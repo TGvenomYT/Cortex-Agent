@@ -1,0 +1,54 @@
+# ═══════════════════════════════════════════════════════════════
+# Cortex Configuration
+# Copy to ~/.cortex/config.yaml and edit with your values.
+# ═══════════════════════════════════════════════════════════════
+
+server:
+  port: 7800
+  host: "127.0.0.1"               # localhost only (security)
+
+database:
+  host: "100.100.35.38"
+  port: 5435
+  name: "postgres"
+  user: "postgres.your-tenant-id"  # Supavisor tenant format
+  password: ""                     # set via env: CORTEX_DB_PASSWORD
+
+llm:
+  primary: openai                  # openai | ollama
+  fallback: ollama                 # null | openai | ollama
+  openai:
+    api_key: ""                    # set via env: OPENAI_API_KEY
+    model: "gpt-4o-mini"
+    max_tokens: 2000
+    temperature: 0.3
+  ollama:
+    base_url: "http://localhost:11434"
+    model: "llama3.1"
+    timeout: 30                    # seconds
+
+context:
+  max_age_minutes: 30              # context stays valid for 30 min
+  include_categories:
+    - git
+    - process
+    - system
+    - shell
+    - project
+    - metrics
+
+memory:
+  max_facts: 100
+  summarize_every: 50              # summarize conversation every N messages
+  retention_days: 90
+
+reminders:
+  check_interval_seconds: 30
+  notification_method: "both"      # macos_notification | say | both
+
+projects:
+  - path: "/Users/niranjan/Documents/projects/smart-terminal"
+    name: "smart-terminal"
+  # Add more:
+  # - path: "/Users/niranjan/Projects/api"
+  #   name: "api"

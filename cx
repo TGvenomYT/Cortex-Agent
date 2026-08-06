@@ -1,0 +1,191 @@
+#!/usr/bin/env python3
+"""
+cx — Cortex Interactive Shell
+Talk to your machine. Type naturally, get smart responses.
+
+Usage:
+  cx              → interactive session
+  cx <one-liner>  → quick one-shot query
+"""
+
+import sys
+import os
+import json
+import readline
+import urllib.request
+import urllib.error
+from datetime import datetime
+
+from rich.console import Console
+from rich.markdown import Markdown
+from rich.panel import Panel
+from rich.text import Text
+
+BASE_URL = "http://localhost:7800"
+SESSION_ID = f"cli-{datetime.now().strftime('%Y%m%d-%H%M')}"
+
+# Force a reasonable width even when piped
+console = Console(width=100 if not sys.stdout.isatty() else None)
+
+
+def post(endpoint: str, data: dict) -> dict:
+    body = json.dumps(data).encode()
+    req = urllib.request.Request(
+        f"{BASE_URL}{endpoint}",
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST"
+    )
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        return json.loads(resp.read())
+
+
+def is_daemon_running() -> bool:
+    try:
+        req = urllib.request.Request(f"{BASE_URL}/status")
+        with urllib.request.urlopen(req, timeout=3):
+            return True
+    except Exception:
+        return False
+
+
+def _is_viz_request(text: str) -> bool:
+    """Detect if the user is asking for a chart/graph/visualization."""
+    viz_keywords = ["chart", "graph", "visualize", "visualization", "bar chart", "sparkline",
+                    "plot", "show me a graph", "usage chart", "metrics chart"]
+    text_lower = text.lower()
+    return any(kw in text_lower for kw in viz_keywords)
+
+
+def send_message(text: str) -> dict:
+    return post("/ask", {
+        "text": text,
+        "source": "cli",
+        "session_id": SESSION_ID
+    })
+
+
+def display_response(response: dict):
+    """Render the response as markdown in terminal."""
+    speak = response.get("speak", "")
+    exec_result = response.get("execution_result")
+
+    if not speak:
+        console.print("[dim]  (no response)[/dim]")
+        return
+
+    # Render the explanation as markdown
+    console.print()
+    md = Markdown(speak)
+    console.print(md)
+
+    # Only show raw error output if command failed
+    if exec_result:
+        exit_code = exec_result.get("exit_code", 0)
+        stderr = exec_result.get("stderr", "").strip()
+
+        if exit_code != 0 and stderr:
+            console.print()
+            console.print(Panel(
+                stderr[:500],
+                title="[red]error[/red]",
+                border_style="red"
+            ))
+
+    # Show reminder confirmation
+    if response.get("reminder_id"):
+        due = response.get("due", "?")
+        console.print(f"  [dim]⏰ reminder #{response['reminder_id']} → {due}[/dim]")
+
+    console.print()
+
+
+def interactive_mode():
+    """Main interactive conversation loop."""
+    console.print()
+    console.print("  [bold]Cortex[/bold] [dim]— type naturally, ctrl+c to quit[/dim]")
+    console.print()
+
+    # History
+    history_file = os.path.expanduser("~/.cortex_history")
+    try:
+        readline.read_history_file(history_file)
+    except (FileNotFoundError, PermissionError, OSError):
+        pass
+    readline.set_history_length(500)
+
+    while True:
+        try:
+            user_input = console.input("  [green]→[/green] ").strip()
+        except (KeyboardInterrupt, EOFError):
+            console.print("\n  [dim]bye.[/dim]\n")
+            break
+
+        if not user_input:
+            continue
+
+        if user_input.lower() in ("exit", "quit", "q", "bye"):
+            console.print("\n  [dim]bye.[/dim]\n")
+            break
+
+        # Special commands
+        if user_input.lower() in ("dashboard", "dash", "stats", "viz"):
+            from dashboard import render_dashboard
+            render_dashboard()
+            continue
+
+        # Intercept visualization requests — handle client-side
+        if _is_viz_request(user_input):
+            from dashboard import render_chart
+            render_chart(user_input)
+            continue
+
+        try:
+            if sys.stdin.isatty():
+                with console.status("[dim]thinking...[/dim]", spinner="dots"):
+                    response = send_message(user_input)
+            else:
+                response = send_message(user_input)
+            display_response(response)
+        except urllib.error.URLError:
+            console.print("\n  [red]Cortex is not running.[/red]")
+            console.print("  [dim]Start: launchctl load ~/Library/LaunchAgents/com.cortex.daemon.plist[/dim]\n")
+            break
+        except Exception as e:
+            console.print(f"\n  [red]Error: {e}[/red]\n")
+
+    # Save history
+    try:
+        readline.write_history_file(history_file)
+    except (PermissionError, OSError):
+        pass
+
+
+def one_shot(text: str):
+    """Single query, print response, exit."""
+    try:
+        if sys.stdin.isatty():
+            with console.status("[dim]thinking...[/dim]", spinner="dots"):
+                response = send_message(text)
+        else:
+            response = send_message(text)
+        display_response(response)
+    except urllib.error.URLError:
+        console.print("\n  [red]Cortex is not running.[/red]\n")
+        sys.exit(1)
+
+
+def main():
+    if not is_daemon_running():
+        console.print("\n  [red]Cortex is not running.[/red]")
+        console.print("  [dim]Start: launchctl load ~/Library/LaunchAgents/com.cortex.daemon.plist[/dim]\n")
+        sys.exit(1)
+
+    if len(sys.argv) > 1:
+        one_shot(" ".join(sys.argv[1:]))
+    else:
+        interactive_mode()
+
+
+if __name__ == "__main__":
+    main()

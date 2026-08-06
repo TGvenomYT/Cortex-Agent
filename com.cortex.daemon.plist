@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.cortex.daemon</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/niranjan/Documents/Cortex Agent/.venv/bin/python3</string>
+        <string>/Users/niranjan/Documents/Cortex Agent/cortex.py</string>
+    </array>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>CORTEX_DB_PASSWORD</key>
+        <string>YOUR_DB_PASSWORD_HERE</string>
+        <key>OPENAI_API_KEY</key>
+        <string>YOUR_OPENAI_KEY_HERE</string>
+    </dict>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/niranjan/Documents/Cortex Agent</string>
+
+    <!-- Auto-start at login -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Restart if it crashes -->
+    <key>KeepAlive</key>
+    <true/>
+
+    <!-- Throttle restarts (don't spin on persistent error) -->
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <key>StandardOutPath</key>
+    <string>/Users/niranjan/Documents/Cortex Agent/logs/cortex.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/niranjan/Documents/Cortex Agent/logs/cortex-error.log</string>
+</dict>
+</plist>
