@@ -116,6 +116,121 @@ CREATE TABLE IF NOT EXISTS devops_plans (
 CREATE INDEX IF NOT EXISTS idx_plans_status ON devops_plans(status);
 CREATE INDEX IF NOT EXISTS idx_plans_planid ON devops_plans(plan_id);
 
+-- ═══ VECTOR RETRIEVAL (semantic relevance for context + memory) ═══
+-- Requires: CREATE EXTENSION IF NOT EXISTS vector;
+-- Embedding model: nomic-embed-text via local Ollama (768 dims). 100% local, no API key.
+
+CREATE EXTENSION IF NOT EXISTS vector;
+
+ALTER TABLE context_store ADD COLUMN IF NOT EXISTS embedding vector(768);
+ALTER TABLE memory        ADD COLUMN IF NOT EXISTS embedding vector(768);
+
+-- HNSW indexes for fast approximate nearest-neighbor search (cosine distance)
+CREATE INDEX IF NOT EXISTS idx_context_embedding ON context_store
+    USING hnsw (embedding vector_cosine_ops);
+CREATE INDEX IF NOT EXISTS idx_memory_embedding ON memory
+    USING hnsw (embedding vector_cosine_ops);
+
+-- ═══ EXPERIENCES (State-Action-Reward buffer — BIG BRAIN System 2 substitute) ═══
+-- Every agent turn is logged here. Reward is computed after the fact from outcomes
+-- (command exit code, user correction/re-ask, explicit feedback). Retrieval over
+-- high-reward experiences acts as the in-context "learning" substitute for weight
+-- updates that aren't possible against a closed-weight model like GPT-4o.
+
+CREATE TABLE IF NOT EXISTS experiences (
+    id SERIAL PRIMARY KEY,
+    session_id VARCHAR(100) NOT NULL,
+
+    -- STATE: what the agent saw
+    user_text TEXT NOT NULL,
+    state_context JSONB,                    -- snapshot of relevant context_store rows used
+
+    -- ACTION: what the agent decided to do
+    action VARCHAR(30) NOT NULL,             -- 'execute' | 'browse' | 'edit' | 'answer' | ...
+    action_payload JSONB NOT NULL,           -- the full response_json the LLM returned
+    speak TEXT,
+
+    -- OUTCOME: raw signals used to compute reward
+    exit_code INTEGER,                       -- for execute/devops actions
+    was_corrected BOOLEAN DEFAULT FALSE,     -- user re-asked / rephrased within N turns
+    was_confirmed BOOLEAN,                   -- for actions that needed confirmation
+    explicit_feedback SMALLINT,              -- -1 | 0 | +1, from a future feedback API
+
+    -- REWARD: computed scalar, -1.0 to +1.0
+    reward FLOAT,
+    reward_reason TEXT,                      -- human-readable why (for debugging the reward function)
+
+    -- Retrieval (nomic-embed-text, local, 768 dims)
+    embedding vector(768),
+
+    created_at TIMESTAMP DEFAULT NOW(),
+    reward_computed_at TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_experiences_session ON experiences(session_id);
+CREATE INDEX IF NOT EXISTS idx_experiences_reward ON experiences(reward DESC);
+CREATE INDEX IF NOT EXISTS idx_experiences_created ON experiences(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_experiences_embedding ON experiences
+    USING hnsw (embedding vector_cosine_ops);
+-- Pending reward computation (experiences created but outcome not yet scored)
+CREATE INDEX IF NOT EXISTS idx_experiences_pending_reward ON experiences(created_at)
+    WHERE reward IS NULL;
+
+-- ═══ GOALS + AUTONOMY LOG (self-directed background cognition) ═══
+-- The autonomy loop (autonomy.py) periodically looks at current context/memory/
+-- experience and decides whether to form a goal or act on an existing one, gated
+-- through the same needs_confirmation() check /ask uses for live requests.
+
+CREATE TABLE IF NOT EXISTS goals (
+    id SERIAL PRIMARY KEY,
+    description TEXT NOT NULL,
+    status VARCHAR(20) DEFAULT 'active',    -- active | done | abandoned
+    priority INTEGER DEFAULT 3,             -- 1-5
+    source VARCHAR(20) DEFAULT 'self',      -- self | user
+    created_at TIMESTAMP DEFAULT NOW(),
+    last_evaluated_at TIMESTAMP,
+    completed_at TIMESTAMP,
+    result TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_goals_status ON goals(status);
+
+CREATE TABLE IF NOT EXISTS autonomy_log (
+    id SERIAL PRIMARY KEY,
+    cycle_at TIMESTAMP DEFAULT NOW(),
+    think TEXT,
+    decision VARCHAR(20),                   -- noop | new_goal | acted | proposed
+    goal_id INTEGER REFERENCES goals(id),
+    action_payload JSONB,
+    needs_confirmation BOOLEAN DEFAULT FALSE,
+    confirmed BOOLEAN,
+    exit_code INTEGER,
+    notified BOOLEAN DEFAULT FALSE
+);
+
+CREATE INDEX IF NOT EXISTS idx_autonomy_log_time ON autonomy_log(cycle_at DESC);
+
+-- ═══ PRIORITIES (standing values — the compass, not a one-off task) ═══
+-- Unlike a goal (one-off, gets marked done/abandoned), a priority is something
+-- the agent holds as important across turns and cycles. Injected into both the
+-- live /ask system prompt (context_reader.py) and the autonomy loop (autonomy.py)
+-- so the two paths share one opinion instead of behaving differently. Can be
+-- seeded by the user, or formed by the agent itself from recurring self-goals /
+-- experience patterns (source='learned' — see autonomy.py::_maybe_form_priority).
+
+CREATE TABLE IF NOT EXISTS priorities (
+    id SERIAL PRIMARY KEY,
+    statement TEXT NOT NULL,
+    weight INTEGER DEFAULT 3,               -- 1-5
+    source VARCHAR(20) DEFAULT 'user',      -- seeded | user | learned
+    status VARCHAR(20) DEFAULT 'active',    -- active | retired
+    created_at TIMESTAMP DEFAULT NOW(),
+    last_reinforced_at TIMESTAMP,
+    reinforcement_count INTEGER DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS idx_priorities_status ON priorities(status);
+
 -- ═══ CLEANUP FUNCTION ═══
 -- Call periodically to purge stale context
 -- Can be triggered by pg_cron if available, or by the daemon itself

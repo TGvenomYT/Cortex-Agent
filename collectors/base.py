@@ -53,21 +53,47 @@ def get_db_conn(config: dict):
 
 
 def upsert_context(conn, category: str, key: str, value: dict,
-                   project_path: str = None, expires_minutes: int = 15):
-    """Write a context row to the DB (insert or update)."""
+                   project_path: str = None, expires_minutes: int = 15,
+                   embedding_text: str = None):
+    """
+    Write a context row to the DB (insert or update).
+    embedding_text: optional text to embed for semantic retrieval (see embeddings.py).
+    If provided, this row becomes findable via db.search_context_semantic().
+    """
     import json
     from datetime import datetime, timedelta
     expires_at = datetime.utcnow() + timedelta(minutes=expires_minutes)
 
+    vec_literal = None
+    if embedding_text:
+        try:
+            import sys, os
+            sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+            from embeddings import embed, to_pgvector
+            vec_literal = to_pgvector(embed(embedding_text))
+        except Exception as e:
+            logging.getLogger("collector.base").warning(f"Embedding failed for {category}/{key}: {e}")
+
     with conn.cursor() as cur:
-        cur.execute("""
-            INSERT INTO context_store (category, project_path, key, value, collected_at, expires_at)
-            VALUES (%s, %s, %s, %s, NOW(), %s)
-            ON CONFLICT (category, project_path, key)
-            DO UPDATE SET value = EXCLUDED.value,
-                          collected_at = NOW(),
-                          expires_at = EXCLUDED.expires_at
-        """, (category, project_path, key, json.dumps(value), expires_at))
+        if vec_literal:
+            cur.execute("""
+                INSERT INTO context_store (category, project_path, key, value, collected_at, expires_at, embedding)
+                VALUES (%s, %s, %s, %s, NOW(), %s, %s::vector)
+                ON CONFLICT (category, project_path, key)
+                DO UPDATE SET value = EXCLUDED.value,
+                              collected_at = NOW(),
+                              expires_at = EXCLUDED.expires_at,
+                              embedding = EXCLUDED.embedding
+            """, (category, project_path, key, json.dumps(value), expires_at, vec_literal))
+        else:
+            cur.execute("""
+                INSERT INTO context_store (category, project_path, key, value, collected_at, expires_at)
+                VALUES (%s, %s, %s, %s, NOW(), %s)
+                ON CONFLICT (category, project_path, key)
+                DO UPDATE SET value = EXCLUDED.value,
+                              collected_at = NOW(),
+                              expires_at = EXCLUDED.expires_at
+            """, (category, project_path, key, json.dumps(value), expires_at))
 
 
 def run_cmd(cmd: str, cwd: str = None, timeout: int = 10) -> tuple[str, str, int]:

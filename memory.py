@@ -5,6 +5,9 @@ Facts, preferences, learned commands — auto-extracted from conversations by LL
 
 import json
 import logging
+from concurrent.futures import ThreadPoolExecutor
+
+from schemas import FACTS_SCHEMA
 
 logger = logging.getLogger("cortex.memory")
 
@@ -42,6 +45,9 @@ class MemoryManager:
         self.max_facts = config.get("max_facts", 100)
         self.summarize_every = config.get("summarize_every", 10)
         self._turn_counts = {}  # session_id → turn count
+        # Fact extraction makes a full LLM call — run it off the request
+        # thread so it doesn't add that latency to the user-facing response.
+        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="memory-extract")
 
     def store_fact(self, content: str, mem_type: str = "fact",
                    source: str = None, importance: int = 3):
@@ -64,7 +70,7 @@ class MemoryManager:
 
         if count % self.summarize_every == 0:
             logger.info(f"Triggering memory extraction for {session_id} (turn {count})")
-            self._extract_facts(session_id)
+            self._executor.submit(self._extract_facts, session_id)
 
     def _extract_facts(self, session_id: str):
         """Use LLM to extract memorable facts from recent conversation."""
@@ -84,7 +90,7 @@ class MemoryManager:
         ]
 
         try:
-            raw = self.llm.complete(messages, json_mode=True)
+            raw = self.llm.complete(messages, json_mode=True, schema=FACTS_SCHEMA)
             # LLM may return {"facts": [...]} or just [...]
             parsed = json.loads(raw)
             facts = parsed if isinstance(parsed, list) else parsed.get("facts", [])

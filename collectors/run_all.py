@@ -21,6 +21,7 @@ import process_collector
 import system_collector
 import shell_collector
 import project_collector
+import owner_collector
 
 
 COLLECTORS = [
@@ -29,6 +30,7 @@ COLLECTORS = [
     ("process", process_collector, "Docker, ports, services"),
     ("git",     git_collector,     "Git state for tracked projects"),
     ("project", project_collector, "Project type, deps, TODOs"),
+    ("owner",   owner_collector,   "Complete machine + owner profile"),
 ]
 
 

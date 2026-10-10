@@ -14,7 +14,6 @@ for pkg, import_name in [
     ("psycopg2-binary", "psycopg2"),
     ("pyyaml", "yaml"),
     ("flask", "flask"),
-    ("openai", "openai"),
     ("httpx", "httpx"),
 ]:
     try:

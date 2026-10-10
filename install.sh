@@ -51,9 +51,24 @@ if [[ -z "${CORTEX_DB_PASSWORD:-}" ]]; then
     echo -e "\n  ${YELLOW}△${RESET} Set CORTEX_DB_PASSWORD in your ~/.zshrc:"
     echo -e "    ${DIM}export CORTEX_DB_PASSWORD=\"your-password\"${RESET}"
 fi
-if [[ -z "${OPENAI_API_KEY:-}" ]]; then
-    echo -e "  ${YELLOW}△${RESET} Set OPENAI_API_KEY in your ~/.zshrc:"
-    echo -e "    ${DIM}export OPENAI_API_KEY=\"sk-...\"${RESET}"
+
+# ─── Ollama check (100% local LLM/embeddings — no API keys used, ever) ───
+if ! command -v ollama &>/dev/null; then
+    echo -e "  ${YELLOW}△${RESET} Ollama not found. Cortex runs fully local via Ollama."
+    echo -e "    ${DIM}Install: https://ollama.com/download${RESET}"
+else
+    if curl -s --max-time 2 http://localhost:11434/api/tags &>/dev/null; then
+        echo -e "  ${GREEN}✓${RESET} Ollama is running"
+        for m in gemma4:e4b nomic-embed-text; do
+            if curl -s http://localhost:11434/api/tags | grep -q "\"$m\|${m%%:*}"; then
+                echo -e "  ${GREEN}✓${RESET} model available: $m"
+            else
+                echo -e "  ${YELLOW}△${RESET} pull required: ${DIM}ollama pull $m${RESET}"
+            fi
+        done
+    else
+        echo -e "  ${YELLOW}△${RESET} Ollama installed but not running: ${DIM}ollama serve${RESET}"
+    fi
 fi
 
 # ─── DB Schema ───

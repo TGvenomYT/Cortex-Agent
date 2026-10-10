@@ -10,6 +10,8 @@ import logging
 import subprocess
 from datetime import datetime
 
+from schemas import DEVOPS_PLAN_SCHEMA, DEVOPS_RECOVERY_SCHEMA
+
 logger = logging.getLogger("cortex.devops")
 
 
@@ -44,7 +46,7 @@ class DevOpsAgent:
         ]
 
         try:
-            raw = self.llm.complete(messages, json_mode=True)
+            raw = self.llm.complete(messages, json_mode=True, schema=DEVOPS_PLAN_SCHEMA)
             data = json.loads(raw)
         except Exception as e:
             logger.error(f"Plan generation failed: {e}")
@@ -208,7 +210,7 @@ class DevOpsAgent:
         ]
 
         try:
-            raw = self.llm.complete(messages, json_mode=True)
+            raw = self.llm.complete(messages, json_mode=True, schema=DEVOPS_RECOVERY_SCHEMA)
             recovery = json.loads(raw)
             logger.info(f"[{plan_id}] Recovery suggestion: {recovery.get('action')} — {recovery.get('reason', '')[:80]}")
             return recovery

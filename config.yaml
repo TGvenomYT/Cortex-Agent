@@ -15,17 +15,14 @@ database:
   password: ""                     # set via env: CORTEX_DB_PASSWORD
 
 llm:
-  primary: openai                  # openai | ollama
-  fallback: ollama                 # null | openai | ollama
-  openai:
-    api_key: ""                    # set via env: OPENAI_API_KEY
-    model: "gpt-4o-mini"
-    max_tokens: 2000
-    temperature: 0.3
+  # 100% local via Ollama. No API keys are ever read for LLM calls.
   ollama:
     base_url: "http://localhost:11434"
-    model: "llama3.1"
-    timeout: 30                    # seconds
+    model: "gemma4:e4b"            # local, JSON mode + vision capable
+    timeout: 60                    # seconds — local inference is slower than cloud
+  ollama_fallback:
+    base_url: "http://localhost:11434"
+    model: "llama3.1:8b"           # local fallback if primary fails
 
 context:
   max_age_minutes: 30              # context stays valid for 30 min
@@ -36,6 +33,9 @@ context:
     - shell
     - project
     - metrics
+    - server
+    - github
+    - owner
 
 memory:
   max_facts: 100
@@ -46,9 +46,123 @@ reminders:
   check_interval_seconds: 30
   notification_method: "both"      # macos_notification | say | both
 
+# ─── Autonomy — goal-directed background cognition ───
+# Runs on its own schedule, no prompt needed. Anything that would need
+# confirmation in a live /ask (safety.py) gets queued as a proposal +
+# notification instead of auto-executed — see autonomy.py.
+autonomy:
+  enabled: true
+  interval_minutes: 15
+  max_actions_per_hour: 4
+  notify_on_action: true
+
 projects:
   - path: "/Users/niranjan/Documents/projects/smart-terminal"
     name: "smart-terminal"
   # Add more:
   # - path: "/Users/niranjan/Projects/api"
   #   name: "api"
+
+appflowy:
+  base_url: "https://beta.appflowy.cloud"
+  email: ""                        # your AppFlowy account email
+  password: ""                     # or set via env: APPFLOWY_PASSWORD
+  token: ""                        # alternative: paste a token directly
+  workspace_id: ""                 # fill after running: cx setup-appflowy
+  todo_database_id: ""             # fill after running: cx setup-appflowy
+
+# ─── Web Credentials (for authenticated crawling) ───
+# Each entry is a named credential set the LLM can reference.
+# auth_type: form | bearer | basic | header | cookie
+web_credentials:
+  # Example: form-based login
+  # jira:
+  #   auth_type: form
+  #   login_url: "https://yourcompany.atlassian.net/login"
+  #   username_field: "email"
+  #   password_field: "password"
+  #   username: "you@company.com"
+  #   password: ""              # set via env: CORTEX_CRED_JIRA_PASSWORD
+  #   extra_fields: {}
+
+  # Example: bearer token (APIs, dashboards)
+  # grafana:
+  #   auth_type: bearer
+  #   token: ""                 # set via env: CORTEX_CRED_GRAFANA_TOKEN
+
+  # Example: basic auth
+  # router:
+  #   auth_type: basic
+  #   username: "admin"
+  #   password: ""              # set via env: CORTEX_CRED_ROUTER_PASSWORD
+
+  # Example: custom headers (API keys)
+  # internal_api:
+  #   auth_type: header
+  #   headers:
+  #     X-API-Key: ""           # set via env: CORTEX_CRED_INTERNAL_API_KEY
+
+  # Example: pre-set cookies
+  # legacy_app:
+  #   auth_type: cookie
+  #   cookies:
+  #     session_id: "abc123"
+
+# ─── Multi-machine (Tailscale SSH) ───
+remote_hosts:
+  server:
+    ip: "100.100.35.38"
+    user: "rathinaswamy"
+    key: "~/.ssh/id_ed25519_myserver"
+  # Add more:
+  # nas:
+  #   ip: "100.x.x.x"
+  #   user: "admin"
+
+# ─── Automation Rules ───
+automation_rules:
+  - name: "High CPU"
+    condition:
+      type: metric_threshold
+      metric: host_cpu
+      operator: ">"
+      threshold: 80
+    action:
+      type: notify
+      message: "CPU is above 80 percent"
+    cooldown_minutes: 15
+
+  - name: "Disk almost full"
+    condition:
+      type: metric_threshold
+      metric: host_disk
+      operator: ">"
+      threshold: 90
+    action:
+      type: say
+      message: "Niranjan, your disk is almost full. You should free up some space."
+    cooldown_minutes: 60
+
+  - name: "Hotel mapping worker crashed"
+    condition:
+      type: container_status
+      container: hotel_mapping_worker_v2
+      status: exited
+    action:
+      type: restart_container
+      container: hotel_mapping_worker_v2
+    cooldown_minutes: 30
+
+# ─── Scheduled Reports ───
+scheduled_reports:
+  - name: "Morning Briefing"
+    hour: 9
+    minute: 0
+    prompt: "Give me a quick morning briefing. System health, any container issues overnight, git changes across my projects, and my calendar for today."
+    delivery: both
+
+  - name: "Evening Wrap"
+    hour: 18
+    minute: 0
+    prompt: "Quick evening summary. What happened today on the system, any issues, and what's on my calendar tomorrow."
+    delivery: notify

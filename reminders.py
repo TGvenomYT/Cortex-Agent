@@ -6,9 +6,10 @@ Fires via macOS notifications (osascript) + TTS (say command).
 
 import time
 import threading
-import subprocess
 import logging
 from datetime import datetime
+
+from notify import notify as _notify_os, say as _say_os
 
 logger = logging.getLogger("cortex.reminders")
 
@@ -96,26 +97,11 @@ class ReminderManager:
 
     def _notify(self, text: str, natural_text: str):
         """Send a macOS notification via osascript."""
-        safe_text = natural_text.replace('"', '\\"').replace("'", "\\'")
-        script = f'display notification "{safe_text}" with title "Cortex" subtitle "Reminder" sound name "Ping"'
-        try:
-            subprocess.run(
-                ["osascript", "-e", script],
-                capture_output=True, timeout=5
-            )
-        except Exception as e:
-            logger.error(f"Notification failed: {e}")
+        _notify_os("", natural_text, sound="Ping", subtitle="Reminder")
 
     def _say(self, text: str):
-        """Speak naturally using macOS TTS."""
-        try:
-            subprocess.Popen(
-                ["say", "-v", "Samantha", "-r", "180", text],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL
-            )
-        except Exception as e:
-            logger.error(f"TTS failed: {e}")
+        """Speak naturally using NLG pipeline + macOS Siri voice."""
+        _say_os(text)
 
     def _reschedule(self, reminder: dict):
         """Reschedule a recurring reminder after it fires."""

@@ -36,6 +36,9 @@ declare -a COLLECTORS=(
     "system:system_collector.py:300"
     "project:project_collector.py:1800"
     "metrics:metrics_collector.py:60"
+    "remote:remote_collector.py:120"
+    "github:github_collector.py:300"
+    "owner:owner_collector.py:1800"
 )
 
 for entry in "${COLLECTORS[@]}"; do
