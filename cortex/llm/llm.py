@@ -86,6 +86,23 @@ def configured_providers() -> dict:
     return {p: bool(get_key(p)) for p in CLOUD_MODELS}
 
 
+# Substrings of provider model ids that are NOT usable via plain chat completions
+# (audio/realtime/image/embedding/tts, responses-API-only "-pro"/codex, search previews…).
+# Listing them would let the user pick a model that errors out as a 404/400.
+_NON_CHAT = ("realtime", "audio", "transcribe", "tts", "image", "imagen", "instruct",
+             "embedding", "moderation", "whisper", "dall-e", "codex", "search",
+             "computer-use", "deep-research", "davinci", "babbage", "veo", "live",
+             "aqa", "robotics", "learnlm")
+# OpenAI's "-pro" models (o1-pro, gpt-5-pro) are Responses-API-only, but "-pro" is a
+# perfectly good chat model on Gemini (gemini-2.5-pro) — so only exclude it for OpenAI.
+_NON_CHAT_OPENAI_ONLY = ("-pro",)
+
+
+def _chat_only(ids, provider=None):
+    extra = _NON_CHAT_OPENAI_ONLY if provider == "openai" else ()
+    return [i for i in ids if i and not any(w in i.lower() for w in _NON_CHAT + extra)]
+
+
 _MODEL_CACHE: dict[str, tuple[float, list]] = {}
 _MODEL_CACHE_TTL = 600.0  # 10 min — /models is polled often; don't hammer the provider API
 
@@ -107,13 +124,13 @@ def list_provider_models(provider: str) -> list:
                           headers={"Authorization": f"Bearer {key}"}, timeout=10)
             r.raise_for_status()
             ids = [m.get("id", "") for m in r.json().get("data", [])]
-            result = sorted(i for i in ids if i.startswith(("gpt-", "o1", "o3", "o4", "chatgpt")))
+            result = sorted(_chat_only((i for i in ids if i.startswith(("gpt-", "o1", "o3", "o4", "chatgpt"))), "openai"))
         elif provider == "gemini":
             r = httpx.get("https://generativelanguage.googleapis.com/v1beta/openai/models",
                           headers={"Authorization": f"Bearer {key}"}, timeout=10)
             r.raise_for_status()
             ids = [m.get("id", "").split("/")[-1] for m in r.json().get("data", [])]
-            result = sorted(i for i in ids if i.startswith("gemini") and "embedding" not in i)
+            result = sorted(_chat_only((i for i in ids if i.startswith("gemini")), "gemini"))
         elif provider == "anthropic":
             r = httpx.get("https://api.anthropic.com/v1/models",
                           headers={"x-api-key": key, "anthropic-version": "2023-06-01"}, timeout=10)
@@ -371,7 +388,10 @@ class LLMRouter:
         except Exception as e:
             logger.warning(f"Primary LLM failed: {e}")
             if self.fallback:
-                return self.fallback.complete(messages, json_mode=json_mode, schema=schema)
+                try:
+                    return self.fallback.complete(messages, json_mode=json_mode, schema=schema)
+                except Exception:
+                    raise e  # report the primary's error, not the fallback's
             raise
 
     def complete_with_tools(self, messages, tools):
@@ -380,7 +400,10 @@ class LLMRouter:
         except Exception as e:
             logger.warning(f"Primary LLM failed (tools): {e}")
             if self.fallback:
-                return self.fallback.complete_with_tools(messages, tools)
+                try:
+                    return self.fallback.complete_with_tools(messages, tools)
+                except Exception:
+                    raise e  # report the primary's error, not the fallback's
             raise
 
     def stream(self, messages):

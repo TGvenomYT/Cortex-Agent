@@ -749,7 +749,10 @@ details.trace[open] .chev{transform:rotate(180deg)}
 .ans{animation:fade .45s ease both}@keyframes fade{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:none}}
 @keyframes pop{from{opacity:0;transform:scale(.95)}to{opacity:1;transform:none}}
 #menu.show{animation:pop .15s ease both;transform-origin:top left}
-#hello{background-size:220% auto;animation:gshift 7s ease-in-out infinite}
+/* Plays ONCE then stops. It used to loop forever: animating background-position on
+   gradient-clipped text can't run on the GPU, so an idle Cortex window repainted every
+   frame on the CPU and kept the whole machine warm. */
+#hello{background-size:220% auto;animation:gshift 2.4s ease-in-out 1 both}
 @keyframes gshift{0%,100%{background-position:0% center}50%{background-position:100% center}}
 /* thinking block + colorful aura: a masked rotating gradient border + soft halo */
 @property --a{syntax:"<angle>";inherits:false;initial-value:0deg}

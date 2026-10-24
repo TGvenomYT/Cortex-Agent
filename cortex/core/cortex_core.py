@@ -83,6 +83,36 @@ class CortexCore:
         logger.warning(f"chart render failed: {err}")
         return None
 
+    def _llm_error_message(self, e: Exception) -> str:
+        """Turn an LLM failure into something the user can act on, naming the real cause
+        (bad key, model not found, rate limit…) instead of a generic 'can't reach a model'."""
+        import httpx
+        model = getattr(getattr(self.llm, "primary", None), "model", "the selected model")
+        if isinstance(e, httpx.HTTPStatusError):
+            code = e.response.status_code
+            try:
+                detail = (e.response.json().get("error") or {})
+                detail = detail.get("message") if isinstance(detail, dict) else str(detail)
+            except Exception:
+                detail = (e.response.text or "")[:200]
+            detail = (detail or "").strip()[:240]
+            if code in (401, 403):
+                why = "the API key was rejected — re-check it in Settings → AI Providers"
+            elif code == 404:
+                why = f"`{model}` isn't available for your key — pick a different model from the selector"
+            elif code == 429:
+                why = "rate limit or quota reached — wait a bit or check your plan/billing"
+            elif code == 400:
+                why = f"the provider rejected this request for `{model}` — try another model"
+            else:
+                why = f"the provider returned an error ({code})"
+            return f"The model provider said no: {why}." + (f"\n\n> {detail}" if detail else "")
+        if isinstance(e, (httpx.ConnectError, httpx.ConnectTimeout)):
+            return ("I can't reach a model. For the local engine, install & run Ollama "
+                    "(then `ollama pull gemma3:12b`); or add a cloud API key under "
+                    "**Settings → AI Providers** and pick that model from the selector top-left.")
+        return f"I hit an error talking to the model: {str(e)[:200]}"
+
     _CHART_WORDS = ("graph", "plot", "chart", "draw", "visuali", "diagram", "curve", "histogram")
 
     def _wants_chart(self, text: str) -> bool:
@@ -192,11 +222,7 @@ class CortexCore:
                 result = self.llm.complete_with_tools(messages, tools=tools_list)
             except Exception as e:
                 logger.error(f"LLM unavailable: {e}")
-                final_speak = (
-                    "I can't reach a model right now. Either start the local engine "
-                    "(install & run Ollama, then `ollama pull gemma3:12b`), or add a cloud "
-                    "API key under **Settings → AI Providers** (Claude / OpenAI / Gemini) and "
-                    "pick that model from the selector at the top-left.")
+                final_speak = self._llm_error_message(e)
                 break
 
             think = (result.get("thinking") or result.get("content") or "").strip()
