@@ -5,6 +5,7 @@
 # installer attempts them best-effort — the core app never fails to install.
 
 flask>=3.0            # web GUI
+waitress>=3.0         # production WSGI server for the GUI (pure-Python, works on Windows)
 httpx>=0.27           # Ollama + cloud provider calls
 pyyaml>=6.0           # config
 python-dateutil>=2.9  # date parsing

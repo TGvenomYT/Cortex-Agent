@@ -1216,6 +1216,33 @@ def _port_in_use(port):
         return s.connect_ex(("127.0.0.1", port)) == 0
 
 
+def _stop_stale_gui(port):
+    """If an old Cortex GUI server is squatting on the port (e.g. left running in the
+    background), stop it so this process can serve in the foreground and Ctrl+C works.
+    Only ever kills a process whose command line is the Cortex GUI server."""
+    import subprocess, signal, time
+    try:
+        pids = subprocess.run(["lsof", "-ti", f"tcp:{port}", "-sTCP:LISTEN"],
+                              capture_output=True, text=True, timeout=5).stdout.split()
+    except Exception:
+        return False
+    stopped = False
+    for pid in pids:
+        try:
+            cmd = subprocess.run(["ps", "-p", pid, "-o", "command="],
+                                 capture_output=True, text=True, timeout=5).stdout
+            if "cortex.server.gui_server" in cmd and int(pid) != os.getpid():
+                os.kill(int(pid), signal.SIGTERM)
+                stopped = True
+        except Exception:
+            pass
+    for _ in range(20):  # wait up to ~4s for the port to free
+        if not _port_in_use(port):
+            break
+        time.sleep(0.2)
+    return stopped
+
+
 def main():
     import threading
     port = int(os.environ.get("CORTEX_GUI_PORT", "7860"))
@@ -1224,14 +1251,26 @@ def main():
     # first run). `cx gui` does NOT open a tab — it just serves and prints the URL.
     auto_open = os.environ.get("CORTEX_GUI_OPEN", "").lower() in ("1", "true", "yes")
     if _port_in_use(port):
-        logger.info(f"Cortex GUI already running at {url}")
-        if auto_open:
-            _open_browser(url)
-        return
+        if _stop_stale_gui(port):
+            logger.info("Replaced an old Cortex GUI that was left running in the background.")
+        if _port_in_use(port):
+            # Something that isn't Cortex owns the port — don't touch it.
+            logger.info(f"Port {port} is in use by another program; Cortex GUI not started.")
+            return
     logger.info(f"Cortex GUI running at {url}  (open it in your browser; Ctrl+C to stop)")
     if auto_open:
         threading.Timer(1.0, lambda: _open_browser(url)).start()
-    app.run(host="127.0.0.1", port=port, threaded=True, debug=False)
+    try:
+        from waitress import serve
+    except ImportError:  # older install without waitress — fall back to Flask's dev server
+        logger.warning("waitress not installed (pip install waitress); using Flask's dev server")
+        app.run(host="127.0.0.1", port=port, threaded=True, debug=False)
+        return
+    # Production WSGI server. /stream holds one worker thread per in-flight chat
+    # (SSE), so keep the pool generous and the idle timeout above a slow LLM turn.
+    # Ctrl+C is handled by waitress and shuts the server down cleanly.
+    serve(app, host="127.0.0.1", port=port, threads=16, channel_timeout=900,
+          ident="Cortex", clear_untrusted_proxy_headers=True)
 
 
 if __name__ == "__main__":
