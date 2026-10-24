@@ -179,7 +179,7 @@ def models():
     cloud = []
     for prov, has in llm_mod.configured_providers().items():
         if has:
-            cloud += llm_mod.CLOUD_MODELS.get(prov, [])
+            cloud += llm_mod.list_provider_models(prov)  # real models from the provider's API
     out["models"] = local + cloud
     out["local"] = local
     out["cloud"] = cloud

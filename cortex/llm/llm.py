@@ -86,6 +86,47 @@ def configured_providers() -> dict:
     return {p: bool(get_key(p)) for p in CLOUD_MODELS}
 
 
+_MODEL_CACHE: dict[str, tuple[float, list]] = {}
+_MODEL_CACHE_TTL = 600.0  # 10 min — /models is polled often; don't hammer the provider API
+
+
+def list_provider_models(provider: str) -> list:
+    """Fetch the REAL available models for a provider (its /models endpoint), so the
+    selector never shows a deprecated/invalid id. Cached 10 min. Falls back to the
+    curated list in CLOUD_MODELS if the call fails (offline, bad key)."""
+    key = get_key(provider)
+    if not key:
+        return []
+    hit = _MODEL_CACHE.get(provider)
+    if hit and (time.time() - hit[0]) < _MODEL_CACHE_TTL:
+        return hit[1]
+    try:
+        result = None
+        if provider == "openai":
+            r = httpx.get("https://api.openai.com/v1/models",
+                          headers={"Authorization": f"Bearer {key}"}, timeout=10)
+            r.raise_for_status()
+            ids = [m.get("id", "") for m in r.json().get("data", [])]
+            result = sorted(i for i in ids if i.startswith(("gpt-", "o1", "o3", "o4", "chatgpt")))
+        elif provider == "gemini":
+            r = httpx.get("https://generativelanguage.googleapis.com/v1beta/openai/models",
+                          headers={"Authorization": f"Bearer {key}"}, timeout=10)
+            r.raise_for_status()
+            ids = [m.get("id", "").split("/")[-1] for m in r.json().get("data", [])]
+            result = sorted(i for i in ids if i.startswith("gemini") and "embedding" not in i)
+        elif provider == "anthropic":
+            r = httpx.get("https://api.anthropic.com/v1/models",
+                          headers={"x-api-key": key, "anthropic-version": "2023-06-01"}, timeout=10)
+            r.raise_for_status()
+            result = sorted(m.get("id", "") for m in r.json().get("data", []))
+        if result:
+            _MODEL_CACHE[provider] = (time.time(), result)
+            return result
+    except Exception as e:
+        logger.info(f"live model list for {provider} failed ({e}) — using curated fallback")
+    return CLOUD_MODELS.get(provider, [])
+
+
 class LLMBackend:
     """Abstract base for all LLM backends."""
 

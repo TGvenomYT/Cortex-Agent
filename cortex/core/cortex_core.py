@@ -192,8 +192,11 @@ class CortexCore:
                 result = self.llm.complete_with_tools(messages, tools=tools_list)
             except Exception as e:
                 logger.error(f"LLM unavailable: {e}")
-                final_speak = ("Sorry — I can't reach my brain right now. "
-                               "Is the local model (Ollama) running?")
+                final_speak = (
+                    "I can't reach a model right now. Either start the local engine "
+                    "(install & run Ollama, then `ollama pull gemma3:12b`), or add a cloud "
+                    "API key under **Settings → AI Providers** (Claude / OpenAI / Gemini) and "
+                    "pick that model from the selector at the top-left.")
                 break
 
             think = (result.get("thinking") or result.get("content") or "").strip()
