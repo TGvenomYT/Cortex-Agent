@@ -134,21 +134,37 @@ def chunk(text: str, size: int = 900, overlap: int = 150) -> list[str]:
 
 
 def ingest(db, path: str, source: str = None) -> tuple[str, int]:
-    """Extract -> chunk -> embed -> store. Returns (source_name, n_chunks)."""
+    """Extract -> chunk -> embed -> store. Returns (source_name, n_embedded_chunks).
+
+    Fails LOUDLY (raises) rather than silently storing chunks with no embedding —
+    an un-embedded chunk is invisible to retrieval, so a 'successful' upload that
+    can never be found is worse than a clear error.
+    """
     from cortex.llm.embeddings import embed, to_pgvector
     source = source or os.path.basename(path)
     text = extract(path)
+    if not (text or "").strip():
+        raise RuntimeError(f"couldn't read any text from {source} (unsupported or empty file?)")
     chunks = chunk(text)
-    n = 0
-    for ch in chunks:
-        try:
-            vec = to_pgvector(embed(ch))
-        except Exception:
-            vec = None
-        db.add_document(source, ch, vec)
-        n += 1
-    logger.info(f"ingested {source}: {n} chunks")
-    return source, n
+    if not chunks:
+        raise RuntimeError(f"no content to index in {source}")
+    # Probe the embedder once up front so we fail fast with a helpful message
+    # instead of silently storing hundreds of unretrievable chunks.
+    probe = embed(chunks[0])
+    if probe is None:
+        raise RuntimeError(
+            "couldn't reach the embedding model — make sure Ollama is running and the "
+            "embedding model is installed:  ollama pull nomic-embed-text")
+    embedded = 0
+    for i, ch in enumerate(chunks):
+        vec = probe if i == 0 else embed(ch)
+        if vec:
+            db.add_document(source, ch, to_pgvector(vec))
+            embedded += 1
+    if embedded == 0:
+        raise RuntimeError(f"embedding failed for every chunk of {source}")
+    logger.info(f"ingested {source}: {embedded}/{len(chunks)} chunks embedded")
+    return source, embedded
 
 
 def retrieve(db, query: str, k: int = 6) -> list[dict]:

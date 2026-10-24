@@ -83,6 +83,35 @@ class CortexCore:
         logger.warning(f"chart render failed: {err}")
         return None
 
+    _CHART_WORDS = ("graph", "plot", "chart", "draw", "visuali", "diagram", "curve", "histogram")
+
+    def _wants_chart(self, text: str) -> bool:
+        t = (text or "").lower()
+        return any(w in t for w in self._CHART_WORDS)
+
+    def _chart_code_for(self, text: str) -> str:
+        """Ask the model for ONLY matplotlib code — the reliable fallback for when
+        the model narrated a plot instead of calling make_chart (common on models
+        whose tool-calling is weak, e.g. cloud variants)."""
+        prompt = (
+            "Write ONLY Python matplotlib code to create this plot: " + text + "\n"
+            "`plt` (matplotlib.pyplot) and `np` (numpy) are ALREADY imported and available. "
+            "Do NOT import anything. Do NOT call plt.show() or plt.savefig(). "
+            "Add a title, axis labels, a grid, and a legend if there are multiple series. "
+            "For functions with asymptotes (e.g. hyperbolas, 1/x, tan), mask the discontinuity "
+            "so the curve doesn't draw a vertical spike. Output ONLY the code — no prose, no ``` fences.")
+        try:
+            raw = (self.llm.complete([{"role": "user", "content": prompt}]) or "").strip()
+            if "```" in raw:
+                import re
+                m = re.search(r"```(?:python)?\s*(.*?)```", raw, re.S)
+                if m:
+                    raw = m.group(1).strip()
+            return raw or None
+        except Exception as e:
+            logger.warning(f"chart code generation failed: {e}")
+            return None
+
     def _image_search(self, query: str) -> list:
         try:
             from ddgs import DDGS
@@ -94,10 +123,15 @@ class CortexCore:
             return []
 
     def _rag_context(self, query: str) -> str:
-        """Pull the most relevant chunks from the user's uploaded files (RAG)."""
+        """Pull the most relevant chunks from the user's uploaded files (RAG).
+
+        Only inject chunks that clear a relevance threshold — otherwise an
+        unrelated query (e.g. 'what's my disk usage') pulls in whatever docs
+        happen to rank highest and feeds the model irrelevant noise."""
         try:
             import cortex.storage.rag as rag
             hits = rag.retrieve(self.db, query, k=6)
+            hits = [h for h in hits if (h.get("similarity") or 0) >= 0.4]
             if hits:
                 return ("[FROM THE USER'S UPLOADED FILES — use/cite when relevant]\n" +
                         "\n---\n".join(f"({h['source']}) {h['chunk']}" for h in hits))
@@ -151,6 +185,7 @@ class CortexCore:
         last_action = {"action": "answer"}
         final_speak = None
         asked, ask_options = False, []
+        chart_shown = False
 
         for step in range(1, self.max_steps + 1):
             try:
@@ -177,6 +212,7 @@ class CortexCore:
 
             stop = False
             for tc in tool_calls:
+                _tcid = tc.get("id") or ""   # OpenAI/Anthropic need tool results to reference this
                 _nm = (tc.get("function") or {}).get("name", "")
                 if _nm.startswith("mcp__"):
                     action = {"action": "mcp", "mcp_name": _nm,
@@ -192,10 +228,11 @@ class CortexCore:
                 if action.get("action") == "chart":  # render a plot inline
                     src = self._render_chart(action.get("code", ""))
                     if src:
+                        chart_shown = True
                         yield {"type": "image", "src": src, "caption": action.get("caption", "")}
                     obs = "chart rendered and shown to the user" if src else "chart render failed"
                     work_log.append(f"[chart] {obs}")
-                    messages.append({"role": "tool", "content": obs})
+                    messages.append({"role": "tool", "tool_call_id": _tcid, "content": obs})
                     continue
                 if action.get("action") == "image_search":  # web images inline
                     items = self._image_search(action.get("query", ""))
@@ -204,18 +241,37 @@ class CortexCore:
                     obs = (f"showed {len(items)} web images for '{action.get('query')}'"
                            if items else "no images found")
                     work_log.append(f"[image_search] {obs}")
-                    messages.append({"role": "tool", "content": obs})
+                    messages.append({"role": "tool", "tool_call_id": _tcid, "content": obs})
                     continue
                 yield {"type": "tool", "name": action.get("action", "?"),
                        "detail": self._tool_detail(action)}
                 obs = self._execute_tool(action, source)
                 work_log.append(f"[{action.get('action')}] {obs}")
                 yield {"type": "observation", "text": obs[:400]}
-                messages.append({"role": "tool", "content": obs[:3000]})
+                messages.append({"role": "tool", "tool_call_id": _tcid, "content": obs[:3000]})
             if stop:
                 break
         else:
             final_speak = None
+
+        # Guaranteed-chart fallback: the user asked for a plot but the model never
+        # produced one (it narrated "here's the graph" without calling make_chart —
+        # common on weaker/cloud tool-callers). Generate the code directly and render
+        # it, and NEVER let the reply claim a graph that doesn't exist.
+        if not asked and self._wants_chart(text) and not chart_shown:
+            yield {"type": "status", "text": "rendering the chart…"}
+            code = self._chart_code_for(text)
+            src = self._render_chart(code) if code else None
+            if src:
+                chart_shown = True
+                yield {"type": "image", "src": src, "caption": ""}
+                if not final_speak or "graph" in (final_speak or "").lower() or \
+                        "plot" in (final_speak or "").lower() or "chart" in (final_speak or "").lower():
+                    final_speak = final_speak or "Here's the graph."
+                last_action = {"action": "chart"}
+            else:
+                final_speak = ("I couldn't render that plot — the code my model produced didn't "
+                               "run. Tell me the exact equation or range and I'll try again.")
 
         if final_speak is None:
             yield {"type": "status", "text": "wrapping up…"}

@@ -1,27 +1,19 @@
-# Cortex — core requirements (cross-platform: macOS, Windows, Linux).
-# These install cleanly from wheels on all three OSes. Voice/audio and MLX
-# extras are optional and live in requirements-voice.txt / the README.
+# Cortex — CORE requirements (cross-platform: macOS, Windows, Linux).
+# Deliberately minimal and pure-Python / compiler-free, so `pip install` works on
+# any Python (incl. brand-new / ARM builds that don't yet have C-extension wheels).
+# Heavier optional features live in the requirements-*.txt files below and the
+# installer attempts them best-effort — the core app never fails to install.
 
-# web GUI + agent
-flask>=3.0
-httpx>=0.27
-pyyaml>=6.0
-python-dateutil>=2.9
-rich>=13.0
-pydantic>=2.0
+flask>=3.0            # web GUI
+httpx>=0.27           # Ollama + cloud provider calls
+pyyaml>=6.0           # config
+python-dateutil>=2.9  # date parsing
+rich>=13.0            # CLI output
+keyring>=24.0         # cross-platform API-key / secret storage
+ddgs>=7.0             # web + image search
+beautifulsoup4>=4.12  # page reading (uses the built-in html.parser — no lxml needed)
 
-# database (SQLite is stdlib; psycopg2 is imported for the optional Postgres sync)
-psycopg2-binary>=2.9
-
-# cross-platform secret storage (Keychain / Credential Manager / Secret Service)
-keyring>=24.0
-
-# web search + page reading tools
-ddgs>=7.0
-beautifulsoup4>=4.12
-lxml>=5.2
-
-# charts / visualization tool (make_chart)
-numpy>=1.26
-pandas>=2.0
-matplotlib>=3.8
+# Optional extras (installed best-effort by run.py; install by hand any time):
+#   requirements-charts.txt    numpy/pandas/matplotlib  -> the make_chart tool
+#   requirements-postgres.txt  psycopg2-binary          -> optional Supabase/Postgres sync
+#   requirements-voice.txt     audio + pydantic/fastapi -> standalone `cx voice`

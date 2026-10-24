@@ -111,11 +111,26 @@ Nothing here is sent anywhere. Secrets are never written to plaintext config.
 - All OS-specific behaviour lives in one file — `osutil.py` — and degrades gracefully
   (if a machine can't notify, Cortex logs instead of crashing).
 
+## Cloud models (optional, plug-and-play)
+
+Cortex runs 100% locally by default. To also use a frontier cloud model, open
+**Settings → AI Providers** and paste an API key for **Claude (Anthropic)**, **OpenAI**,
+or **Gemini (Google)**. Then pick its model from the selector at the top-left. Keys are
+stored in your OS keychain (macOS Keychain / Windows Credential Manager / Linux Secret
+Service) — never in a file, and only ever sent to that provider. Remove a key any time
+from the same screen and Cortex falls back to local.
+
+Everything works the same across providers — the agent loop, tools, charts, PDF search —
+because they all go through one unified interface in `cortex/llm/llm.py`.
+
 ## Configuration
 
-Edit `config.yaml` to pick your model(s), timeouts, and feature toggles. The default
-backend is local SQLite — no setup needed. Optional Postgres sync (to a self-hosted
-Supabase) is available but off by default.
+Edit `config.yaml` to pick your default local model(s), timeouts, and feature toggles.
+The default backend is local SQLite — no setup needed. Optional Postgres sync (to a
+self-hosted Supabase) is available but off by default.
+
+`cx gui` serves the app and prints the URL but does **not** auto-open a browser; the
+one-command installer (`run.py`) opens it once on first run.
 
 ## Uninstall
 

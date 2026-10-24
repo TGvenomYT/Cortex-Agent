@@ -141,7 +141,7 @@ class WebCrawler:
             csrf_token = None
             extra_fields = {}
             if "text/html" in login_page.headers.get("content-type", ""):
-                soup = BeautifulSoup(login_page.text, "lxml")
+                soup = BeautifulSoup(login_page.text, "html.parser")
                 form = soup.find("form")
                 if form:
                     # Find hidden inputs (CSRF tokens, etc.)
@@ -241,7 +241,7 @@ class WebCrawler:
                 }
 
             # Parse HTML
-            soup = BeautifulSoup(response.text, "lxml")
+            soup = BeautifulSoup(response.text, "html.parser")
             title = soup.title.string.strip() if soup.title and soup.title.string else None
 
             for tag in soup(STRIP_TAGS):

@@ -16,8 +16,10 @@ logger = logging.getLogger("cortex.calendar")
 # turn via build_messages. Cache results briefly and keep the timeout tight so
 # calendar awareness never dominates response latency.
 _CAL_CACHE: dict[str, tuple[float, list]] = {}
-_CAL_TTL = 300.0       # seconds
-_CAL_TIMEOUT = 4       # seconds
+_CAL_TTL = 300.0       # seconds (successful reads)
+_CAL_MISS_TTL = 1800.0 # seconds — a denied/unavailable calendar won't fix itself soon,
+                       # so cache the empty result long so we don't re-block every turn
+_CAL_TIMEOUT = 2.5     # seconds
 
 
 def get_todays_events() -> list[dict]:
@@ -103,18 +105,28 @@ def get_tomorrows_events() -> list[dict]:
 
 
 def _run_calendar_script(script: str) -> list[dict]:
-    """Run AppleScript and parse the output (cached, tight timeout)."""
+    """Run AppleScript and parse the output (cached, tight timeout).
+
+    macOS Calendar only — on other OSes there's no osascript, so skip without a
+    pointless subprocess. A timeout/failure is cached for a long time so a denied
+    or unavailable calendar never blocks more than one turn per 30 minutes."""
+    import cortex.util.osutil as osutil
+    if not osutil.IS_MAC:
+        return []
     key = hashlib.md5(script.encode()).hexdigest()
     hit = _CAL_CACHE.get(key)
-    if hit and (time.time() - hit[0]) < _CAL_TTL:
-        return hit[1]
+    if hit:
+        ttl = hit[2] if len(hit) > 2 else _CAL_TTL
+        if (time.time() - hit[0]) < ttl:
+            return hit[1]
     try:
         result = subprocess.run(
             ["osascript", "-e", script],
             capture_output=True, text=True, timeout=_CAL_TIMEOUT
         )
         if result.returncode != 0:
-            logger.error(f"Calendar script failed: {result.stderr}")
+            logger.warning("Calendar unavailable (permission?) — skipping calendar context")
+            _CAL_CACHE[key] = (time.time(), [], _CAL_MISS_TTL)
             return []
 
         events = []
@@ -128,15 +140,16 @@ def _run_calendar_script(script: str) -> list[dict]:
                     "calendar": parts[3].strip(),
                     "location": parts[4].strip() if len(parts) > 4 else "",
                 })
-        _CAL_CACHE[key] = (time.time(), events)
+        _CAL_CACHE[key] = (time.time(), events, _CAL_TTL)
         return events
 
     except subprocess.TimeoutExpired:
         logger.warning("Calendar script timed out — skipping calendar context")
-        _CAL_CACHE[key] = (time.time(), [])  # cache the miss so we don't re-block for TTL
+        _CAL_CACHE[key] = (time.time(), [], _CAL_MISS_TTL)
         return []
     except Exception as e:
         logger.error(f"Calendar error: {e}")
+        _CAL_CACHE[key] = (time.time(), [], _CAL_MISS_TTL)
         return []
 
 

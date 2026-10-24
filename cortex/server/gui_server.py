@@ -70,8 +70,10 @@ def ensure_voice():
 @app.route("/")
 def index():
     from cortex.core.context_reader import ContextReader
-    return Response(PAGE.replace("__OWNER__", ContextReader.owner_name())
-                        .replace("__MODEL__", _model_label()), mimetype="text/html")
+    r = Response(PAGE.replace("__OWNER__", ContextReader.owner_name())
+                     .replace("__MODEL__", _model_label()), mimetype="text/html")
+    r.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"  # always serve fresh app
+    return r
 
 
 @app.route("/manifest.json")
@@ -137,47 +139,94 @@ def apple_touch_icon():
 
 @app.route("/sw.js")
 def sw():
+    # SELF-DESTRUCTING service worker. A cache-first SW pinned stale app code in
+    # installed PWAs and hid every fix. Cortex always needs the local server
+    # running anyway, so offline shell-caching buys nothing — this SW deletes all
+    # caches, unregisters itself, and reloads open windows so a stuck PWA heals in
+    # one load and is never controlled by a SW again (the page no longer registers one).
     js = """
-const C='cortex-v2';
 self.addEventListener('install',e=>self.skipWaiting());
-self.addEventListener('activate',e=>e.waitUntil(self.clients.claim()));
-self.addEventListener('fetch',e=>{const u=new URL(e.request.url);
- if(e.request.method==='GET'&&(u.pathname==='/'||u.pathname.startsWith('/icon')||u.pathname==='/manifest.json')){
-  e.respondWith(caches.open(C).then(c=>c.match(e.request).then(m=>m||fetch(e.request).then(r=>{c.put(e.request,r.clone());return r}).catch(()=>m))));
- }});
+self.addEventListener('activate',e=>e.waitUntil((async()=>{
+  const keys=await caches.keys();
+  await Promise.all(keys.map(k=>caches.delete(k)));
+  await self.clients.claim();
+  await self.registration.unregister();
+  const cs=await self.clients.matchAll({type:'window'});
+  cs.forEach(c=>c.navigate(c.url));
+})()));
 """
-    return Response(js, mimetype="application/javascript")
+    r = Response(js, mimetype="application/javascript")
+    r.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"  # always fetch the current SW
+    return r
 
 
 @app.route("/models")
 def models():
-    """Real installed Ollama models + the one currently in use."""
+    """Local Ollama models + cloud models for any provider with an API key."""
+    import cortex.llm.llm as llm_mod
     out = {"current": "", "models": []}
     try:
         out["current"] = core().llm.primary.model
     except Exception:
         pass
+    local = []
     try:
         base = core().config["llm"]["ollama"].get("base_url", "http://localhost:11434")
         data = httpx.get(base + "/api/tags", timeout=4).json()
-        out["models"] = sorted(m["name"] for m in data.get("models", []))
+        local = sorted(m["name"] for m in data.get("models", []))
     except Exception as e:
         logger.warning(f"/models: {e}")
+    cloud = []
+    for prov, has in llm_mod.configured_providers().items():
+        if has:
+            cloud += llm_mod.CLOUD_MODELS.get(prov, [])
+    out["models"] = local + cloud
+    out["local"] = local
+    out["cloud"] = cloud
     return jsonify(out)
 
 
 @app.route("/set_model", methods=["POST"])
 def set_model():
-    """Switch the live model for subsequent requests (real, not a placeholder)."""
+    """Switch the live model — rebuilds the backend so cloud providers work too."""
+    import cortex.llm.llm as llm_mod
     m = (request.get_json(silent=True) or {}).get("model", "").strip()
     if not m:
         return jsonify({"ok": False}), 400
     try:
-        core().llm.primary.model = m   # affects every following ask
-        logger.info(f"model switched to {m}")
+        c = core()
+        c.llm.primary = llm_mod.backend_for_model(m, c.config.get("llm", {}))
+        logger.info(f"model switched to {m} ({llm_mod.provider_for_model(m)})")
         return jsonify({"ok": True, "current": m})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/keys")
+def keys_status():
+    """Which cloud providers have a key set (never returns the keys themselves)."""
+    import cortex.llm.llm as llm_mod
+    return jsonify({"providers": llm_mod.configured_providers()})
+
+
+@app.route("/keys/set", methods=["POST"])
+def keys_set():
+    import cortex.llm.llm as llm_mod
+    d = request.get_json(force=True) or {}
+    prov, key = d.get("provider", ""), (d.get("key", "") or "").strip()
+    if prov not in llm_mod.CLOUD_MODELS or not key:
+        return jsonify({"ok": False, "error": "provider and key required"}), 400
+    ok = llm_mod.set_key(prov, key)
+    return jsonify({"ok": ok})
+
+
+@app.route("/keys/remove", methods=["POST"])
+def keys_remove():
+    import cortex.llm.llm as llm_mod
+    prov = (request.get_json(force=True) or {}).get("provider", "")
+    if prov in llm_mod.CLOUD_MODELS:
+        llm_mod.delete_key(prov)
+    return jsonify({"ok": True})
 
 
 @app.route("/settings", methods=["GET", "POST"])
@@ -830,8 +879,26 @@ q.addEventListener('keydown',e=>{
  if(e.key==='Tab'&&TABFILL&&!q.value.trim()){e.preventDefault();q.value=TABFILL;q.dispatchEvent(new Event('input'));return}
  if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();form.requestSubmit()}});
 // markdown
+const SUP={'0':'⁰','1':'¹','2':'²','3':'³','4':'⁴','5':'⁵','6':'⁶','7':'⁷','8':'⁸','9':'⁹','+':'⁺','-':'⁻','n':'ⁿ','i':'ⁱ','x':'ˣ','y':'ʸ','a':'ᵃ','b':'ᵇ'};
+const SUB={'0':'₀','1':'₁','2':'₂','3':'₃','4':'₄','5':'₅','6':'₆','7':'₇','8':'₈','9':'₉','+':'₊','-':'₋','n':'ₙ','x':'ₓ','i':'ᵢ','a':'ₐ'};
+const SYM={pi:'π',theta:'θ',alpha:'α',beta:'β',gamma:'γ',delta:'δ',Delta:'Δ',lambda:'λ',mu:'μ',sigma:'σ',omega:'ω',phi:'φ',infty:'∞',times:'×',cdot:'·',div:'÷',pm:'±',leq:'≤',geq:'≥',le:'≤',ge:'≥',neq:'≠',approx:'≈',rightarrow:'→',Rightarrow:'⇒',to:'→',sum:'∑',int:'∫',partial:'∂',nabla:'∇',cdots:'⋯',ldots:'…'};
+const sups=s=>[...s].map(c=>SUP[c]||c).join('');
+const subz=s=>[...s].map(c=>SUB[c]||c).join('');
+function tex(e){return e
+ .replace(/\\frac\s*\{([^{}]*)\}\s*\{([^{}]*)\}/g,'($1)/($2)')
+ .replace(/\\sqrt\s*\{([^{}]*)\}/g,'√($1)')
+ .replace(/\^\{([^{}]*)\}/g,(_,p)=>sups(p)).replace(/\^(-?[0-9a-zA-Z])/g,(_,p)=>sups(p))
+ .replace(/_\{([^{}]*)\}/g,(_,p)=>subz(p)).replace(/_(-?[0-9a-zA-Z])/g,(_,p)=>subz(p))
+ .replace(/\\(pi|theta|alpha|beta|gamma|Delta|delta|lambda|mu|sigma|omega|phi|infty|times|cdot|div|pm|leq|geq|le|ge|neq|approx|rightarrow|Rightarrow|to|sum|int|partial|nabla|cdots|ldots)\b/g,(m,n)=>SYM[n]||m)
+ .replace(/\\sqrt\b/g,'√').replace(/\\left|\\right|\\!|\\,|\\;|\\:|\\quad|\\qquad/g,'')
+ .replace(/\\\\/g,' ').replace(/[{}]/g,'').replace(/\\([a-zA-Z]+)/g,'$1').trim()}
+function mathify(t){return t
+ .replace(/\$\$([^$]+)\$\$/g,(_,e)=>tex(e))
+ .replace(/\$([^$\n]+)\$/g,(_,e)=>tex(e))
+ .replace(/\\\(([\s\S]*?)\\\)/g,(_,e)=>tex(e))
+ .replace(/\\\[([\s\S]*?)\\\]/g,(_,e)=>tex(e))}
 function md(src){src=src.replace(/\r/g,'');const out=[],L=src.split('\n');let i=0;
- const inl=t=>esc(t).replace(/```/g,'').replace(/`([^`]+)`/g,'<code>$1</code>').replace(/\*\*([^*]+)\*\*/g,'<b>$1</b>').replace(/(^|[^*])\*([^*]+)\*/g,'$1<i>$2</i>').replace(/\[([^\]]+)\]\((https?:[^)]+)\)/g,'<a href="$2" target="_blank">$1</a>');
+ const inl=t=>esc(mathify(t)).replace(/```/g,'').replace(/`([^`]+)`/g,'<code>$1</code>').replace(/\*\*([^*]+)\*\*/g,'<b>$1</b>').replace(/(^|[^*])\*([^*]+)\*/g,'$1<i>$2</i>').replace(/\[([^\]]+)\]\((https?:[^)]+)\)/g,'<a href="$2" target="_blank">$1</a>');
  while(i<L.length){let ln=L[i];
   if(/^```/.test(ln)){let b=[];i++;while(i<L.length&&!/^```/.test(L[i])){b.push(esc(L[i]));i++}i++;out.push('<pre><code>'+b.join('\n')+'</code></pre>');continue}
   let h=ln.match(/^(#{1,3})\s+(.*)/);if(h){out.push('<h'+h[1].length+'>'+inl(h[2])+'</h'+h[1].length+'>');i++;continue}
@@ -930,6 +997,7 @@ async function openSettings(){CUR=await (await fetch('/settings')).json();
    <div class="navitem on" data-t="profile" onclick="sTab('profile')">Profile</div>
    <div class="navitem" data-t="devices" onclick="sTab('devices')">Devices</div>
    <div class="navitem" data-t="voice" onclick="sTab('voice')">Voice</div>
+   <div class="navitem" data-t="providers" onclick="sTab('providers')">AI Providers</div>
    <div class="navitem" data-t="email" onclick="sTab('email')">Email</div>
    <div class="navitem" data-t="mcp" onclick="sTab('mcp')">MCP</div>
    <div class="navitem" data-t="jobs" onclick="sTab('jobs')">Jobs</div></div>
@@ -940,9 +1008,35 @@ function sTab(t){document.querySelectorAll('.navitem[data-t]').forEach(n=>n.clas
  if(t==='profile')renderProfile(c);
  else if(t==='devices')renderDevices(c);
  else if(t==='voice')renderVoice(c);
+ else if(t==='providers')renderProviders(c);
  else if(t==='email')renderEmail(c);
  else if(t==='mcp')renderMcp(c);
  else renderJobs(c)}
+const PROV=[['anthropic','Claude (Anthropic)','sk-ant-…','console.anthropic.com/settings/keys'],
+            ['openai','OpenAI','sk-…','platform.openai.com/api-keys'],
+            ['gemini','Gemini (Google)','AIza…','aistudio.google.com/apikey']];
+function renderProviders(c){
+ c.innerHTML=`<div class="slabel">AI providers</div>
+  <div class="dsub" style="margin-bottom:12px;line-height:1.5">Cortex runs 100% locally by default. Paste an API key to also use a cloud model — keys are stored in your OS keychain, never in a file, and never leave this machine except to call that provider. After adding a key, pick its model from the selector top-left.</div>
+  <div id="provlist"><div class="dsub">loading…</div></div>`;
+ loadProviders()}
+async function loadProviders(){const L=$('provlist');if(!L)return;
+ let st={};try{st=(await (await fetch('/keys')).json()).providers||{}}catch(_){}
+ L.innerHTML=PROV.map(([id,name,ph,url])=>{const on=st[id];
+  return `<div class="dev"><div class="dico">${PLUG}</div><div style="flex:1;min-width:0">
+    <div class="dname">${esc(name)} ${on?'<span class="dot2 on"></span>':''}</div>
+    <div class="dsub">${on?'Connected ✓':'Not connected'} · <a href="https://${url}" target="_blank">get a key</a></div>
+    <div style="display:flex;gap:8px;margin-top:8px">
+     <input class="inp" id="k_${id}" placeholder="${ph}" autocomplete="off" style="flex:1">
+     <button class="btn" onclick="saveKey('${id}')">${on?'Update':'Connect'}</button>
+     ${on?`<span class="xbtn" title="Remove" onclick="rmKey('${id}')">${TRASH}</span>`:''}
+    </div></div></div>`}).join('')+'<div class="dsub" id="pstat" style="margin-top:10px"></div>'}
+async function saveKey(id){const k=$('k_'+id).value.trim();if(!k){$('pstat').textContent='Paste a key first.';return}
+ $('pstat').textContent='Saving…';
+ try{const r=await fetch('/keys/set',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({provider:id,key:k})});
+  if(!r.ok){$('pstat').textContent='Could not save that key.';return}
+  $('pstat').textContent='Saved ✓ — pick its model from the selector top-left.';loadProviders();loadModels()}catch(_){$('pstat').textContent='Could not save that key.'}}
+async function rmKey(id){await fetch('/keys/remove',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({provider:id})});loadProviders();loadModels()}
 const PLUG='<svg viewBox="0 0 24 24"><path d="M9 2v6M15 2v6M7 8h10v3a5 5 0 0 1-10 0z"/><path d="M12 16v6"/></svg>';
 function renderMcp(c){
  c.innerHTML=`<div class="slabel">MCP servers</div>
@@ -1097,7 +1191,13 @@ function attachFiles(){const i=document.createElement('input');i.type='file';i.m
   try{const j=await (await fetch('/files/upload',{method:'POST',body:fd})).json();tag.remove();
    (j.files||[]).forEach(x=>{const c=el('div','fu');c.textContent='📎 '+x.name+(x.chunks?' · '+x.chunks+' chunks':' · '+(x.error||'?'));$('attached').appendChild(c)})}catch(_){tag.textContent='upload failed'}};
  i.click()}
-if('serviceWorker' in navigator)navigator.serviceWorker.register('/sw.js').catch(()=>{});
+// Unregister any previously-installed service worker + clear its caches (it used
+// to pin stale app code). We deliberately do NOT register a new one — Cortex needs
+// the local server running anyway, so there's nothing to gain from shell caching.
+if('serviceWorker' in navigator){
+  navigator.serviceWorker.getRegistrations().then(rs=>rs.forEach(r=>r.unregister())).catch(()=>{});
+  if(window.caches)caches.keys().then(ks=>ks.forEach(k=>caches.delete(k))).catch(()=>{});
+}
 loadChats();loadModels();refreshProfile();updateThemeIcon();initBell();maybeOnboard();
 </script></body></html>"""
 
@@ -1117,10 +1217,17 @@ def main():
     import threading
     port = int(os.environ.get("CORTEX_GUI_PORT", "7860"))
     url = f"http://127.0.0.1:{port}"
+    # Only auto-open the browser when explicitly asked (the installer sets this on
+    # first run). `cx gui` does NOT open a tab — it just serves and prints the URL.
+    auto_open = os.environ.get("CORTEX_GUI_OPEN", "").lower() in ("1", "true", "yes")
     if _port_in_use(port):
-        logger.info(f"Cortex GUI already running at {url} — opening it."); _open_browser(url); return
-    logger.info(f"Cortex GUI at {url}  (Ctrl+C to stop)")
-    threading.Timer(1.0, lambda: _open_browser(url)).start()
+        logger.info(f"Cortex GUI already running at {url}")
+        if auto_open:
+            _open_browser(url)
+        return
+    logger.info(f"Cortex GUI running at {url}  (open it in your browser; Ctrl+C to stop)")
+    if auto_open:
+        threading.Timer(1.0, lambda: _open_browser(url)).start()
     app.run(host="127.0.0.1", port=port, threaded=True, debug=False)
 
 

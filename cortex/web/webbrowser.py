@@ -64,7 +64,7 @@ def fetch_page(url: str, timeout: int = 15) -> dict:
             }
 
         # Parse HTML
-        soup = BeautifulSoup(response.text, "lxml")
+        soup = BeautifulSoup(response.text, "html.parser")
 
         # Get title
         title = soup.title.string.strip() if soup.title and soup.title.string else None

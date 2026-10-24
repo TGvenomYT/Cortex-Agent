@@ -9,8 +9,21 @@ import logging
 from datetime import datetime, timedelta
 from contextlib import contextmanager
 
-import psycopg2
-from psycopg2 import pool, extras
+# psycopg2 is ONLY needed for the optional Postgres backend / cloud sync. The
+# default backend is local SQLite (no compiler, no Postgres), so make the import
+# optional — on minimal installs (and Pythons with no psycopg2 wheel) the app
+# still runs fully on SQLite. The SQLite shim ignores cursor_factory, so the
+# RealDictCursor stub below is only ever evaluated, never used, in SQLite mode.
+try:
+    import psycopg2
+    from psycopg2 import pool, extras
+except ImportError:
+    psycopg2 = None
+    pool = None
+
+    class _ExtrasStub:
+        RealDictCursor = None
+    extras = _ExtrasStub()
 
 logger = logging.getLogger("cortex.db")
 
@@ -387,9 +400,8 @@ class Database:
 
     def get_all_reminders(self, include_fired: bool = False) -> list:
         """Get all reminders, optionally including fired ones."""
-        import psycopg2.extras
         with self.get_conn() as conn:
-            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            with conn.cursor(cursor_factory=extras.RealDictCursor) as cur:
                 if include_fired:
                     cur.execute("SELECT * FROM reminders ORDER BY due_at ASC")
                 else:

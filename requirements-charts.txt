@@ -1,0 +1,7 @@
+# Cortex — OPTIONAL chart/visualization extras (the make_chart tool).
+# Needs a Python with prebuilt wheels for these (most do; a brand-new ARM Python
+# may not yet). If they can't install, Cortex still runs — charts just won't render.
+#   pip install -r requirements-charts.txt
+numpy>=1.26
+pandas>=2.0
+matplotlib>=3.8

@@ -39,6 +39,7 @@ STAMP = os.path.join(VENV, ".cortex-deps-installed")
 OLLAMA_API = "http://127.0.0.1:11434/api/tags"
 DEFAULT_MODEL = "gemma3:12b"        # solid tool-use default, ~8GB
 LIGHT_MODEL = "gemma3:4b"           # lighter alt for low-RAM machines (~3GB)
+EMBED_MODEL = "nomic-embed-text"    # required for PDF/doc search (RAG), ~275MB
 
 ARGS = sys.argv[1:]
 ASSUME_YES = "--yes" in ARGS
@@ -57,6 +58,18 @@ def sh(cmd, **kw):
     subprocess.check_call(cmd, **kw)
 
 
+def sh_optional(cmd, label):
+    """Run an install that's allowed to fail (optional feature). Returns True/False."""
+    say("    $ " + " ".join(cmd))
+    try:
+        subprocess.check_call(cmd)
+        return True
+    except subprocess.CalledProcessError:
+        say(f"    ⚠ couldn't install {label} on this Python — Cortex still runs; "
+            f"that feature stays off until the wheels are available.")
+        return False
+
+
 def ask_yes(prompt, default=True):
     if ASSUME_YES or not sys.stdin or not sys.stdin.isatty():
         return default
@@ -68,6 +81,33 @@ def ask_yes(prompt, default=True):
     if not ans:
         return default
     return ans in ("y", "yes")
+
+
+def _read_reqs(path):
+    out = []
+    for line in open(path):
+        line = line.split("#", 1)[0].strip()
+        if line:
+            out.append(line)
+    return out
+
+
+def install_requirements(py, path):
+    """Install core deps. Try the fast batch install; if it fails (e.g. one package
+    has no wheel for this Python), fall back to installing each one individually so a
+    single bad package can't block the whole app."""
+    try:
+        sh([py, "-m", "pip", "install", "-q", "-r", path])
+        return
+    except subprocess.CalledProcessError:
+        say("    batch install failed — retrying package-by-package so the rest still land…")
+    failed = []
+    for pkg in _read_reqs(path):
+        if not sh_optional([py, "-m", "pip", "install", "-q", pkg], pkg):
+            failed.append(pkg)
+    if failed:
+        say(f"    ⚠ couldn't install: {', '.join(failed)}. Cortex will run with those "
+            f"features degraded. Tip: a stable Python (3.12 / 3.13) has wheels for everything.")
 
 
 # ── 1. venv + python deps ────────────────────────────────────────────────────
@@ -85,11 +125,17 @@ def ensure_python_env():
             sh([sys.executable, "-m", "venv", VENV])
         py = venv_python()
     if "--reinstall" in ARGS or not os.path.exists(STAMP):
-        say("    installing requirements (first run can take a minute)…")
+        say("    installing core requirements (first run can take a minute)…")
         sh([py, "-m", "pip", "install", "--upgrade", "pip", "--quiet"])
-        sh([py, "-m", "pip", "install", "-q", "-r", os.path.join(HERE, "requirements.txt")])
+        install_requirements(py, os.path.join(HERE, "requirements.txt"))
+        # Optional extras — best-effort. A missing wheel (e.g. matplotlib on a
+        # brand-new ARM Python) must NOT fail the whole install.
+        say("    installing chart support (optional)…")
+        sh_optional([py, "-m", "pip", "install", "-q", "-r",
+                     os.path.join(HERE, "requirements-charts.txt")], "chart support (matplotlib)")
         if "--voice" in ARGS:
-            sh([py, "-m", "pip", "install", "-q", "-r", os.path.join(HERE, "requirements-voice.txt")])
+            sh_optional([py, "-m", "pip", "install", "-q", "-r",
+                         os.path.join(HERE, "requirements-voice.txt")], "voice support")
         open(STAMP, "w").close()
     else:
         say("    dependencies already installed ✓")
@@ -251,6 +297,24 @@ def ensure_model(py):
     return True
 
 
+def ensure_embed_model():
+    """Pull the embedding model used for PDF/document search (RAG). Without it,
+    uploads appear to succeed but can never be retrieved."""
+    step("3b", "Embedding model (for PDF / document search)")
+    have = installed_models()
+    if any(h == EMBED_MODEL or h.startswith(EMBED_MODEL + ":") for h in have):
+        say(f"    '{EMBED_MODEL}' already installed ✓")
+        return True
+    say(f"    pulling '{EMBED_MODEL}' (~275MB) so attached files are searchable…")
+    try:
+        sh(["ollama", "pull", EMBED_MODEL])
+        return True
+    except subprocess.CalledProcessError as e:
+        say(f"    ⚠ couldn't pull {EMBED_MODEL} ({e}) — PDF search won't work until you run: "
+            f"ollama pull {EMBED_MODEL}")
+        return False
+
+
 # ── 4. launch ────────────────────────────────────────────────────────────────
 def _open(url):
     try:
@@ -268,8 +332,9 @@ def launch(py):
     step(4, "Launching Cortex")
     say("    opening the GUI at http://127.0.0.1:7860  (first run will ask your name)")
     say("    Ctrl+C to stop.\n")
+    env = dict(os.environ, CORTEX_GUI_OPEN="1")  # the installer opens a tab once; `cx gui` won't
     try:
-        return subprocess.call([py, "-m", "cortex.server.gui_server"], cwd=HERE)
+        return subprocess.call([py, "-m", "cortex.server.gui_server"], cwd=HERE, env=env)
     except KeyboardInterrupt:
         return 0
 
@@ -283,6 +348,7 @@ def main():
     if "--skip-ollama" not in ARGS:
         if ensure_ollama():
             ensure_model(py)
+            ensure_embed_model()
         else:
             say("\n    (continuing without Ollama — chat won't work until it's installed)")
     return launch(py)

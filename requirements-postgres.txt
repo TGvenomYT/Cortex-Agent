@@ -1,0 +1,6 @@
+# Cortex — OPTIONAL Postgres backend / Supabase cloud-sync.
+# The default backend is local SQLite and needs NONE of this. Only install if you
+# turn on Postgres sync. Needs a psycopg2 wheel for your Python (or Postgres dev
+# headers + a compiler to build from source).
+#   pip install -r requirements-postgres.txt
+psycopg2-binary>=2.9

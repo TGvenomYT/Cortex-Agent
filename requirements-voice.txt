@@ -21,3 +21,6 @@ uvicorn>=0.29
 
 # Apple-Silicon-only MLX speech (skip on Windows/Linux/Intel):
 #   pip install mlx-whisper kokoro-mlx
+
+# the standalone voice SERVER (cx voice) also needs:
+pydantic>=2.0
