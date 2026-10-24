@@ -23,13 +23,13 @@ def needs_onboarding() -> bool:
 
 def _save_owner(name: str):
     os.makedirs(os.path.dirname(_OWNER_FILE), exist_ok=True)
-    with open(_OWNER_FILE, "w") as f:
+    with open(_OWNER_FILE, "w", encoding="utf-8") as f:
         json.dump({"name": name}, f)
 
 
 def mark_done():
     os.makedirs(os.path.dirname(_DONE_FILE), exist_ok=True)
-    open(_DONE_FILE, "w").close()
+    open(_DONE_FILE, "w", encoding="utf-8").close()
 
 
 def run_onboarding(console=None) -> None:

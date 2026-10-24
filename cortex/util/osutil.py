@@ -134,7 +134,7 @@ _SECRETS_FILE = os.path.join(data_dir(), "secrets.json")
 
 def _file_secret_get(account: str) -> str | None:
     try:
-        with open(_SECRETS_FILE) as f:
+        with open(_SECRETS_FILE, encoding="utf-8") as f:
             return json.load(f).get(account)
     except (FileNotFoundError, ValueError):
         return None
@@ -144,10 +144,10 @@ def _file_secret_set(account: str, secret: str) -> bool:
     try:
         data = {}
         if os.path.exists(_SECRETS_FILE):
-            with open(_SECRETS_FILE) as f:
+            with open(_SECRETS_FILE, encoding="utf-8") as f:
                 data = json.load(f)
         data[account] = secret
-        with open(_SECRETS_FILE, "w") as f:
+        with open(_SECRETS_FILE, "w", encoding="utf-8") as f:
             json.dump(data, f)
         if not IS_WINDOWS:
             os.chmod(_SECRETS_FILE, 0o600)
@@ -159,10 +159,10 @@ def _file_secret_set(account: str, secret: str) -> bool:
 
 def _file_secret_delete(account: str) -> None:
     try:
-        with open(_SECRETS_FILE) as f:
+        with open(_SECRETS_FILE, encoding="utf-8") as f:
             data = json.load(f)
         data.pop(account, None)
-        with open(_SECRETS_FILE, "w") as f:
+        with open(_SECRETS_FILE, "w", encoding="utf-8") as f:
             json.dump(data, f)
     except (FileNotFoundError, ValueError):
         pass

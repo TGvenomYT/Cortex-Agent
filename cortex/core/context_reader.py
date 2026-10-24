@@ -158,7 +158,7 @@ class ContextReader:
         """The name Cortex calls its owner — set during onboarding, defaults to Niranjan."""
         import json as _json
         try:
-            with open(os.path.expanduser("~/.cortex/owner.json")) as f:
+            with open(os.path.expanduser("~/.cortex/owner.json"), encoding="utf-8") as f:
                 return _json.load(f).get("name") or "Niranjan"
         except Exception:
             return "Niranjan"

@@ -39,6 +39,7 @@ class CommandExecutor:
                 cwd=effective_cwd,
                 capture_output=True,
                 text=True,
+                encoding="utf-8", errors="replace",  # Windows defaults to cp1252 → charmap errors
                 timeout=timeout,
                 env=env
             )

@@ -78,7 +78,7 @@ def load_env_file(path: str = ENV_FILE) -> None:
     from running inside ~/Documents.
     """
     try:
-        with open(path) as f:
+        with open(path, encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
                 if not line or line.startswith("#") or "=" not in line:
@@ -92,7 +92,7 @@ def load_env_file(path: str = ENV_FILE) -> None:
 def load_config() -> dict:
     for path in CONFIG_PATHS:
         if os.path.exists(path):
-            with open(path) as f:
+            with open(path, encoding="utf-8") as f:
                 return yaml.safe_load(f)
     logger.error("No config.yaml found")
     sys.exit(1)

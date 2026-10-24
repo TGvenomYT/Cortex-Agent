@@ -290,7 +290,7 @@ def detect_project(project_path: str) -> dict:
     if os.path.exists(pkg_json):
         try:
             import json
-            with open(pkg_json) as f:
+            with open(pkg_json, encoding="utf-8") as f:
                 pkg = json.load(f)
             scripts = pkg.get("scripts", {})
             if "dev" in scripts:

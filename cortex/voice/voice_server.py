@@ -38,7 +38,7 @@ def get_hotwords():
     try:
         mtime = os.path.getmtime(HOTWORDS_FILE)
         if mtime != _hotwords_cache["mtime"]:
-            with open(HOTWORDS_FILE, "r") as f:
+            with open(HOTWORDS_FILE, "r", encoding="utf-8") as f:
                 text = f.read().strip()
             _hotwords_cache["value"] = text or None
             _hotwords_cache["mtime"] = mtime

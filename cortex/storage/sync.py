@@ -45,7 +45,7 @@ APPEND_TABLES = ["experiences", "conversations", "autonomy_log", "command_log"]
 
 def _load_hwm() -> dict:
     try:
-        with open(_HWM_FILE) as f:
+        with open(_HWM_FILE, encoding="utf-8") as f:
             return json.load(f)
     except (FileNotFoundError, ValueError):
         return {}
@@ -53,7 +53,7 @@ def _load_hwm() -> dict:
 
 def _save_hwm(hwm: dict):
     ensure_state_dir()
-    with open(_HWM_FILE, "w") as f:
+    with open(_HWM_FILE, "w", encoding="utf-8") as f:
         json.dump(hwm, f)
 
 

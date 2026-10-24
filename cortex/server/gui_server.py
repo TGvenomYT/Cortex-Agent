@@ -110,8 +110,8 @@ def icon(sz):
 def _asset(name, mime):
     path = os.path.join(__import__("cortex").ROOT, "assets", name)
     if os.path.exists(path):
-        mode = "r" if mime.endswith("svg+xml") else "rb"
-        with open(path, mode) as f:
+        text = mime.endswith("svg+xml")
+        with open(path, "r" if text else "rb", encoding="utf-8" if text else None) as f:
             return Response(f.read(), mimetype=mime)
     return Response(b"", status=404)
 

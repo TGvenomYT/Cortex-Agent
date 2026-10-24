@@ -31,14 +31,14 @@ _DEFAULTS = {
 def load() -> dict:
     s = dict(_DEFAULTS)
     try:
-        with open(SETTINGS_FILE) as f:
+        with open(SETTINGS_FILE, encoding="utf-8") as f:
             s.update(json.load(f))
     except (FileNotFoundError, ValueError):
         pass
     # name falls back to owner.json (set by the CLI onboarding)
     if not s.get("name"):
         try:
-            with open(OWNER_FILE) as f:
+            with open(OWNER_FILE, encoding="utf-8") as f:
                 s["name"] = json.load(f).get("name", "") or ""
         except Exception:
             pass
@@ -54,14 +54,14 @@ def save(patch: dict) -> dict:
                  "emails", "mcp_servers", "tasks"):
             s[k] = v
     s.pop("has_avatar", None)
-    with open(SETTINGS_FILE, "w") as f:
+    with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
         json.dump(s, f, indent=2)
     # keep owner.json (persona) + the CLI onboarding flag in sync
     if s.get("name"):
-        with open(OWNER_FILE, "w") as f:
+        with open(OWNER_FILE, "w", encoding="utf-8") as f:
             json.dump({"name": s["name"]}, f)
     if s.get("onboarded"):
-        open(ONBOARD_FLAG, "w").close()
+        open(ONBOARD_FLAG, "w", encoding="utf-8").close()
     return load()
 
 

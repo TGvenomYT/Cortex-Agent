@@ -49,13 +49,13 @@ def _bump_cycle_counter() -> int:
     ensure_state_dir()
     n = 0
     try:
-        with open(_CYCLE_COUNTER) as f:
+        with open(_CYCLE_COUNTER, encoding="utf-8") as f:
             n = int(json.load(f).get("count", 0))
     except (FileNotFoundError, ValueError, json.JSONDecodeError):
         n = 0
     n += 1
     try:
-        with open(_CYCLE_COUNTER, "w") as f:
+        with open(_CYCLE_COUNTER, "w", encoding="utf-8") as f:
             json.dump({"count": n}, f)
     except Exception:
         pass

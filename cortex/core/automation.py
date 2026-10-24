@@ -74,7 +74,7 @@ class AutomationEngine:
 
     def _load_cooldowns(self):
         try:
-            with open(_COOLDOWN_STATE) as f:
+            with open(_COOLDOWN_STATE, encoding="utf-8") as f:
                 raw = json.load(f)
             self._fired_recently = {k: datetime.fromisoformat(v) for k, v in raw.items()}
         except (FileNotFoundError, ValueError, json.JSONDecodeError):
@@ -83,7 +83,7 @@ class AutomationEngine:
     def _save_cooldowns(self):
         try:
             os.makedirs(os.path.dirname(_COOLDOWN_STATE), mode=0o700, exist_ok=True)
-            with open(_COOLDOWN_STATE, "w") as f:
+            with open(_COOLDOWN_STATE, "w", encoding="utf-8") as f:
                 json.dump({k: v.isoformat() for k, v in self._fired_recently.items()}, f)
         except Exception as e:
             logger.warning(f"could not persist automation cooldowns: {e}")

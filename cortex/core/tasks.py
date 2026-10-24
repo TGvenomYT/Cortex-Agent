@@ -96,7 +96,7 @@ def _mac_install(task: dict):
  <key>StandardErrorPath</key><string>{_DIR}/logs/task-{task['id']}-error.log</string>
 </dict></plist>"""
     p = _plist_path(task["id"])
-    with open(p, "w") as f:
+    with open(p, "w", encoding="utf-8") as f:
         f.write(plist)
     subprocess.run(["launchctl", "unload", p], capture_output=True)
     subprocess.run(["launchctl", "load", p], capture_output=True)
