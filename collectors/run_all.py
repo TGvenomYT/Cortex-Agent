@@ -65,18 +65,11 @@ def show_db_context():
     """Print what's currently stored in context_store."""
     config = load_config()
     conn = get_db_conn(config)
-
-    import psycopg2.extras
-    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-        cur.execute("""
-            SELECT category, key, project_path, collected_at,
-                   expires_at, value
-            FROM context_store
-            ORDER BY category, collected_at DESC
-        """)
-        rows = cur.fetchall()
-
+    # Dual-backend: read through the Database API (works on SQLite or Postgres).
+    rows = conn.get_context(max_age_minutes=24 * 60)
     conn.close()
+    for r in rows:
+        r.setdefault("project_path", None)
 
     if not rows:
         print("  (no context in DB yet)")

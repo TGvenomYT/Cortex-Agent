@@ -1,2 +1,4 @@
 #!/bin/bash
-exec "/Users/niranjan/Documents/Cortex Agent/.venv/bin/python3" "/Users/niranjan/Documents/Cortex Agent/cx_app.py" "$@"
+# Cortex CLI — delegates to the cortex.cli.cx_app module in the package.
+cd "/Users/niranjan/Documents/Cortex Agent" || exit 1
+exec "/Users/niranjan/Documents/Cortex Agent/.venv/bin/python3" -m cortex.cli.cx_app "$@"

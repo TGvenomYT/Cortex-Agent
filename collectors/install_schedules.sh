@@ -29,16 +29,19 @@ if [[ ! -f "$VENV_PYTHON" ]]; then
 fi
 
 # Define collectors: name, script, interval_seconds
+# Intervals widened for battery friendliness (were as low as 60s). Context
+# expires in ~15 min, so these cadences keep it fresh without waking the CPU +
+# running an embedding every minute.
 declare -a COLLECTORS=(
-    "shell:shell_collector.py:60"
-    "process:process_collector.py:60"
-    "git:git_collector.py:120"
-    "system:system_collector.py:300"
+    "shell:shell_collector.py:180"
+    "process:process_collector.py:180"
+    "git:git_collector.py:300"
+    "system:system_collector.py:600"
     "project:project_collector.py:1800"
-    "metrics:metrics_collector.py:60"
-    "remote:remote_collector.py:120"
-    "github:github_collector.py:300"
-    "owner:owner_collector.py:1800"
+    "metrics:metrics_collector.py:180"
+    "remote:remote_collector.py:600"
+    "github:github_collector.py:900"
+    "owner:owner_collector.py:3600"
 )
 
 for entry in "${COLLECTORS[@]}"; do

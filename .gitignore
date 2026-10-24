@@ -25,3 +25,7 @@ Thumbs.db
 
 # Database
 *.sqlite
+com.cortex.daemon.plist
+*.retired
+.cortex/
+cortex.env

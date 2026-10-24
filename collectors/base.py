@@ -37,63 +37,33 @@ def load_config() -> dict:
 
 
 def get_db_conn(config: dict):
-    """Return a raw psycopg2 connection (autocommit on)."""
-    db = config["database"]
-    password = db.get("password") or os.environ.get("CORTEX_DB_PASSWORD", "")
-    conn = psycopg2.connect(
-        host=db["host"],
-        port=db["port"],
-        dbname=db["name"],
-        user=db["user"],
-        password=password,
-        connect_timeout=10
+    """
+    Return a connected dual-backend Database (local-first). Collectors used to
+    open a raw psycopg2 connection to the remote Postgres — which broke in the
+    local-first model (their data never reached Cortex's local SQLite, and every
+    run failed when Tailscale was off). Now they write wherever Cortex reads.
+    """
+    sys.path.insert(0, os.path.normpath(os.path.join(os.path.dirname(__file__), "..")))
+    from cortex.storage.db import Database
+    dbc = config["database"]
+    db = Database(
+        backend=dbc.get("backend", "sqlite"),
+        sqlite_path=os.path.expanduser(dbc.get("sqlite_path", "~/.cortex/cortex.db")),
+        host=dbc.get("host"), port=dbc.get("port"), name=dbc.get("name"),
+        user=dbc.get("user"),
+        password=dbc.get("password") or os.environ.get("CORTEX_DB_PASSWORD", ""),
     )
-    conn.autocommit = True
-    return conn
+    if not db.connect():
+        raise RuntimeError("collector: DB connection failed")
+    return db
 
 
 def upsert_context(conn, category: str, key: str, value: dict,
                    project_path: str = None, expires_minutes: int = 15,
                    embedding_text: str = None):
-    """
-    Write a context row to the DB (insert or update).
-    embedding_text: optional text to embed for semantic retrieval (see embeddings.py).
-    If provided, this row becomes findable via db.search_context_semantic().
-    """
-    import json
-    from datetime import datetime, timedelta
-    expires_at = datetime.utcnow() + timedelta(minutes=expires_minutes)
-
-    vec_literal = None
-    if embedding_text:
-        try:
-            import sys, os
-            sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-            from embeddings import embed, to_pgvector
-            vec_literal = to_pgvector(embed(embedding_text))
-        except Exception as e:
-            logging.getLogger("collector.base").warning(f"Embedding failed for {category}/{key}: {e}")
-
-    with conn.cursor() as cur:
-        if vec_literal:
-            cur.execute("""
-                INSERT INTO context_store (category, project_path, key, value, collected_at, expires_at, embedding)
-                VALUES (%s, %s, %s, %s, NOW(), %s, %s::vector)
-                ON CONFLICT (category, project_path, key)
-                DO UPDATE SET value = EXCLUDED.value,
-                              collected_at = NOW(),
-                              expires_at = EXCLUDED.expires_at,
-                              embedding = EXCLUDED.embedding
-            """, (category, project_path, key, json.dumps(value), expires_at, vec_literal))
-        else:
-            cur.execute("""
-                INSERT INTO context_store (category, project_path, key, value, collected_at, expires_at)
-                VALUES (%s, %s, %s, %s, NOW(), %s)
-                ON CONFLICT (category, project_path, key)
-                DO UPDATE SET value = EXCLUDED.value,
-                              collected_at = NOW(),
-                              expires_at = EXCLUDED.expires_at
-            """, (category, project_path, key, json.dumps(value), expires_at))
+    """Write a context row (insert or update) through the dual-backend Database."""
+    conn.upsert_context(category, key, value, project_path=project_path,
+                        expires_minutes=expires_minutes, embedding_text=embedding_text)
 
 
 def run_cmd(cmd: str, cwd: str = None, timeout: int = 10) -> tuple[str, str, int]:
@@ -115,7 +85,5 @@ def run_cmd(cmd: str, cwd: str = None, timeout: int = 10) -> tuple[str, str, int
 
 
 def get_tracked_projects(conn) -> list[dict]:
-    """Fetch all tracked projects from DB."""
-    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-        cur.execute("SELECT name, path, type, custom_commands FROM tracked_projects")
-        return [dict(r) for r in cur.fetchall()]
+    """Fetch all tracked projects via the dual-backend Database."""
+    return [dict(r) for r in conn.get_tracked_projects()]

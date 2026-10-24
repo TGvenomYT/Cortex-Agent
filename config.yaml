@@ -8,21 +8,31 @@ server:
   host: "127.0.0.1"               # localhost only (security)
 
 database:
+  # Local-first: SQLite is the source of truth, so Cortex works with Tailscale
+  # OFF (e.g. on a college network that blocks VPNs). The Postgres block below is
+  # the OPTIONAL sync target, used only when the server is reachable (see sync.py).
+  backend: "sqlite"                # sqlite | postgres
+  sqlite_path: "~/.cortex/cortex.db"
   host: "100.100.35.38"
   port: 5435
   name: "postgres"
   user: "postgres.your-tenant-id"  # Supavisor tenant format
-  password: ""                     # set via env: CORTEX_DB_PASSWORD
+  password: ""                     # from macOS Keychain / ~/.cortex/cortex.env; never commit
 
 llm:
   # 100% local via Ollama. No API keys are ever read for LLM calls.
+  # gemma4-agent:12b-mlx is the measured agentic winner: with the full system
+  # prompt + tools it calls tools 3/3; gemma4:e4b scored 0/3 (it drowns in the
+  # long prompt). The 12b MLX build is also SMALLER than e4b (7.7GB vs 9.6GB),
+  # so this is both more capable AND lighter. This is what lets Cortex actually
+  # complete multi-step jobs.
   ollama:
     base_url: "http://localhost:11434"
-    model: "gemma4:e4b"            # local, JSON mode + vision capable
-    timeout: 60                    # seconds — local inference is slower than cloud
+    model: "gemma4-agent:12b-mlx"  # agentic/tool-use tuned, 7.7GB, fits 24GB
+    timeout: 90                    # 12b local inference needs more headroom
   ollama_fallback:
     base_url: "http://localhost:11434"
-    model: "llama3.1:8b"           # local fallback if primary fails
+    model: "gemma4:12b-mlx"        # also 3/3 on tool-calling; same size
 
 context:
   max_age_minutes: 30              # context stays valid for 30 min
@@ -52,8 +62,9 @@ reminders:
 # notification instead of auto-executed — see autonomy.py.
 autonomy:
   enabled: true
-  interval_minutes: 15
-  max_actions_per_hour: 4
+  interval_minutes: 15          # (legacy thread model) — scheduled model uses the launchd StartInterval
+  max_actions_per_hour: 4       # DB-backed rate cap, enforced across wake-run-exit runs
+  max_steps_per_wake: 4         # multi-step planner: max plan→act→observe steps per wake
   notify_on_action: true
 
 projects:

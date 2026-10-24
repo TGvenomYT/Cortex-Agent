@@ -1,0 +1,23 @@
+# Cortex — OPTIONAL voice/audio extras (install on top of requirements.txt).
+#
+#   pip install -r requirements-voice.txt
+#
+# Browser speech (the GUI mic/speaker) needs NONE of these — it uses the
+# browser's own Web Speech API. These are only for the standalone `cx voice`
+# mode and the in-process voice server.
+#
+# NOTE: pyaudio needs a system PortAudio lib first:
+#   macOS:  brew install portaudio
+#   Debian: sudo apt install portaudio19-dev
+#   Windows: bundled in the wheel (usually no extra step)
+
+SpeechRecognition>=3.10
+pyaudio>=0.2.14
+webrtcvad-wheels>=2.0.10
+sounddevice>=0.4
+soundfile>=0.12
+fastapi>=0.110
+uvicorn>=0.29
+
+# Apple-Silicon-only MLX speech (skip on Windows/Linux/Intel):
+#   pip install mlx-whisper kokoro-mlx
