@@ -1262,6 +1262,7 @@ html:not([data-theme=light]) .bgwarn{color:#f28b82}
 .utab{width:100%;border-collapse:collapse;font-size:12px}.utab td,.utab th{padding:5px 6px;text-align:left;border-bottom:1px solid var(--line);color:var(--mut)}
 .utab td.n,.utab th.n{text-align:right}
 .ugrid{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:12px}
+.modal>.sub{border:0;background:none;padding:0;margin:0 0 12px}
 .opt.go{background:var(--blue);color:var(--onblue);border-color:var(--blue)}
 .mh{font-size:11px;color:var(--dim);padding:8px 12px 4px;text-transform:uppercase;letter-spacing:.4px}
 .mi.locked{color:var(--dim)}

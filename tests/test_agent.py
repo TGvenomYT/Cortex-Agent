@@ -512,6 +512,17 @@ def test_a_correction_cannot_smuggle_in_a_secret(make_core):
     assert notes(core) == ["The user uses wifi at home."]
 
 
+def test_a_secret_in_command_output_is_not_logged(make_core):
+    core = make_core()
+    res = core.executor.execute("echo token=abc123secret", source="test")
+    assert "abc123secret" in res["stdout"]      # the job itself still sees real output
+    with core.db.get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT stdout, command FROM command_log ORDER BY id DESC LIMIT 1")
+            row = cur.fetchone()
+    assert "abc123secret" not in (row[0] + row[1])
+
+
 def test_a_secret_in_chat_is_not_stored_or_replayed(make_core):
     core = make_core("Got it.", "ok")
     run(core.ask_stream("my password is hunter2-test, log me in", "s1", "gui"))

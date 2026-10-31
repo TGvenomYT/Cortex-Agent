@@ -29,8 +29,9 @@ Runs on **macOS, Windows and Linux**.
    official Linux script / winget — and starts it,
 3. checks the model in `config.yaml`; if it isn't available on your machine it pulls a
    sensible default (`gemma3:12b`) and points the config at it,
-4. opens the Cortex GUI at **http://127.0.0.1:7860**, whose first run walks you through
-   onboarding (your name, optional server).
+4. adds a `cx` command (on macOS and Linux, in `~/.local/bin`),
+5. opens the Cortex GUI at **http://127.0.0.1:7860**, whose first run walks you through
+   setup: your name, an optional server, and what Cortex may keep track of.
 
 Everything is incremental — anything already installed is left alone, so re-running is
 safe and a machine that's already set up just launches.
@@ -65,7 +66,8 @@ python3 run.py --skip-ollama  # just venv + launch, don't touch Ollama/models
 - **Email** — connect Gmail (app password, stored in your OS keychain) to triage your inbox.
 - **Web + vision + charts** — web search, page reading, image search, and a `make_chart`
   tool that renders real plots inline.
-- **Memory** — remembers your preferences and facts across sessions.
+- **Memory** — picks up what you tell it about yourself as you talk, and remembers it in
+  every later chat. See and delete it all in Settings → Memory.
 - **Attachments / RAG** — drop in PDFs, docs, images or video and ask about them.
 - **Works offline** — with a local model, the whole thing runs against your local LLM and
   local DB.
@@ -157,6 +159,25 @@ Cortex Agent/
   legacy/           archived old daemon (not used — see legacy/README.md)
 ```
 
+## Your data, on your machine
+
+Each person's install is entirely their own: their name, memory, chats and settings live in
+their `~/.cortex`, and nothing is shared between machines.
+
+**Memory.** After each message Cortex notes what you said about yourself, reading only your own
+words. A correction replaces the old note, repeats are ignored, and "from now on…" becomes a
+standing rule. Each question brings up whatever memories bear on it, so nothing is lost as they
+add up. **Passwords, keys and card numbers are never kept**, and are masked in stored chats.
+
+**What it keeps track of.** Nothing runs in the background until setup asks. Reminders, this
+computer's health and your projects are on by default; shell history and machine details (installed
+apps, Wi-Fi names, SSH key names) stay off unless you turn them on. Change it any time in Settings →
+Background or with `cx workers`. If you only use cloud models, these stay on your machine, but what's
+relevant to a question goes to that provider with it.
+
+**Your own settings** go in `~/.cortex/config.yaml`, which sits on top of the project's `config.yaml` and
+survives updates. Keep the project's copy free of anything personal, since everyone shares it.
+
 ## Where your data lives
 
 Everything is under `~/.cortex/`:
@@ -165,6 +186,7 @@ Everything is under `~/.cortex/`:
 |------|------|
 | `~/.cortex/cortex.db` | the local SQLite database (conversations, memory, tasks, …) |
 | `~/.cortex/settings.json` | your settings (name, connected accounts, scheduled tasks) |
+| `~/.cortex/config.yaml` | your own overrides of the shared config (optional) |
 | `~/.cortex/artifacts/` | generated charts/images |
 | `~/.cortex/checkpoints/` | copies kept for undo (14 days) |
 | `~/.cortex/runs/` | output of background commands (3 days) |
@@ -178,10 +200,10 @@ are never written to plaintext config.
 
 ## Platform notes
 
-- **macOS** is the most battle-tested (notifications via Notification Center, always-on
-  recurring tasks via `launchd`, MLX-accelerated voice).
-- **Linux**: notifications via `notify-send`, recurring tasks via `cron`.
-- **Windows**: toast notifications via PowerShell, recurring tasks via Task Scheduler.
+- **macOS** is the most battle-tested (notifications via Notification Center, background
+  work via `launchd`, MLX-accelerated voice).
+- **Linux**: notifications via `notify-send`, background work via `cron`.
+- **Windows**: toast notifications via PowerShell, background work via Task Scheduler.
 - All OS-specific behaviour lives in one file — `osutil.py` — and degrades gracefully
   (if a machine can't notify, Cortex logs instead of crashing).
 

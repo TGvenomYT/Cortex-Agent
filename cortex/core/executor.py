@@ -14,6 +14,8 @@ import time
 import logging
 import uuid
 
+from cortex.core.safety import redact
+
 logger = logging.getLogger("cortex.executor")
 
 RUNS_DIR = "~/.cortex/runs"
@@ -91,8 +93,8 @@ class CommandExecutor:
 
         def finish(exit_code, stdout, stderr, **extra):
             duration_ms = int((time.time() - start) * 1000)
-            self.db.log_command(command=command, exit_code=exit_code, stdout=(stdout or "")[:5000],
-                                stderr=(stderr or "")[:2000], duration_ms=duration_ms,
+            self.db.log_command(command=redact(command), exit_code=exit_code, stdout=redact(stdout or "")[:5000],
+                                stderr=redact(stderr or "")[:2000], duration_ms=duration_ms,
                                 triggered_by=source, project_path=cwd)
             logger.info(f"Command finished: exit={exit_code}, {duration_ms}ms")
             return {"exit_code": exit_code, "stdout": stdout, "stderr": stderr,
