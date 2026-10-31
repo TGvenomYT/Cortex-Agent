@@ -211,6 +211,15 @@ def _wide_target(path: str) -> bool:
         or os.path.dirname(p) in ("/Users", "/home")
 
 
+def _risky_write(path: str) -> bool:
+    """Writing here changes how the machine or a program behaves, not just a file's contents."""
+    p = _expand(path)
+    home = os.path.expanduser("~").rstrip("/")
+    return bool(_SENSITIVE.search(p) or re.search(r"Library/(LaunchAgents|LaunchDaemons)|\.config/", p)
+                or (os.path.dirname(p) == home and os.path.basename(p).startswith("."))
+                or any(p == d or p.startswith(d + "/") for d in _SYSTEM_DIRS - {"/private", "/Users", "/home", "/var"}))
+
+
 def _rm_verdict(args: list[str], sudo: bool) -> tuple[int, str]:
     flags = "".join(a[1:] for a in args if a.startswith("-") and not a.startswith("--"))
     recursive = "r" in flags.lower() or "--recursive" in args or "--dir" in args
@@ -344,8 +353,17 @@ def _simple(prog: str, args: list[str], raw: str, known_hosts: set, depth: int,
             return _DANGER, f"`docker {sub}` can stop or remove things", ""
         return (_SAFE, "", "") if sub in _READ_ONLY_SUB["docker"] else (_UNKNOWN, "", "docker")
     if name == "find":
-        if set(args) & {"-delete", "-exec", "-execdir", "-ok", "-okdir", "-fprint", "-fprintf", "-fls"}:
+        if set(args) & {"-delete", "-fprint", "-fprintf", "-fls"}:
             return _DANGER, "it can delete or change the files it finds", ""
+        for flag in ("-exec", "-execdir", "-ok", "-okdir"):
+            if flag in args:        # judged by what it runs on each file: `-exec wc -l {} +` only reads
+                inner = args[args.index(flag) + 1:]
+                inner = [a for a in inner if a not in ("{}", "+", ";")]
+                if not inner:
+                    return _DANGER, "it can delete or change the files it finds", ""
+                level, why, key = _simple(os.path.basename(inner[0]), inner[1:], raw, known_hosts, depth + 1, sudo)
+                if level != _SAFE:
+                    return max(level, _DANGER), why or "it can delete or change the files it finds", ""
         return _SAFE, "", ""
     if name == "sed":
         if any(a.startswith("-i") or a == "--in-place" for a in args):
@@ -402,8 +420,10 @@ def _classify(command: str, known_hosts: set, depth: int = 0) -> tuple[int, str,
     for path in writes:
         if re.match(r"/dev/(sd|disk|rdisk|nvme)", path):
             note(_BLOCKED, "it would write straight over a disk")
-        else:
+        elif _risky_write(path):
             note(_DANGER, f"it writes to {path}")
+        else:
+            note(_UNKNOWN, "", "writing files")
     for pipeline in pipelines:
         names = []
         for argv in pipeline:
@@ -458,7 +478,8 @@ def _shell_verdict(cmd: str, tainted: bool, background: bool, grants, mode: str)
     if level == "safe":
         return Verdict(ALLOW)
     if tainted:
-        return Verdict(ASK, show + "\nI've been reading outside content this turn, so I'm checking with you first. OK?")
+        return Verdict(ASK, show + "\n**Check this one.** It came up right after I read outside content, so that "
+                                   "content could be what's asking for it. Only say yes if you wanted this.")
     if level == "danger":
         return Verdict(ASK, show + f"\nHeads up: {why}. Go ahead?")
     if not background and (mode == "balanced" or (key and key in grants)):
@@ -542,7 +563,7 @@ def evaluate(action: dict, *, tainted: bool = False, background: bool = False,
             return Verdict(ALLOW)
         if op == "remove":
             return Verdict(ALLOW) if not tainted else Verdict(ASK, f"Remove scheduled task {action.get('task_id')}?")
-        return Verdict(ASK, f"I'd like to schedule this to run on its own, {action.get('task_schedule')}:\n\n"
+        return Verdict(ASK, f"I'd like to schedule this to run on its own, {_when(action.get('task_schedule'))}:\n\n"
                             f"> {action.get('task_prompt')}\n\nIt keeps running in the background until "
                             "it finishes or you stop it. Set it up?")
 
@@ -584,6 +605,15 @@ def evaluate(action: dict, *, tainted: bool = False, background: bool = False,
                             f"```\n{str(action.get('mcp_args') or {})[:600]}\n```\n\nOK?", key)
 
     return Verdict(ASK, f"I'd like to do something I can't classify ({kind or 'unknown'}). OK?")
+
+
+def _when(schedule) -> str:
+    """What the schedule will really do, which may be slower than what was asked for."""
+    from cortex.core.tasks import parse_schedule
+    try:
+        return parse_schedule(schedule)[1]
+    except ValueError:
+        return str(schedule)
 
 
 def needs_confirmation(action: dict) -> tuple[bool, str]:

@@ -1,12 +1,12 @@
 # Cortex ✦ — your brother in the machine
 
-A private, on-device AI assistant. It runs a **local LLM** (via [Ollama](https://ollama.com)),
-keeps all its data in a **local SQLite database**, and gives you a clean chat GUI that can
-actually *do* things on your machine — answer questions about your system, run commands,
-read your email, search the web, make charts, remember what matters, and quietly run
-recurring tasks for you.
+A private AI assistant that lives on your computer. It runs a **local LLM** (via
+[Ollama](https://ollama.com)) or a **cloud model** if you add a key, keeps all its data in a
+**local SQLite database**, and gives you a clean chat GUI that can actually *do* things on
+your machine — answer questions about your system, run commands, read your email, search
+the web, make charts, remember what matters, and quietly run recurring tasks for you.
 
-No cloud keys. No account. Nothing leaves your machine unless you ask it to.
+No account needed. With a local model, nothing leaves your machine unless you ask it to.
 
 Runs on **macOS, Windows and Linux**.
 
@@ -44,22 +44,52 @@ python3 run.py --skip-ollama  # just venv + launch, don't touch Ollama/models
 > You can still do it by hand: install Ollama from [ollama.com](https://ollama.com),
 > `ollama pull <model>`, set it in `config.yaml`, then `python3 run.py --skip-ollama`.
 
+> **Can't install Ollama?** You don't need it. Add an **Ollama Cloud** key (see
+> [Cloud models](#cloud-models-optional-plug-and-play)) and pick a cloud model. Uploaded files
+> are then searched by keyword rather than by meaning.
+
 ---
 
 ## What it can do
 
 - **Chat that acts** — a multi-step agent loop: it plans, runs tools, looks at the
-  results, and answers in plain language (never dumps raw logs at you).
+  results, and answers in plain language (never dumps raw logs at you). Replies appear as
+  they're written.
+- **Asks before it acts** — see [Approvals](#approvals) below.
 - **Knows your system** — ask “is my machine OK?” and it actually checks.
 - **Recurring tasks** — “every morning at 8, email me a news briefing.” Cortex schedules
-  it with your OS scheduler (launchd / cron / Task Scheduler) and delivers the result.
+  it with your OS scheduler (launchd / cron / Task Scheduler) and delivers the result. A run
+  with nothing to say stays quiet, and a job with an end (“tell me when X happens”) stops
+  itself once it's done.
 - **Proactive nudges** — a notification bell for things it noticed while you were away.
 - **Email** — connect Gmail (app password, stored in your OS keychain) to triage your inbox.
 - **Web + vision + charts** — web search, page reading, image search, and a `make_chart`
   tool that renders real plots inline.
 - **Memory** — remembers your preferences and facts across sessions.
 - **Attachments / RAG** — drop in PDFs, docs, images or video and ask about them.
-- **Works offline** — the whole thing runs against your local LLM and local DB.
+- **Works offline** — with a local model, the whole thing runs against your local LLM and
+  local DB.
+
+## Approvals
+
+Every action Cortex takes goes through one gate (`cortex/core/safety.py`), whether it comes
+from chat, a helper, a scheduled task or autonomy:
+
+- **Read-only work runs on its own.** A command counts only if every part of it is known to
+  be read-only. Anything unrecognised is treated as not read-only.
+- **Everything else asks first**, with buttons, and the job carries on from where it paused
+  once you answer. "Allow in this chat" stops the prompts for ordinary repeated commands.
+- **When nobody's there** (scheduled tasks, autonomy), it goes to the approvals inbox in the
+  notification bell, and the job continues without it.
+- **Some things are refused outright**, even if you approve: erasing disks, deleting a home
+  or system folder, force-pushing, and reading saved passwords.
+
+Once Cortex has read outside content in a turn (a web page, an email, a file), that text might
+contain instructions from a stranger. It's marked as untrusted, and from then on everything
+beyond reading asks first, whatever you allowed earlier.
+
+Settings → Background → Approvals can loosen this to **Balanced**, where ordinary commands you
+asked for run without a prompt. Destructive ones always ask.
 
 ---
 
@@ -72,18 +102,19 @@ Cortex Agent/
   uninstall.py      cross-platform uninstaller
   config.yaml       models, timeouts, feature toggles
   cortex/           the application package
-    core/           agent loop, memory, safety, reminders, automation, autonomy, tasks
+    core/           agent loop, the safety gate, memory, reminders, automation, autonomy, tasks
     llm/            Ollama client, tools, schemas, embeddings, chart + NLG
     web/            web search, crawl, browser automation
     voice/          MLX voice server + voice mode
     storage/        SQLite + Postgres-sync backends, RAG, settings
     server/         Flask GUI + the scheduled-job runner
     integrations/   Gmail, calendar, MCP client
-    cli/            the `cx` terminal app + dashboard
+    cli/            the `cx` terminal app
     util/           OS compat, secrets, config bootstrap, notifications
   collectors/       background system-state collectors (run on a schedule)
   assets/           app icons + favicon
   docs/             plan, DB schema, Siri shortcuts
+  tests/            pytest suite (pip install -r requirements-dev.txt, then pytest)
   legacy/           archived old daemon (not used — see legacy/README.md)
 ```
 
@@ -98,7 +129,9 @@ Everything is under `~/.cortex/`:
 | `~/.cortex/artifacts/` | generated charts/images |
 | OS secret store | DB/email passwords (macOS Keychain · Windows Credential Manager · Linux Secret Service) |
 
-Nothing here is sent anywhere. Secrets are never written to plaintext config.
+Nothing here is sent anywhere, except that a cloud model sees what it needs for the task
+at hand (your messages, relevant memories, uploaded text) when you choose to use one. Secrets
+are never written to plaintext config.
 
 ---
 
@@ -113,12 +146,26 @@ Nothing here is sent anywhere. Secrets are never written to plaintext config.
 
 ## Cloud models (optional, plug-and-play)
 
-Cortex runs 100% locally by default. To also use a frontier cloud model, open
-**Settings → AI Providers** and paste an API key for **Claude (Anthropic)**, **OpenAI**,
-or **Gemini (Google)**. Then pick its model from the selector at the top-left. Keys are
-stored in your OS keychain (macOS Keychain / Windows Credential Manager / Linux Secret
-Service) — never in a file, and only ever sent to that provider. Remove a key any time
-from the same screen and Cortex falls back to local.
+Cortex runs locally by default. To also use a cloud model, open **Settings → AI Providers**
+(or run `cx key <provider>`) and paste a key, then pick the model from the selector at the
+top-left (or `cx model <name>`). Your choice is remembered, and the terminal and background
+jobs use it too.
+
+| Provider | Key from | Needs Ollama installed? |
+|----------|----------|-------------------------|
+| **Ollama Cloud** | [ollama.com/settings/keys](https://ollama.com/settings/keys) | No |
+| Claude | [console.anthropic.com](https://console.anthropic.com/settings/keys) | No |
+| OpenAI | [platform.openai.com](https://platform.openai.com/api-keys) | No |
+| Gemini | [aistudio.google.com](https://aistudio.google.com/apikey) | No |
+
+**How Ollama is routed:** local models go to the Ollama running on this machine
+(`localhost:11434`), and cloud models go straight to `https://ollama.com/api` with your key.
+The cloud list needs no key, so it shows up even with nothing installed. Models already
+signed in through `ollama signin` keep working through the local daemon if you add no key.
+
+If you've added a key and the local engine isn't running, a job fails over to a cloud model
+instead of stopping. Keys are stored in your OS keychain — never in a file, and only ever sent
+to that provider. Remove one any time from the same screen.
 
 Everything works the same across providers — the agent loop, tools, charts, PDF search —
 because they all go through one unified interface in `cortex/llm/llm.py`.

@@ -27,6 +27,7 @@ backend converts this to/from its own wire format.
 """
 
 import os
+import re
 import json
 import time
 import uuid
@@ -242,13 +243,18 @@ class OllamaBackend(LLMBackend):
     to the cloud."""
 
     def __init__(self, base_url: str = "http://localhost:11434", model: str = "gemma4:e4b",
-                 timeout: int = 60, api_key: str = None, num_ctx: int = None):
+                 timeout: int = 60, api_key: str = None, num_ctx: int = None, max_tokens: int = None,
+                 think: bool = None):
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.timeout = timeout
         self.api_key = api_key
         self.num_ctx = num_ctx
+        self.max_tokens = max_tokens
+        self.think = think
+        self._can_think = False
         self._no_tools = False      # this model turned out not to support tool calling
+        self._ctx_checked = False
 
     @property
     def label(self) -> str:
@@ -256,6 +262,21 @@ class OllamaBackend(LLMBackend):
 
     def _headers(self) -> dict:
         return {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
+
+    def _probe(self) -> None:
+        """Read the model's own settings, once. num_ctx only ever raises what it was built with:
+        Ollama's default can silently cut off a long prompt, but a bigger window stays."""
+        if self._ctx_checked:
+            return
+        self._ctx_checked = True
+        try:
+            info = httpx.post(f"{self.base_url}/api/show", json={"model": self.model}, timeout=3).json()
+            own = re.search(r"num_ctx\s+(\d+)", info.get("parameters") or "")
+            if own and self.num_ctx and int(own.group(1)) >= self.num_ctx:
+                self.num_ctx = None
+            self._can_think = "thinking" in (info.get("capabilities") or [])
+        except (httpx.HTTPError, ValueError) as e:
+            logger.debug(f"couldn't read {self.model}'s settings: {e}")
 
     def _httpx_timeout(self):
         # Fail fast if nothing's there, but give a model that's loading time to answer.
@@ -286,8 +307,14 @@ class OllamaBackend(LLMBackend):
             payload["tools"] = tools
         if not self.api_key:
             payload["keep_alive"] = resolve_keep_alive()
-            if self.num_ctx:
-                payload["options"] = {"num_ctx": self.num_ctx}
+            self._probe()
+            options = {k: v for k, v in (("num_ctx", self.num_ctx), ("num_predict", self.max_tokens)) if v}
+            if options:
+                payload["options"] = options
+            # A small local model given free rein to think can spend minutes reasoning in
+            # silence, or never stop: Ollama streams nothing until the thinking ends.
+            if self._can_think and self.think is not None:
+                payload["think"] = self.think
         return payload
 
     def _post(self, payload: dict) -> dict:
@@ -327,9 +354,10 @@ class OllamaBackend(LLMBackend):
         return list(merged.values())
 
     def complete_with_tools(self, messages: list[dict], tools: list[dict]) -> dict:
-        msg = self._post(self._payload(messages, tools=tools)).get("message", {})
+        data = self._post(self._payload(messages, tools=tools))
+        msg = data.get("message", {})
         return {"content": msg.get("content", ""), "tool_calls": self._calls(msg.get("tool_calls") or []),
-                "thinking": msg.get("thinking", "")}
+                "thinking": msg.get("thinking", ""), "truncated": data.get("done_reason") == "length"}
 
     def _lines(self, payload: dict):
         """The stream as parsed chunks. Raises with a readable body on an HTTP error."""
@@ -356,7 +384,7 @@ class OllamaBackend(LLMBackend):
         return stream, next(stream, None)
 
     def stream_with_tools(self, messages: list[dict], tools: list[dict]):
-        content, thinking, calls = "", "", []
+        content, thinking, calls, reason = "", "", [], None
         start = time.time()
         payload = self._payload(messages, stream=True, tools=tools)
         try:
@@ -369,6 +397,7 @@ class OllamaBackend(LLMBackend):
             stream, first = self._open({k: v for k, v in payload.items() if k != "tools"})
         for chunk in itertools.chain([first] if first else [], stream):
             msg = chunk.get("message") or {}
+            reason = chunk.get("done_reason") or reason
             thinking += msg.get("thinking") or ""
             calls.extend(msg.get("tool_calls") or [])
             piece = msg.get("content") or ""
@@ -376,7 +405,8 @@ class OllamaBackend(LLMBackend):
                 content += piece
                 yield "delta", piece
         logger.info(f"Ollama [{self.model}] {int((time.time()-start)*1000)}ms ({self.label}, stream)")
-        yield "done", {"content": content, "tool_calls": self._calls(calls), "thinking": thinking}
+        yield "done", {"content": content, "tool_calls": self._calls(calls), "thinking": thinking,
+                       "truncated": reason == "length"}
 
     def stream(self, messages: list[dict]):
         for c in self._lines(self._payload(messages, stream=True)):
@@ -433,7 +463,9 @@ class OpenAICompatBackend(LLMBackend):
         return r.json()["choices"][0]["message"].get("content") or ""
 
     def complete_with_tools(self, messages: list[dict], tools: list[dict]) -> dict:
-        payload = {"model": self.model, "messages": self._wire_messages(messages), "tools": tools}
+        payload = {"model": self.model, "messages": self._wire_messages(messages)}
+        if tools:
+            payload["tools"] = tools
         start = time.time()
         r = httpx.post(f"{self.base_url}/chat/completions", headers=self._headers(),
                        json=payload, timeout=self.timeout)
@@ -532,9 +564,10 @@ class AnthropicBackend(LLMBackend):
 
     def complete_with_tools(self, messages: list[dict], tools: list[dict]) -> dict:
         system, conv = self._convert(messages)
-        data = self._post({"model": self.model, "max_tokens": self.max_tokens,
-                           "system": system, "messages": conv,
-                           "tools": self._tools_to_anthropic(tools)})
+        body = {"model": self.model, "max_tokens": self.max_tokens, "system": system, "messages": conv}
+        if tools:
+            body["tools"] = self._tools_to_anthropic(tools)
+        data = self._post(body)
         content, thinking, tcs = "", "", []
         for b in data.get("content", []):
             bt = b.get("type")
@@ -564,14 +597,23 @@ class LLMRouter:
     def _chain(self) -> list:
         return [b for b in (self.primary, self.fallback, self.rescue) if b is not None]
 
+    @staticmethod
+    def _worth_trying(backend, last_error) -> bool:
+        """A local model that timed out means this machine is the bottleneck. Loading a
+        second one to repeat the wait only makes that worse, so go straight to the cloud."""
+        stalled = isinstance(last_error, httpx.TimeoutException)
+        return not (stalled and isinstance(backend, OllamaBackend) and not backend.api_key)
+
     def _first_answer(self, call, what: str):
-        first_error = None
+        first_error = last_error = None
         for backend in self._chain():
+            if not self._worth_trying(backend, last_error):
+                continue
             try:
                 return call(backend)
             except Exception as e:
                 logger.warning(f"{what} [{getattr(backend, 'model', '?')}] failed: {e}")
-                first_error = first_error or e
+                first_error, last_error = first_error or e, e
         raise first_error  # report the chosen model's error, not the last fallback's
 
     def complete(self, messages, json_mode=False, schema=None):
@@ -581,8 +623,10 @@ class LLMRouter:
         return self._first_answer(lambda b: b.complete_with_tools(messages, tools), "LLM (tools)")
 
     def stream_with_tools(self, messages, tools):
-        first_error = None
+        first_error = last_error = None
         for backend in self._chain():
+            if not self._worth_trying(backend, last_error):
+                continue
             started = False
             try:
                 for kind, payload in backend.stream_with_tools(messages, tools):
@@ -593,7 +637,7 @@ class LLMRouter:
                 if started:      # part of a reply is already on screen; don't splice in another model
                     raise
                 logger.warning(f"LLM stream [{getattr(backend, 'model', '?')}] failed: {e}")
-                first_error = first_error or e
+                first_error, last_error = first_error or e, e
         raise first_error
 
     def stream(self, messages):
@@ -606,6 +650,11 @@ class LLMRouter:
 
 def _ollama_cfg(config: dict) -> dict:
     return config.get("ollama", {}) or {}
+
+
+def _local_tuning(config: dict) -> dict:
+    cfg = _ollama_cfg(config)
+    return {"num_ctx": cfg.get("num_ctx"), "max_tokens": cfg.get("max_tokens", 2048), "think": cfg.get("think", False)}
 
 
 def _ollama_base(config: dict) -> str:
@@ -639,8 +688,7 @@ def backend_for_model(model: str, config: dict, timeout: int = 90) -> LLMBackend
                                        key, model, "gemini", timeout)
         logger.warning("Gemini model selected but no Google API key set — using local model")
     # default: local Ollama
-    return OllamaBackend(base_url=_ollama_base(config), model=model, timeout=timeout,
-                         num_ctx=_ollama_cfg(config).get("num_ctx"))
+    return OllamaBackend(base_url=_ollama_base(config), model=model, timeout=timeout, **_local_tuning(config))
 
 
 def saved_model() -> str | None:
@@ -718,8 +766,7 @@ def create_router(config: dict) -> LLMRouter:
     fallback_model = fallback_cfg.get("model") or config.get("fallback")
     if fallback_model:
         fallback = OllamaBackend(base_url=fallback_cfg.get("base_url", base_url), model=fallback_model,
-                                 timeout=fallback_cfg.get("timeout", timeout),
-                                 num_ctx=ollama_cfg.get("num_ctx"))
+                                 timeout=fallback_cfg.get("timeout", timeout), **_local_tuning(config))
     rescue = None
     if isinstance(primary, OllamaBackend) and not primary.api_key:
         rescue = rescue_backend()

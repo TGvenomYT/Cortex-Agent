@@ -83,6 +83,63 @@ def test_local_call_sends_context_size_and_no_key(fake):
     assert req["_auth"] is None and req["options"]["num_ctx"] == 16384 and req["keep_alive"]
 
 
+def test_context_size_only_ever_raises_a_models_own(fake):
+    fake.parameters = "num_ctx                        32768\ntemperature 1"
+    b = llm.OllamaBackend(fake.url, "m:1", num_ctx=16384)
+    b.complete([{"role": "user", "content": "hi"}])
+    assert "options" not in fake.requests[-1]
+    fake.parameters = "num_ctx 4096"
+    b = llm.OllamaBackend(fake.url, "m:2", num_ctx=16384)
+    b.complete([{"role": "user", "content": "hi"}])
+    assert fake.requests[-1]["options"]["num_ctx"] == 16384
+
+
+def test_thinking_is_off_and_output_capped_locally(fake):
+    fake.capabilities = ["completion", "tools", "thinking"]
+    b = llm.OllamaBackend(fake.url, "m:1", think=False, max_tokens=2048)
+    b.complete([{"role": "user", "content": "hi"}])
+    req = fake.requests[-1]
+    assert req["think"] is False and req["options"]["num_predict"] == 2048
+
+
+def test_think_is_not_sent_to_a_model_that_cannot_think(fake):
+    b = llm.OllamaBackend(fake.url, "m:1", think=False)
+    b.complete([{"role": "user", "content": "hi"}])
+    assert "think" not in fake.requests[-1]
+
+
+def test_a_stalled_local_model_does_not_load_a_second_local_model(monkeypatch):
+    import httpx
+
+    class Stalls(llm.OllamaBackend):
+        tried = 0
+
+        def complete(self, *a, **k):
+            type(self).tried += 1
+            raise httpx.ReadTimeout("slow")
+
+    class Rescue(llm.LLMBackend):
+        def complete(self, *a, **k):
+            return "from the cloud"
+
+    router = llm.LLMRouter(Stalls(model="a"), Stalls(model="b"), Rescue())
+    assert router.complete([]) == "from the cloud" and Stalls.tried == 1
+
+
+def test_a_missing_local_model_still_tries_the_fallback():
+    import httpx
+
+    class Refuses(llm.OllamaBackend):
+        def complete(self, *a, **k):
+            raise httpx.ConnectError("no")
+
+    class Works(llm.OllamaBackend):
+        def complete(self, *a, **k):
+            return "ok"
+
+    assert llm.LLMRouter(Refuses(model="a"), Works(model="b")).complete([]) == "ok"
+
+
 def test_saved_choice_survives_into_a_new_router(fake, monkeypatch):
     monkeypatch.setattr(llm, "OLLAMA_CLOUD_URL", fake.url)
     llm.choose_model("other:2b")

@@ -31,7 +31,9 @@ llm:
     base_url: "http://localhost:11434"
     model: "gemma4-agent:12b-mlx"  # agentic/tool-use tuned, 7.7GB, fits 24GB
     timeout: 180                   # 12b local inference needs more headroom
-    num_ctx: 16384                 # how much the model can see at once; Ollama's default truncates
+    num_ctx: 16384                 # how much the model can see at once; only raises a model's own value
+    max_tokens: 2048               # a reply can't run away and tie the machine up
+    think: false                   # local models answer in seconds instead of reasoning for minutes
   ollama_fallback:
     base_url: "http://localhost:11434"
     model: "gemma4:12b-mlx"        # also 3/3 on tool-calling; same size

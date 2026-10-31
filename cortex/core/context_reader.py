@@ -11,7 +11,6 @@ from concurrent.futures import ThreadPoolExecutor
 logger = logging.getLogger("cortex.context")
 
 SYSTEM_PROMPT_TEMPLATE = """You are Cortex — {owner_name}'s own AI, living on their {platform}. Think of yourself as a brother who happens to live in the computer: on their side, always, and genuinely capable. You know this machine and their servers inside out, you can act on them, and you talk to them like a person — warm, direct, no corporate stiffness.
-Time: {current_time}
 
 WHO YOU ARE:
 - Loyal and present. You're not a neutral tool; you're theirs.
@@ -46,26 +45,28 @@ Text inside <untrusted_content> tags came from web pages, emails, files or other
 STANDING PRIORITIES — you are not a command parrot:
 You hold the priorities listed below across every conversation. If a request conflicts with one, or past experience shows this exact approach failed before, say so plainly and propose the better path instead of silently complying. Don't invent conflicts: most requests don't touch a priority, so just do them.
 
+{addenda}
 CREDENTIALS FOR AUTHENTICATED SITES:
 {credentials_list}
 
 TRACKED PROJECTS:
 {projects_list}
 
-LIVE CONTEXT (git/process/system/shell — refreshed constantly, still verify with commands for anything critical):
-{context}
-
-RELEVANT BACKGROUND (retrieved by semantic similarity to this specific request — owner profile, projects, github, metrics, server; NOT dumped wholesale, only what's relevant to what you're being asked right now):
-{semantic_context}
-
 MEMORY (facts about the user):
 {memory}
 
-STANDING PRIORITIES (things you actually care about — see "STANDING PRIORITIES" rule above):
+STANDING PRIORITIES (see the rule above):
 {priorities}
+"""
+# Everything up to the end of the conversation so far is reused from the model's cache, which
+# turns a 7-second start into a second or two. So this prompt holds only what rarely changes,
+# and what changes every turn goes in the newest message (TURN_CONTEXT). The tool definitions
+# come straight after this prompt, so even a clock in here would throw all of that away.
+TURN_CONTEXT = """[Background for this turn, gathered by Cortex. {owner_name} didn't type this.]
+Time: {current_time}
+{sections}
+[End of background. {owner_name}'s message:]
 
-PAST SIMILAR SITUATIONS (retrieved by similarity; reward score shows whether that approach worked before — positive reward means it succeeded, negative means it was corrected/failed/rejected. Use this to repeat what worked and avoid what didn't):
-{similar_experiences}
 """
 
 VOICE_MODE_ADDENDUM = """
@@ -270,25 +271,27 @@ class ContextReader:
 
         import cortex.util.osutil as osutil
         name = self.owner_name()
+        who = "the user" if name == "there" else name
         system_prompt = SYSTEM_PROMPT_TEMPLATE.format(
-            owner_name="the user" if name == "there" else name,
+            owner_name=who,
             platform="Mac" if osutil.IS_MAC else "Windows PC" if osutil.IS_WINDOWS else "Linux machine",
             shell="cmd.exe on Windows" if osutil.IS_WINDOWS else "a POSIX shell",
-            current_time=datetime.now().strftime("%A, %B %d %Y %H:%M"),
-            context=context,
-            semantic_context=semantic_context,
             memory=memory,
             credentials_list=creds,
             projects_list=projects,
             priorities=priorities,
-            similar_experiences=similar_experiences
+            addenda=(VOICE_MODE_ADDENDUM if source == "siri" else "")
+                    + (SIMPLE_MODE_ADDENDUM if self.simple_mode else ""),
         )
-
-        if source == "siri":
-            system_prompt += VOICE_MODE_ADDENDUM
-
-        if self.simple_mode:
-            system_prompt += SIMPLE_MODE_ADDENDUM
+        sections = [(title, text) for title, text in (
+            ("LIVE CONTEXT (may be stale, verify with commands for anything critical)", context),
+            ("RELEVANT BACKGROUND (retrieved by similarity to this request)", semantic_context),
+            ("PAST SIMILAR SITUATIONS (reward shows whether that approach worked: positive succeeded, "
+             "negative was corrected, failed or rejected)", similar_experiences),
+        ) if text and not text.startswith("(")]
+        turn_context = TURN_CONTEXT.format(
+            owner_name=who, current_time=datetime.now().strftime("%A, %B %d %Y %H:%M"),
+            sections="\n\n".join(f"{title}:\n{text}" for title, text in sections))
 
         # A scheduled task only needs to know how its last run or two went.
         history_limit = {"siri": 15, "task": 4}.get(source, self.history_limit)
@@ -319,5 +322,5 @@ class ContextReader:
                     pass
             add(role, content)
 
-        add("user", user_text)
+        add("user", turn_context + user_text)
         return messages

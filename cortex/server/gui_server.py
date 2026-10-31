@@ -682,8 +682,9 @@ def history():
     try:
         p = core().db.get_pending_action(session)
         if p:
-            grant = ((p.get("payload") or {}).get("_resume") or {}).get("grant")
-            pending = {"id": p["id"], "can_always": bool(grant), "scope": grant or ""}
+            resume = (p.get("payload") or {}).get("_resume") or {}
+            pending = {"id": p["id"], "can_always": bool(resume.get("grant")), "scope": resume.get("grant") or "",
+                       "after_outside_content": bool((resume.get("job") or {}).get("tainted"))}
     except Exception as e:
         logger.warning(f"/history pending: {e}")
     return jsonify({"messages": out, "running": bool(job and not job.done), "pending": pending})
@@ -1297,14 +1298,14 @@ function addResp(t,parts){parts=parts||[];const resp=el('div','resp');
  wrap.appendChild(resp);return resp}
 // Approval buttons answer one specific held action by id. Nothing is parsed from text, so what
 // runs depends on which button was pressed, and the job carries on from where it paused.
-function approvalCard(resp,a){const o=el('div','opts');
+function approvalCard(resp,a){const o=el('div','opts');const wary=a.after_outside_content;
  const go=(decision,label)=>{if(busy)return;busy=true;o.remove();const turn=addUser(label);
   fetch('/approve',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({session:sid,id:a.id,decision})})
    .then(r=>{if(r.ok){runTurn(turn,'/attach?session='+encodeURIComponent(sid))}else{busy=false;openChat(sid)}}).catch(()=>{busy=false})};
  const btn=(label,cls,decision)=>{const b=el('div','opt'+cls);b.textContent=label;b.onclick=()=>go(decision,label);o.appendChild(b)};
- btn('Yes, do it',' go','approve');
+ btn('Yes, do it',wary?'':' go','approve');
  if(a.can_always)btn('Yes, and allow this for the rest of the chat','','approve_session');
- btn('No, cancel','','reject');resp.appendChild(o)}
+ btn('No, cancel',wary?' go':'','reject');resp.appendChild(o)}
 // stream — the turn runs server-side; this just follows it (and can rejoin it after a refresh)
 function submit(text){if(busy||!text)return;busy=true;send.classList.remove('show');hello.style.display='none';
  localStorage.setItem('cx-sid',sid);   // remember this chat so a refresh reopens it

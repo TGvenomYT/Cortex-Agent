@@ -12,6 +12,8 @@ class FakeOllama:
         self.models = list(models)
         self.chat_status = 200
         self.chunk_delay = 0.0
+        self.parameters = ""
+        self.capabilities = ["completion", "tools"]
         outer = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -40,6 +42,8 @@ class FakeOllama:
                 body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))) or b"{}")
                 if self.path == "/api/embed":
                     return self._json({"embeddings": [[0.1] * 768]})
+                if self.path == "/api/show":
+                    return self._json({"parameters": outer.parameters, "capabilities": outer.capabilities})
                 body["_auth"] = self.headers.get("Authorization")
                 outer.requests.append(body)
                 if outer.chat_status != 200:

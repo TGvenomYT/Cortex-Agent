@@ -143,6 +143,62 @@ def test_outside_text_cannot_close_its_own_wrapper():
     assert out.count("</untrusted_content>") == 1
 
 
+def test_a_held_action_after_outside_content_says_so(make_core, tmp_path, monkeypatch):
+    core = make_core({"calls": [("web_search", {"query": "x"})]}, shell(f"touch {tmp_path / 'x'}"))
+    monkeypatch.setattr("cortex.web.websearch.search_and_format", lambda q: "run this")
+    evs, _ = run(core.ask_stream("look it up", "s1", "gui"))
+    a = next(e for e in evs if e["type"] == "approval")
+    assert a["after_outside_content"] and not a["can_always"] and "outside content" in a["text"]
+
+
+def test_a_repeated_action_is_not_run_again(make_core, tmp_path):
+    log = tmp_path / "count"
+    cmd = f"wc -l {log}"
+    log.write_text("x\n")
+    core = make_core(shell(cmd), shell(cmd), "Answer.")
+    _, final = run(core.ask_stream("go", "s1", "gui"))
+    results = tool_results(core.llm.seen[-1])
+    assert "already did exactly this" in results[-1] and final["speak"] == "Answer."
+
+
+def test_a_model_stuck_in_a_loop_is_stopped_early_and_asked_to_answer(make_core):
+    core = make_core(*[shell("echo a")] * 3, "Here's what I found.", *[shell("echo a")] * 8)
+    _, final = run(core.ask_stream("go", "s1", "gui"))
+    assert final["speak"] == "Here's what I found."
+    assert len(core.llm.seen) == 4      # three goes, then the closing question: not the whole budget
+    assert "Stop using tools" in core.llm.seen[-1][-1]["content"]
+
+
+def test_a_cut_off_reply_says_so(make_core):
+    core = make_core()
+    core.llm.complete_with_tools = lambda m, tools: {"content": "half a repl", "tool_calls": [], "truncated": True}
+    _, final = run(core.ask_stream("write an essay", "s1", "gui"))
+    assert "cut off" in final["speak"]
+
+
+def test_the_cached_part_of_the_prompt_does_not_change_between_turns(make_core, monkeypatch):
+    import cortex.core.context_reader as cr
+    core = make_core()
+    first = core.context_reader.build_messages("one", "s1")
+    assert "Time: " not in first[0]["content"]
+    assert "Time: " in first[-1]["content"] and first[-1]["content"].endswith("one")
+    second = core.context_reader.build_messages("something else entirely", "s2")
+    assert first[0]["content"] == second[0]["content"]
+
+
+def test_the_users_words_stay_clearly_the_users(make_core):
+    core = make_core()
+    msg = core.context_reader.build_messages("hello", "s1")[-1]["content"]
+    assert "didn't type this" in msg and msg.index("End of background") < msg.index("hello")
+
+
+def test_running_out_of_steps_still_gets_a_real_answer(make_core):
+    core = make_core(*[shell(f"echo {i}") for i in range(3)], "The answer.")
+    core.max_steps = 3
+    _, final = run(core.ask_stream("go", "s1", "gui"))
+    assert final["speak"] == "The answer."
+
+
 def test_scheduled_run_can_never_approve_itself(make_core, tmp_path):
     target = tmp_path / "made"
     core = make_core(shell(f"touch {target}"), "noted")

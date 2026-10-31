@@ -60,6 +60,27 @@ def test_ordinary_work_is_unknown(cmd):
     assert level(cmd) == "unknown", cmd
 
 
+def test_find_exec_is_judged_by_what_it_runs():
+    assert level('find . -name "*.py" -exec wc -l {} +') == "safe"
+    assert level("find . -type f -exec grep -l foo {} ;") == "safe"
+    assert level("find . -name '*.log' -exec rm {} +") == "danger"
+    assert level("find . -exec chmod 777 {} +") == "danger"
+
+
+def test_ordinary_file_writes_can_be_allowed_for_a_chat():
+    assert classify_shell("echo hi > notes/out.txt")[0] == "unknown"
+    assert classify_shell("echo hi > notes/out.txt")[2] == "writing files"
+    assert classify_shell("sort a.txt >> /tmp/out.txt")[0] == "unknown"
+
+
+@pytest.mark.parametrize("cmd", [
+    "echo hi > ~/.zshrc", "echo x >> ~/.ssh/authorized_keys", "echo x > /etc/hosts",
+    "echo x > ~/Library/LaunchAgents/evil.plist", "echo x > .env", "cat a > ~/.config/gh/hosts.yml",
+])
+def test_writes_that_change_how_things_behave_stay_dangerous(cmd):
+    assert level(cmd) == "danger", cmd
+
+
 def test_words_inside_quotes_do_not_trip_the_gate():
     assert level('echo "please do not rm -rf / or reboot"') == "safe"
     assert level("grep 'DROP TABLE' schema.sql") == "safe"
