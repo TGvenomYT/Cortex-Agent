@@ -179,6 +179,10 @@ class Runtime:
 def _alive(pid) -> bool:
     if not pid:
         return False
+    if os.name == "nt":     # os.kill(pid, 0) there would send a Ctrl+C
+        import subprocess
+        out = subprocess.run(["tasklist", "/FI", f"PID eq {int(pid)}", "/NH"], capture_output=True, text=True)
+        return str(int(pid)) in out.stdout
     try:
         os.kill(int(pid), 0)
         return True

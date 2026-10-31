@@ -4,7 +4,7 @@
 # It overrides the smart-terminal LLM call to route through Cortex.
 #
 # Usage: Add to ~/.zshrc:
-#   source "/Users/niranjan/Documents/Cortex Agent/smart_terminal_hook.zsh"
+#   source "/path/to/Cortex Agent/smart_terminal_hook.zsh"
 # ─────────────────────────────────────────────────────────────
 
 # Override the smart-terminal command generation to use Cortex

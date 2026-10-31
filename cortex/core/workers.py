@@ -1,19 +1,20 @@
 """
 workers.py — the control panel for everything Cortex does in the background.
 
-Cortex's background work is a set of small scheduled jobs (macOS launchd): reminder
-and automation checks, nine "awareness" collectors, an AI autonomy session, two daily
+Cortex's background work is a set of small scheduled jobs (launchd, cron or Task
+Scheduler, see scheduler.py): reminder and automation checks, nine "awareness" collectors, an AI autonomy session, two daily
 briefings and a cloud sync — plus any recurring tasks the user (or the agent) created.
 This module is the single place that knows about all of them. It can list them with
 live status, switch each one on/off (really unloading it from launchd, so it stops
 waking the machine), run one right now, and apply a whole-profile preset.
 
-Source of truth is launchd itself (`launchctl list` / `print-disabled`), so what the UI
-shows is what the OS is actually doing — nothing is cached or remembered separately.
-"Off" means bootout + disable, so a worker also stays off across logins/reboots.
+Source of truth is the OS scheduler itself, so what the UI shows is what the OS is
+actually doing — nothing is cached or remembered separately. On macOS "off" means bootout
++ disable, so a worker stays off across logins/reboots; elsewhere the job is removed.
 
-Built-in workers are macOS-only (that's where install_scheduled.sh puts them). User
-tasks go through tasks.py and work on macOS/Linux/Windows.
+Nothing runs until someone chooses it: a fresh install starts with every worker off, and
+the setup step asks what Cortex may keep track of (see TRACKING). What people type at
+the shell and what's installed on their machine stay opt-in.
 """
 from __future__ import annotations
 
@@ -25,6 +26,7 @@ import logging
 import subprocess
 
 import cortex
+from cortex.core import scheduler
 import cortex.util.osutil as osutil
 
 logger = logging.getLogger("cortex.workers")
@@ -39,52 +41,52 @@ _DOMAIN = f"gui/{_UID}"
 BUILTIN = [
     dict(key="reminders", label="com.cortex.reminders", name="Reminders", group="essentials",
          desc="Fires your reminders when they're due.", cost="light", ai=False,
-         run=["run_once.py", "reminders"]),
+         run=["run_once.py", "reminders"], every=60),
     dict(key="automation", label="com.cortex.automation", name="Automation rules", group="essentials",
          desc="Checks your if-this-then-that rules.", cost="light", ai=False,
-         run=["run_once.py", "automation"]),
+         run=["run_once.py", "automation"], every=120),
 
     dict(key="collector.system", label="com.cortex.collector.system", name="System stats", group="awareness",
          desc="Disk, memory, CPU and network snapshot.", cost="light", ai=False,
-         run=["collectors/system_collector.py"]),
+         run=["collectors/system_collector.py"], every=600),
     dict(key="collector.process", label="com.cortex.collector.process", name="Running services", group="awareness",
          desc="Docker containers, open ports, services.", cost="light", ai=False,
-         run=["collectors/process_collector.py"]),
+         run=["collectors/process_collector.py"], every=180),
     dict(key="collector.metrics", label="com.cortex.collector.metrics", name="Performance metrics", group="awareness",
          desc="CPU / memory history.", cost="light", ai=False,
-         run=["collectors/metrics_collector.py"]),
+         run=["collectors/metrics_collector.py"], every=180),
     dict(key="collector.shell", label="com.cortex.collector.shell", name="Shell history", group="awareness",
          desc="Learns from the commands you run.", cost="light", ai=False,
-         run=["collectors/shell_collector.py"]),
+         run=["collectors/shell_collector.py"], every=180),
     dict(key="collector.git", label="com.cortex.collector.git", name="Git status", group="awareness",
          desc="Branch / changes across your tracked projects.", cost="light", ai=False,
-         run=["collectors/git_collector.py"]),
+         run=["collectors/git_collector.py"], every=300),
     dict(key="collector.project", label="com.cortex.collector.project", name="Project scanner", group="awareness",
          desc="Project types, dependencies, TODOs.", cost="light", ai=False,
-         run=["collectors/project_collector.py"]),
+         run=["collectors/project_collector.py"], every=1800),
     dict(key="collector.owner", label="com.cortex.collector.owner", name="Machine profile", group="awareness",
          desc="Full machine + owner profile — the heaviest collector.", cost="medium", ai=False,
-         run=["collectors/owner_collector.py"]),
+         run=["collectors/owner_collector.py"], every=3600),
     dict(key="collector.remote", label="com.cortex.collector.remote", name="Remote hosts", group="awareness",
          desc="Checks your server over SSH / Tailscale.", cost="light", ai=False,
-         run=["collectors/remote_collector.py"]),
+         run=["collectors/remote_collector.py"], every=600),
     dict(key="collector.github", label="com.cortex.collector.github", name="GitHub", group="awareness",
          desc="Repos, pull requests and issues.", cost="light", ai=False,
-         run=["collectors/github_collector.py"]),
+         run=["collectors/github_collector.py"], every=900),
 
     dict(key="autonomy", label="com.cortex.autonomy", name="Autonomy", group="ai",
          desc="Cortex works on your goals by itself: plans, acts, reports. Wakes the AI model.",
-         cost="heavy", ai=True, run=["run_once.py", "autonomy"]),
+         cost="heavy", ai=True, run=["run_once.py", "autonomy"], every=1800),
     dict(key="report-morning", label="com.cortex.report-morning", name="Morning briefing", group="ai",
          desc="Writes your daily briefing. Wakes the AI model.", cost="heavy", ai=True,
-         run=["run_once.py", "report", "Morning Briefing"]),
+         run=["run_once.py", "report", "Morning Briefing"], daily=(9, 0)),
     dict(key="report-evening", label="com.cortex.report-evening", name="Evening wrap", group="ai",
          desc="Writes your end-of-day wrap-up. Wakes the AI model.", cost="heavy", ai=True,
-         run=["run_once.py", "report", "Evening Wrap"]),
+         run=["run_once.py", "report", "Evening Wrap"], daily=(18, 0)),
 
     dict(key="sync", label="com.cortex.sync", name="Cloud sync", group="sync",
          desc="Pushes your local data to your server when it's reachable.", cost="light", ai=False,
-         run=["run_once.py", "sync"]),
+         run=["run_once.py", "sync"], every=1800),
 ]
 _BY_KEY = {w["key"]: w for w in BUILTIN}
 
@@ -101,15 +103,42 @@ PROFILES = {
     "off": [],
     "essential": ["reminders", "automation"],
     "balanced": ["reminders", "automation", "collector.system", "collector.process",
-                 "collector.metrics", "collector.shell", "collector.git", "collector.project", "sync"],
+                 "collector.metrics", "collector.git", "collector.project"],
     "full": [w["key"] for w in BUILTIN],
 }
 PROFILE_BLURB = {
     "off": "Nothing runs in the background. Reminders won't fire.",
     "essential": "Only reminders and rules. Practically free.",
-    "balanced": "Plus machine awareness and sync. No AI model in the background.",
+    "balanced": "Plus this computer's health and your projects. No AI model in the background.",
     "full": "Everything, including AI autonomy and briefings.",
 }
+
+
+# What the setup step offers. Things that reveal what someone does stay off until they say so.
+TRACKING = [
+    dict(id="essentials", name="Reminders and alerts", on=True, keys=["reminders", "automation"],
+         desc="Fires your reminders, and warns you if the disk or CPU gets tight."),
+    dict(id="health", name="This computer's health", on=True,
+         keys=["collector.system", "collector.process", "collector.metrics"],
+         desc="Disk, memory, what's running. So it can answer without checking every time."),
+    dict(id="projects", name="Your projects", on=True, keys=["collector.git", "collector.project"],
+         desc="Git status and project details, for the folders you list below."),
+    dict(id="shell", name="Commands you type", on=False, keys=["collector.shell"],
+         desc="Reads your shell history so it knows what you've been doing. Passwords in it are masked."),
+    dict(id="machine", name="Apps and setup", on=False, keys=["collector.owner"],
+         desc="Installed apps, tools, Wi-Fi network names and SSH key names."),
+]
+
+
+def _schedule(w: dict) -> dict:
+    if "daily" in w:
+        return {"type": "daily", "hour": w["daily"][0], "minute": w["daily"][1]}
+    return {"type": "interval", "seconds": w["every"]}
+
+
+def _argv(w: dict) -> list:
+    run = w["run"]
+    return [sys.executable, os.path.join(cortex.ROOT, run[0])] + run[1:]
 
 
 # ── launchd plumbing ──────────────────────────────────────────────────────
@@ -200,16 +229,29 @@ def _builtin_rows(loaded: dict, disabled: set) -> list[dict]:
         st = loaded.get(w["label"])
         rows.append({
             **{k: w[k] for k in ("key", "name", "desc", "group", "cost", "ai")},
-            "installed": installed,
-            "available": osutil.IS_MAC and installed,
+            "installed": True, "available": True,
             "on": bool(st) and w["label"] not in disabled,
             "running": bool(st and st["pid"]),
             "last_exit": st["exit"] if st else None,
-            "cadence": _cadence(info),
+            "cadence": _cadence(info or _preview(w)),
             "last_run": _last_run(info),
             "removable": False,
         })
     return rows
+
+
+def _preview(w: dict) -> dict:
+    """What a not-yet-installed worker's cadence will be."""
+    return {"StartCalendarInterval": {"Hour": w["daily"][0], "Minute": w["daily"][1]}} if "daily" in w \
+        else {"StartInterval": w["every"]}
+
+
+def _other_rows() -> list[dict]:
+    """Built-in workers on Linux and Windows, as the OS scheduler has them."""
+    return [{**{k: w[k] for k in ("key", "name", "desc", "group", "cost", "ai")},
+             "installed": True, "available": True, "on": scheduler.installed(w["key"]), "running": False,
+             "last_exit": None, "cadence": _cadence(_preview(w)), "last_run": None, "removable": False}
+            for w in BUILTIN]
 
 
 def _task_rows(loaded: dict) -> list[dict]:
@@ -251,7 +293,7 @@ def _voice_row() -> dict:
 
 def list_workers() -> list[dict]:
     loaded, disabled = (_loaded(), _disabled()) if osutil.IS_MAC else ({}, set())
-    rows = _builtin_rows(loaded, disabled) if osutil.IS_MAC else []
+    rows = _builtin_rows(loaded, disabled) if osutil.IS_MAC else _other_rows()
     rows += [_voice_row()]
     try:
         rows += _task_rows(loaded)
@@ -261,9 +303,9 @@ def list_workers() -> list[dict]:
 
 
 def is_on(key: str) -> bool:
-    """Is this built-in worker actually scheduled right now? True where there's nothing to check."""
+    """Is this built-in worker actually scheduled right now?"""
     if not osutil.IS_MAC:
-        return True
+        return scheduler.installed(key)
     w = _BY_KEY.get(key)
     return bool(w) and w["label"] in _loaded() and w["label"] not in _disabled()
 
@@ -290,7 +332,6 @@ def summary(rows: list[dict] | None = None) -> dict:
         "ai_on": sum(1 for r in rows if r["on"] and r["ai"] and r["group"] != "services"),
         "tasks_on": sum(1 for r in tasks if r["on"]),
         "tasks_total": len(tasks),
-        "mac": osutil.IS_MAC,
     }
 
 
@@ -336,11 +377,19 @@ def set_enabled(key: str, on: bool) -> dict:
     if not w:
         return {"ok": False, "on": False, "error": f"unknown worker '{key}'"}
     if not osutil.IS_MAC:
-        return {"ok": False, "on": False, "error": "built-in background workers are macOS-only"}
+        try:
+            if on:
+                scheduler.install(key, _argv(w), _schedule(w))
+            else:
+                scheduler.remove(key)
+        except RuntimeError as e:
+            return {"ok": False, "on": False, "error": str(e)}
+        return {"ok": True, "on": bool(on)}
     plist = _plist_path(w["label"])
     if not os.path.exists(plist):
-        return {"ok": False, "on": False,
-                "error": "not installed — run install_scheduled.sh to set up the scheduled jobs"}
+        if not on:
+            return {"ok": True, "on": False}
+        scheduler.write_plist(key, _argv(w), _schedule(w))
     svc = f"{_DOMAIN}/{w['label']}"
     try:
         if on:
@@ -359,6 +408,17 @@ def set_enabled(key: str, on: bool) -> dict:
         return {"ok": False, "on": not on, "error": str(e)}
     now_on = w["label"] in _loaded() and w["label"] not in _disabled()
     return {"ok": now_on == bool(on), "on": now_on}
+
+
+def choose_tracking(chosen: list) -> dict:
+    """The setup step: turn on what the person agreed to, and nothing else."""
+    errors = []
+    for group in TRACKING:
+        for key in group["keys"]:
+            r = set_enabled(key, group["id"] in chosen)
+            if not r.get("ok") and r.get("error"):
+                errors.append(f"{key}: {r['error']}")
+    return {"ok": not errors, "errors": errors[:5]}
 
 
 def apply_profile(name: str) -> dict:

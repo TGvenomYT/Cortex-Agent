@@ -129,7 +129,7 @@ def remove_jobs():
         lines = cur.stdout.splitlines() if cur.returncode == 0 else []
         kept, removed, skip = [], 0, False
         for l in lines:
-            if "cortex-task-" in l or "run_once.py" in l and "Cortex" in l:
+            if l.strip().startswith("# cortex-") or "run_once.py" in l and "Cortex" in l:
                 removed += 1
                 skip = True
                 continue
@@ -194,9 +194,16 @@ def remove_cli():
     if IS_WIN:
         say("    nothing to remove (no cx shim is installed on Windows)")
         return
+    local = os.path.expanduser("~/.local/bin/cx")
+    if os.path.islink(local) and HERE in os.path.realpath(local):
+        if DRY:
+            say(f"    would remove: {local}")
+        else:
+            os.remove(local)
+            say(f"    removed {local}")
     cx = "/usr/local/bin/cx"
     if not os.path.lexists(cx):
-        say("    no cx shim found ✓")
+        say("    no system-wide cx shim found ✓")
         return
     # only remove if it points into THIS project
     try:

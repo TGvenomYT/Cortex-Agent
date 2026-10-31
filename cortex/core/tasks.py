@@ -10,8 +10,8 @@ through Cortex and delivers the result (notification / email).
   Linux   -> cron     (a `crontab` line tagged `# cortex-task-<id>`)
   Windows -> schtasks (\\Cortex\\task-<id>)
 
-These show up in Settings → Jobs and can be removed there. parse_schedule()
-produces a normalized schedule which each backend translates to its own format.
+These show up in Settings → Background and can be removed there. parse_schedule()
+produces a normalized schedule, and cortex/core/scheduler.py puts it in the OS scheduler.
 """
 from __future__ import annotations
 
@@ -19,16 +19,13 @@ import os
 import re
 import sys
 import uuid
-import shutil
-import subprocess
 
-import cortex.util.osutil as osutil
+from cortex.core import scheduler
 import cortex.storage.settings_store as settings_store
 
 _DIR = __import__("cortex").ROOT  # project root: run_once shim, logs, working dir live here
 _VENV_PY = sys.executable  # whichever python is running us (the venv in normal use)
 _RUNNER = os.path.join(_DIR, "run_once.py")
-_LA = os.path.expanduser("~/Library/LaunchAgents")
 
 
 def list_tasks() -> list[dict]:
@@ -101,147 +98,13 @@ def parse_schedule(s: str) -> tuple[dict, str]:
     raise ValueError(f"I can't read the schedule '{raw}'. Try 'daily 08:00', 'every 30 min' or 'every friday at 9am'")
 
 
-# ── macOS: launchd ──────────────────────────────────────────────────────────
-def _plist_path(tid: str) -> str:
-    return os.path.join(_LA, f"com.cortex.task.{tid}.plist")
-
-
-def _mac_install(task: dict):
-    os.makedirs(_LA, exist_ok=True)
-    os.makedirs(os.path.join(_DIR, "logs"), exist_ok=True)
-    sched, _ = parse_schedule(task["schedule"])
-    if sched["type"] == "interval":
-        sched_xml = f"<key>StartInterval</key><integer>{sched['seconds']}</integer>"
-    else:
-        weekday = f"<key>Weekday</key><integer>{sched['weekday']}</integer>" if sched["type"] == "weekly" else ""
-        sched_xml = (f"<key>StartCalendarInterval</key><dict>{weekday}"
-                     f"<key>Hour</key><integer>{sched['hour']}</integer>"
-                     f"<key>Minute</key><integer>{sched['minute']}</integer></dict>")
-    label = f"com.cortex.task.{task['id']}"
-    plist = f"""<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0"><dict>
- <key>Label</key><string>{label}</string>
- <key>ProgramArguments</key><array>
-  <string>{_VENV_PY}</string><string>{_RUNNER}</string><string>task</string><string>{task['id']}</string>
- </array>
- <key>WorkingDirectory</key><string>{_DIR}</string>
- {sched_xml}
- <key>ProcessType</key><string>Background</string><key>LowPriorityIO</key><true/>
- <key>StandardOutPath</key><string>{_DIR}/logs/task-{task['id']}.log</string>
- <key>StandardErrorPath</key><string>{_DIR}/logs/task-{task['id']}-error.log</string>
-</dict></plist>"""
-    p = _plist_path(task["id"])
-    with open(p, "w", encoding="utf-8") as f:
-        f.write(plist)
-    subprocess.run(["launchctl", "unload", p], capture_output=True)
-    subprocess.run(["launchctl", "load", p], capture_output=True)
-
-
-def _mac_remove(tid: str):
-    p = _plist_path(tid)
-    subprocess.run(["launchctl", "unload", p], capture_output=True)
-    try:
-        os.remove(p)
-    except OSError:
-        pass
-
-
-# ── Linux: cron ──────────────────────────────────────────────────────────────
-def _cron_lines() -> list[str]:
-    out = subprocess.run(["crontab", "-l"], capture_output=True, text=True)
-    return out.stdout.splitlines() if out.returncode == 0 else []
-
-
-def _cron_write(lines: list[str]):
-    proc = subprocess.run(["crontab", "-"], input="\n".join(lines) + "\n", text=True,
-                          capture_output=True)
-    if proc.returncode != 0:
-        raise RuntimeError(proc.stderr.strip() or "crontab write failed")
-
-
-def _linux_install(task: dict):
-    sched, _ = parse_schedule(task["schedule"])
-    if sched["type"] == "interval":
-        mins = max(1, sched["seconds"] // 60)
-        hours = mins // 60
-        when = (f"*/{mins} * * * *" if mins < 60 else f"0 */{hours} * * *" if hours < 24
-                else f"0 0 */{hours // 24} * *")
-    elif sched["type"] == "weekly":
-        when = f"{sched['minute']} {sched['hour']} * * {sched['weekday']}"
-    else:
-        when = f"{sched['minute']} {sched['hour']} * * *"
-    logdir = os.path.join(_DIR, "logs")
-    os.makedirs(logdir, exist_ok=True)
-    cmd = (f'cd "{_DIR}" && "{_VENV_PY}" "{_RUNNER}" task {task["id"]} '
-           f'>> "{logdir}/task-{task["id"]}.log" 2>&1')
-    tag = f"# cortex-task-{task['id']}"
-    lines = [l for l in _cron_lines() if f"cortex-task-{task['id']}" not in l]
-    lines += [tag, f"{when} {cmd}"]
-    _cron_write(lines)
-
-
-def _linux_remove(tid: str):
-    lines = _cron_lines()
-    kept, skip_next = [], False
-    for l in lines:
-        if f"cortex-task-{tid}" in l:
-            skip_next = True
-            continue
-        if skip_next:
-            skip_next = False
-            continue
-        kept.append(l)
-    try:
-        _cron_write(kept)
-    except RuntimeError:
-        pass
-
-
-# ── Windows: schtasks ────────────────────────────────────────────────────────
-def _win_name(tid: str) -> str:
-    return f"\\Cortex\\task-{tid}"
-
-
-def _win_install(task: dict):
-    sched, _ = parse_schedule(task["schedule"])
-    tr = f'"{_VENV_PY}" "{_RUNNER}" task {task["id"]}'
-    base = ["schtasks", "/create", "/f", "/tn", _win_name(task["id"]), "/tr", tr]
-    if sched["type"] == "interval":
-        base += ["/sc", "MINUTE", "/mo", str(max(1, sched["seconds"] // 60))]
-    elif sched["type"] == "weekly":
-        base += ["/sc", "WEEKLY", "/d", _DAY_NAMES[sched["weekday"]][:3].upper(),
-                 "/st", f"{sched['hour']:02d}:{sched['minute']:02d}"]
-    else:
-        base += ["/sc", "DAILY", "/st", f"{sched['hour']:02d}:{sched['minute']:02d}"]
-    proc = subprocess.run(base, capture_output=True, text=True)
-    if proc.returncode != 0:
-        raise RuntimeError(proc.stderr.strip() or "schtasks create failed")
-
-
-def _win_remove(tid: str):
-    subprocess.run(["schtasks", "/delete", "/f", "/tn", _win_name(tid)], capture_output=True)
-
-
-# ── public API (OS dispatch) ─────────────────────────────────────────────────
 def _install(task: dict):
-    if osutil.IS_MAC:
-        _mac_install(task)
-    elif osutil.IS_WINDOWS:
-        _win_install(task)
-    elif osutil.IS_LINUX and shutil.which("crontab"):
-        _linux_install(task)
-    else:
-        raise RuntimeError(f"no supported scheduler on {osutil.OS_NAME} (need cron/launchd/schtasks)")
+    scheduler.install(f"task.{task['id']}", [_VENV_PY, _RUNNER, "task", task["id"]],
+                      parse_schedule(task["schedule"])[0])
 
 
 def _uninstall(tid: str):
-    if osutil.IS_MAC:
-        _mac_remove(tid)
-    elif osutil.IS_WINDOWS:
-        _win_remove(tid)
-    elif osutil.IS_LINUX:
-        _linux_remove(tid)
+    scheduler.remove(f"task.{tid}")
 
 
 def add_task(desc: str, prompt: str, schedule: str, deliver: str = "notify") -> dict:

@@ -328,6 +328,25 @@ def _open(url):
         pass
 
 
+def link_cx():
+    """Put `cx` on the PATH, without needing an admin password."""
+    if IS_WIN:
+        say("    In this folder, `.\\cx` gives you Cortex in the terminal.")
+        return
+    bin_dir = os.path.expanduser("~/.local/bin")
+    link = os.path.join(bin_dir, "cx")
+    try:
+        os.makedirs(bin_dir, exist_ok=True)
+        if os.path.lexists(link):
+            os.remove(link)
+        os.symlink(os.path.join(HERE, "cx"), link)
+    except OSError as e:
+        say(f"    couldn't add the `cx` command ({e}); use ./cx in this folder")
+        return
+    if bin_dir not in os.environ.get("PATH", "").split(os.pathsep):
+        say(f"    Add this to your shell profile to use `cx` anywhere: export PATH=\"{bin_dir}:$PATH\"")
+
+
 def launch(py):
     step(4, "Launching Cortex")
     say("    opening the GUI at http://127.0.0.1:7860  (first run will ask your name)")
@@ -345,6 +364,7 @@ def main():
         say(f"Cortex needs Python 3.10+ (you have {sys.version.split()[0]}).")
         return 1
     py = ensure_python_env()
+    link_cx()
     if "--skip-ollama" not in ARGS:
         if ensure_ollama():
             ensure_model(py)

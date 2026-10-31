@@ -90,12 +90,14 @@ class ReminderManager:
         """Convert a raw reminder into natural conversational speech."""
         # Simple natural phrases — no LLM call needed for speed
         import random
+        from cortex.core.context_reader import ContextReader
+        name = ContextReader.owner_name()
         intros = [
             f"Hey, quick reminder — {text}.",
-            f"Heads up Niranjan, you wanted to {text}.",
+            f"Heads up {name}, you wanted to {text}.",
             f"Just nudging you — {text}.",
             f"Hey, it's time to {text}.",
-            f"Niranjan, reminder: {text}.",
+            f"Hey {name}, reminder: {text}.",
         ]
         return random.choice(intros)
 

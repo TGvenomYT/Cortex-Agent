@@ -14,7 +14,22 @@ from base import load_config, get_db_conn, upsert_context
 
 logger = logging.getLogger("collector.remote")
 
-SSH_CMD = 'ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new -i ~/.ssh/id_ed25519_myserver rathinaswamy@100.100.35.38'
+def _ssh_prefix() -> str | None:
+    """How to reach this person's server: Settings → Devices, or remote_hosts in their config."""
+    import shlex
+    sys.path.insert(0, os.path.normpath(os.path.join(os.path.dirname(__file__), "..")))
+    import cortex.storage.settings_store as settings_store
+    server = settings_store.load().get("server") or {}
+    hosts = (load_config().get("remote_hosts") or {}).values()
+    entry = next((h for h in hosts if h.get("ip") == server.get("host")), None) or next(iter(hosts), None) or {}
+    host, user = server.get("host") or entry.get("ip"), server.get("user") or entry.get("user")
+    if not host:
+        return None
+    key = f"-i {shlex.quote(entry['key'])} " if entry.get("key") else ""
+    return f"ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new {key}{shlex.quote(f'{user}@{host}' if user else host)}"
+
+
+SSH_CMD = None
 
 
 def _ssh(command: str, timeout: int = 10) -> str:
@@ -179,6 +194,11 @@ def collect_server_services(conn):
 
 
 def main():
+    global SSH_CMD
+    SSH_CMD = _ssh_prefix()
+    if not SSH_CMD:
+        logger.info("no server configured, nothing to check")
+        return
     config = load_config()
     conn = get_db_conn(config)
 

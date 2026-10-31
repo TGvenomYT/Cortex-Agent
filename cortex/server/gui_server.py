@@ -532,6 +532,24 @@ def workers_list():
     })
 
 
+@app.route("/tracking")
+def tracking():
+    import cortex.core.workers as workers
+    return jsonify({"options": [{k: g[k] for k in ("id", "name", "desc", "on")} for g in workers.TRACKING]})
+
+
+@app.route("/tracking/choose", methods=["POST"])
+def tracking_choose():
+    """The setup step: what this person agrees Cortex may keep track of."""
+    import cortex.core.workers as workers
+    d = request.get_json(silent=True) or {}
+    for folder in d.get("projects") or []:
+        path = os.path.abspath(os.path.expanduser(str(folder).strip()))
+        if os.path.isdir(path):
+            core().db.track_project(os.path.basename(path), path)
+    return jsonify(workers.choose_tracking(d.get("chosen") or []))
+
+
 @app.route("/workers/set", methods=["POST"])
 def workers_set():
     import cortex.core.workers as workers
@@ -1686,11 +1704,11 @@ function drawBackground(){const L=$('bgbody');if(!L||!BG)return;
  const S=BG.summary,R=BG.resources,M=R.models||[],Rs=R.settings||{},A=BG.agents||{};
  const prof=BG.profiles.find(p=>p.id===S.profile);
  let h=`<div class="slabel">Background work</div><div class="bgsum">
-   <div class="big">${S.mac?`${S.on} of ${S.total} workers on`:'Built-in workers are macOS-only'} · ${S.ai_on} AI job${S.ai_on===1?'':'s'}${S.tasks_total?` · ${S.tasks_on}/${S.tasks_total} tasks`:''}</div>
+   <div class="big">${S.on} of ${S.total} workers on · ${S.ai_on} AI job${S.ai_on===1?'':'s'}${S.tasks_total?` · ${S.tasks_on}/${S.tasks_total} tasks`:''}</div>
    <div class="dsub" style="margin-top:2px">${R.on_ac?'Plugged in':'On battery'}${R.battery!=null?' · '+R.battery+'%':''} · thermal ${esc(R.thermal)}${R.free_mem_pct!=null?' · '+R.free_mem_pct+'% memory free':''}</div>
    ${R.constrained?`<div class="bgwarn">Machine is under pressure (${esc(R.constrained_why)}) — optional AI work is paused.</div>`:''}
    <div class="dsub" id="bgstat" style="margin-top:4px;min-height:16px"></div></div>`;
- if(S.mac){h+=`<div class="seg">${BG.profiles.map(p=>`<button class="${S.profile===p.id?'on':''}" data-click="setProfile('${p.id}')">${cap(p.id)}</button>`).join('')}</div>
+ {h+=`<div class="seg">${BG.profiles.map(p=>`<button class="${S.profile===p.id?'on':''}" data-click="setProfile('${p.id}')">${cap(p.id)}</button>`).join('')}</div>
    <div class="dsub" style="line-height:1.45">${S.profile==='custom'?(S.on===0&&S.tasks_on?'Built-in workers are off, but your recurring tasks still run.':'Custom mix — you switched individual workers below.'):esc((prof||{}).blurb||'')} ${S.profile==='off'?'(Off also pauses your recurring tasks.)':''}</div>`}
  // AI model memory
  h+=`<div class="slabel" style="margin-top:18px">AI model memory</div>
@@ -1821,10 +1839,17 @@ function obStep(n){
    <div class="field"><label>Server label</label><input class="inp" id="obslabel" value="${esc(sv.label||'')}" placeholder="myserver"></div>
    <div class="field"><label>Host / Tailscale IP</label><input class="inp" id="obshost" value="${esc(sv.host||'')}" placeholder="100.x.x.x"></div>
    <div class="field"><label>SSH user</label><input class="inp" id="obsuser" value="${esc(sv.user||'')}"></div>
-   <div style="display:flex;justify-content:space-between;margin-top:14px"><button class="btn ghost" data-click="obStep(1)">Back</button><button class="btn" data-click="obFinish()">Finish</button></div>`)}}
+   <div style="display:flex;justify-content:space-between;margin-top:14px"><button class="btn ghost" data-click="obStep(1)">Back</button><button class="btn" data-click="obTrack()">Next</button></div>`)}}
+async function obTrack(){OB.server={label:$('obslabel').value.trim(),host:$('obshost').value.trim(),user:$('obsuser').value.trim()};
+ const opts=(await (await fetch('/tracking')).json()).options||[];
+ showModal(`<h2>What should I keep track of?</h2><div class="sub">Everything stays on this computer, and you can change this anytime in Settings → Background.</div>${pips(2)}
+  ${opts.map(o=>`<label class="rowline" style="padding:7px 0;cursor:pointer;gap:12px"><div><div class="dname">${esc(o.name)}</div><div class="dsub" style="line-height:1.4">${esc(o.desc)}</div></div><input type="checkbox" class="track" value="${esc(o.id)}" ${o.on?'checked':''}></label>`).join('')}
+  <div class="field" style="margin-top:8px"><label>Folders you work in (optional, comma separated)</label><input class="inp" id="obfolders" placeholder="~/projects/my-app"></div>
+  <div style="display:flex;justify-content:space-between;margin-top:14px"><button class="btn ghost" data-click="obStep(2)">Back</button><button class="btn" data-click="obFinish()">Finish</button></div>`)}
 function obAv(){const i=document.createElement('input');i.type='file';i.accept='image/*';
  i.onchange=async()=>{const f=i.files[0];if(!f)return;const fd=new FormData();fd.append('avatar',f);await fetch('/avatar',{method:'POST',body:fd});OB.has_avatar=true;setBg('obav')};i.click()}
-async function obFinish(){OB.server={label:$('obslabel').value.trim(),host:$('obshost').value.trim(),user:$('obsuser').value.trim()};
+async function obFinish(){
+ await postJ('/tracking/choose',{chosen:[...document.querySelectorAll('.track:checked')].map(c=>c.value),projects:$('obfolders').value.split(',').map(x=>x.trim()).filter(Boolean)});
  await fetch('/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:OB.name||'',server:OB.server,onboarded:true})});
  closeOv();refreshProfile()}
 function attachFiles(){const i=document.createElement('input');i.type='file';i.multiple=true;

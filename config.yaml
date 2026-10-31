@@ -1,6 +1,7 @@
 # ═══════════════════════════════════════════════════════════════
-# Cortex Configuration
-# Copy to ~/.cortex/config.yaml and edit with your values.
+# Cortex defaults, shared by everyone who installs it.
+# Your own settings go in ~/.cortex/config.yaml, which sits on top of this file
+# and stays on your machine. Don't put anything personal here.
 # ═══════════════════════════════════════════════════════════════
 
 server:
@@ -13,11 +14,8 @@ database:
   # the OPTIONAL sync target, used only when the server is reachable (see sync.py).
   backend: "sqlite"                # sqlite | postgres
   sqlite_path: "~/.cortex/cortex.db"
-  host: "100.100.35.38"
-  port: 5435
-  name: "postgres"
-  user: "postgres.your-tenant-id"  # Supavisor tenant format
-  password: ""                     # from macOS Keychain / ~/.cortex/cortex.env; never commit
+  # To sync to your own Postgres, add host, port, name and user in ~/.cortex/config.yaml.
+  # The password comes from the OS keychain, never from a file here.
 
 llm:
   # Local by default via Ollama. The model picked in the app is saved in settings and
@@ -77,20 +75,7 @@ autonomy:
   max_steps_per_wake: 4         # multi-step planner: max plan→act→observe steps per wake
   notify_on_action: true
 
-projects:
-  - path: "/Users/niranjan/Documents/projects/smart-terminal"
-    name: "smart-terminal"
-  # Add more:
-  # - path: "/Users/niranjan/Projects/api"
-  #   name: "api"
-
-appflowy:
-  base_url: "https://beta.appflowy.cloud"
-  email: ""                        # your AppFlowy account email
-  password: ""                     # or set via env: APPFLOWY_PASSWORD
-  token: ""                        # alternative: paste a token directly
-  workspace_id: ""                 # fill after running: cx setup-appflowy
-  todo_database_id: ""             # fill after running: cx setup-appflowy
+projects: []                       # folders to track; set during setup, or in ~/.cortex/config.yaml
 
 # ─── Web Credentials (for authenticated crawling) ───
 # Each entry is a named credential set the LLM can reference.
@@ -129,16 +114,11 @@ web_credentials:
   #   cookies:
   #     session_id: "abc123"
 
-# ─── Multi-machine (Tailscale SSH) ───
-remote_hosts:
-  server:
-    ip: "100.100.35.38"
-    user: "rathinaswamy"
-    key: "~/.ssh/id_ed25519_myserver"
-  # Add more:
-  # nas:
-  #   ip: "100.x.x.x"
-  #   user: "admin"
+# ─── Other machines ───
+# Your server is set in Settings → Devices. To give it an SSH key, in ~/.cortex/config.yaml:
+#   remote_hosts:
+#     server: {ip: "100.x.x.x", user: "you", key: "~/.ssh/id_ed25519"}
+remote_hosts: {}
 
 # ─── Automation Rules ───
 automation_rules:
@@ -160,19 +140,9 @@ automation_rules:
       operator: ">"
       threshold: 90
     action:
-      type: say
-      message: "Niranjan, your disk is almost full. You should free up some space."
+      type: notify
+      message: "Your disk is almost full. You should free up some space."
     cooldown_minutes: 60
-
-  - name: "Hotel mapping worker crashed"
-    condition:
-      type: container_status
-      container: hotel_mapping_worker_v2
-      status: exited
-    action:
-      type: restart_container
-      container: hotel_mapping_worker_v2
-    cooldown_minutes: 30
 
 # ─── Scheduled Reports ───
 scheduled_reports:

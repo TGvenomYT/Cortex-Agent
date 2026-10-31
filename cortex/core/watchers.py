@@ -34,6 +34,9 @@ INTERVAL = {"pid": 5, "process": 10, "port": 10, "file": 10, "check": 30}
 
 
 def _pid_alive(pid: int) -> bool:
+    if os.name == "nt":     # os.kill(pid, 0) there would send a Ctrl+C
+        from cortex.core.runtime import _alive
+        return _alive(pid)
     try:
         os.kill(int(pid), 0)
     except ProcessLookupError:
@@ -48,6 +51,9 @@ def _pid_alive(pid: int) -> bool:
 
 
 def _matching(pattern: str) -> list:
+    if os.name == "nt":
+        out = subprocess.run(["tasklist", "/FO", "CSV", "/NH"], capture_output=True, text=True).stdout
+        return [line for line in out.splitlines() if pattern.lower() in line.lower()]
     try:
         out = subprocess.run(["pgrep", "-f", pattern], capture_output=True, text=True, timeout=10).stdout.split()
     except (OSError, subprocess.SubprocessError):

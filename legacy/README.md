@@ -17,3 +17,6 @@ Their imports reference the old flat module layout and will NOT resolve against 
 
 `dashboard.py` and `voice.py` joined these later: both only talked to the retired :7800 daemon.
 The live voice mode is `cortex/voice/voice_mode.py`.
+
+`install.sh`, `install_scheduled.sh` and `install_schedules.sh` were replaced by `run.py` and `cortex/core/scheduler.py`,
+which work on every OS and ask before anything runs in the background.

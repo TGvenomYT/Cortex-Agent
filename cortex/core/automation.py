@@ -190,7 +190,8 @@ class AutomationEngine:
             self._notify(rule_name, message)
 
         elif atype == "say":
-            message = action.get("message", f"Heads up Niranjan, {rule_name}")
+            from cortex.core.context_reader import ContextReader
+            message = action.get("message", f"Heads up {ContextReader.owner_name()}, {rule_name}")
             self._say(message)
 
         elif atype == "execute":

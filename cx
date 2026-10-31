@@ -1,4 +1,12 @@
 #!/bin/bash
 # Cortex CLI — delegates to the cortex.cli.cx_app module in the package.
-cd "/Users/niranjan/Documents/Cortex Agent" || exit 1
-exec "/Users/niranjan/Documents/Cortex Agent/.venv/bin/python3" -m cortex.cli.cx_app "$@"
+# Works from wherever the project lives, including through a symlink on PATH.
+SOURCE="${BASH_SOURCE[0]}"
+while [ -L "$SOURCE" ]; do
+  DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+  SOURCE="$(readlink "$SOURCE")"
+  [[ "$SOURCE" != /* ]] && SOURCE="$DIR/$SOURCE"
+done
+ROOT="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+cd "$ROOT" || exit 1
+exec "$ROOT/.venv/bin/python3" -m cortex.cli.cx_app "$@"

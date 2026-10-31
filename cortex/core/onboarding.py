@@ -32,6 +32,22 @@ def mark_done():
     open(_DONE_FILE, "w", encoding="utf-8").close()
 
 
+def _ask_tracking(console) -> None:
+    """Nothing runs in the background until the person says what's fine with them."""
+    import cortex.core.workers as workers
+    console.print("\n  [dim]What should I keep track of? It all stays on this computer.[/dim]")
+    chosen = []
+    for group in workers.TRACKING:
+        default = "Y/n" if group["on"] else "y/N"
+        try:
+            reply = console.input(f"  {group['name']} ({group['desc']}) [{default}] ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            return
+        if reply.startswith("y") or (not reply and group["on"]):
+            chosen.append(group["id"])
+    workers.choose_tracking(chosen)
+
+
 def run_onboarding(console=None) -> None:
     """Interactive first-run. Safe to re-run (idempotent-ish)."""
     if console is None:
@@ -76,12 +92,13 @@ def run_onboarding(console=None) -> None:
         from cortex.util.cortex_bootstrap import load_config, connect_db
         db = connect_db(load_config())
         if db:
-            db.save_memory(type="fact", content=f"The user's name is {name}.",
-                           source="onboarding", importance=5)
+            from cortex.core.memory import MemoryManager
+            MemoryManager(db, None, {}).store_fact(f"The user's name is {name}.", source="onboarding", importance=5)
             for p in priorities:
                 db.create_priority(statement=p, weight=4, source="user")
     except Exception:
         pass
+    _ask_tracking(console)
 
     console.print()
     console.print(f"  [bold]You're all set, {name}.[/bold] Here's what you can just ask me, plainly:")

@@ -52,8 +52,9 @@ class ReportScheduler:
                 memory = memory_mgr.format_for_prompt(limit=10)
             except Exception:
                 pass
+        from cortex.core.context_reader import ContextReader
         sys_prompt = (
-            "You are Cortex delivering a scheduled spoken briefing to Niranjan. "
+            f"You are Cortex delivering a scheduled spoken briefing to {ContextReader.owner_name()}. "
             "Be concise and natural — a few sentences, no markdown. Use the live "
             "context below; call out anything that needs attention.\n\n"
             f"CONTEXT:\n{context}\n\nMEMORY:\n{memory}"

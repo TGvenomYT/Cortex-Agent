@@ -89,13 +89,26 @@ def load_env_file(path: str = ENV_FILE) -> None:
         pass
 
 
+def _merge(base: dict, mine: dict) -> dict:
+    out = dict(base)
+    for key, value in (mine or {}).items():
+        out[key] = _merge(out[key], value) if isinstance(value, dict) and isinstance(out.get(key), dict) else value
+    return out
+
+
 def load_config() -> dict:
+    """The shared defaults, with this person's ~/.cortex/config.yaml on top. Everything
+    personal belongs in that file: it stays on their machine and survives updates."""
+    config, found = {}, False
     for path in CONFIG_PATHS:
         if os.path.exists(path):
             with open(path, encoding="utf-8") as f:
-                return yaml.safe_load(f)
-    logger.error("No config.yaml found")
-    sys.exit(1)
+                config = _merge(config, yaml.safe_load(f) or {})
+            found = True
+    if not found:
+        logger.error("No config.yaml found")
+        sys.exit(1)
+    return config
 
 
 def connect_db(config: dict):

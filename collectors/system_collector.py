@@ -3,9 +3,14 @@ System Collector — runs every 5 minutes.
 Captures disk, RAM, CPU, uptime, network interfaces, battery, and macOS version.
 """
 
+import getpass
 import os
+import platform
+import shutil
+import socket
 import sys
 import re
+import time
 import logging
 
 sys.path.insert(0, os.path.dirname(__file__))
@@ -14,8 +19,22 @@ from base import load_config, get_db_conn, upsert_context, run_cmd
 logger = logging.getLogger("collector.system")
 
 
+IS_MAC, IS_WINDOWS = sys.platform == "darwin", os.name == "nt"
+
+
+def _gb(n: int) -> str:
+    return f"{n / 1024 ** 3:.0f}G"
+
+
 def collect_disk(conn):
     """Disk usage for all mounted volumes."""
+    if IS_WINDOWS:
+        home = os.path.abspath(os.sep)
+        u = shutil.disk_usage(home)
+        main = {"filesystem": home, "size": _gb(u.total), "used": _gb(u.used), "available": _gb(u.free),
+                "use_pct": f"{round(u.used / u.total * 100)}%", "mount": home}
+        upsert_context(conn, "system", "disk", {"main": main, "all_volumes": [main]}, expires_minutes=10)
+        return
     out, _, _ = run_cmd("df -h | grep -v tmpfs | grep -v devfs | awk 'NR>1 {print $1,$2,$3,$4,$5,$6}'")
     disks = []
     for line in out.splitlines():
@@ -41,8 +60,35 @@ def collect_disk(conn):
         logger.info(f"Disk: {main_disk['used']}/{main_disk['size']} ({main_disk['use_pct']})")
 
 
+def _memory_mb() -> tuple:
+    """(total, available) on Linux and Windows."""
+    if IS_WINDOWS:
+        import ctypes
+
+        class Status(ctypes.Structure):
+            _fields_ = [("length", ctypes.c_ulong), ("load", ctypes.c_ulong)] + \
+                       [(n, ctypes.c_ulonglong) for n in ("total", "avail", "pt", "apt", "pv", "apv", "epv")]
+        s = Status()
+        s.length = ctypes.sizeof(Status)
+        ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(s))
+        return s.total / 1024 ** 2, s.avail / 1024 ** 2
+    return parse_meminfo(open("/proc/meminfo", encoding="utf-8").read())
+
+
+def parse_meminfo(text: str) -> tuple:
+    kb = {m.group(1): int(m.group(2)) for m in re.finditer(r"^(\w+):\s+(\d+)", text, re.M)}
+    return kb.get("MemTotal", 0) / 1024, kb.get("MemAvailable", kb.get("MemFree", 0)) / 1024
+
+
 def collect_memory(conn):
-    """RAM usage via vm_stat (macOS native)."""
+    """RAM usage, via vm_stat on macOS."""
+    if not IS_MAC:
+        total_mb, free_mb = _memory_mb()
+        used_mb = total_mb - free_mb
+        upsert_context(conn, "system", "memory", {
+            "total_mb": round(total_mb, 1), "used_mb": round(used_mb, 1), "free_mb": round(free_mb, 1),
+            "use_pct": round(used_mb / total_mb * 100, 1) if total_mb else 0}, expires_minutes=10)
+        return
     out, _, _ = run_cmd("vm_stat")
     page_size = 16384  # macOS default 16KB pages on Apple Silicon, 4096 on Intel
     # Try to parse page size from output
@@ -83,6 +129,14 @@ def collect_memory(conn):
 
 def collect_cpu(conn):
     """CPU info and current load."""
+    if not IS_MAC:
+        cores = os.cpu_count() or 1
+        load = os.getloadavg() if hasattr(os, "getloadavg") else (0.0, 0.0, 0.0)
+        upsert_context(conn, "system", "cpu", {
+            "model": platform.processor() or platform.machine(), "logical_cores": cores,
+            "load_1min": load[0], "load_5min": load[1], "load_15min": load[2],
+            "load_pct_estimate": round(load[0] / cores * 100, 1)}, expires_minutes=10)
+        return
     # CPU model
     cpu_model, _, _ = run_cmd("sysctl -n machdep.cpu.brand_string 2>/dev/null || sysctl -n hw.model")
     # Core count
@@ -108,6 +162,16 @@ def collect_cpu(conn):
 
 def collect_uptime(conn):
     """System uptime and boot time."""
+    if not IS_MAC:
+        if IS_WINDOWS:
+            import ctypes
+            seconds = ctypes.windll.kernel32.GetTickCount64() / 1000
+        else:
+            with open("/proc/uptime", encoding="utf-8") as f:
+                seconds = float(f.read().split()[0])
+        upsert_context(conn, "system", "uptime", {"uptime_string": f"up {seconds / 3600:.1f} hours",
+                                                  "boot_epoch": int(time.time() - seconds)}, expires_minutes=10)
+        return
     uptime_out, _, _ = run_cmd("uptime")
     boot_out, _, _ = run_cmd("sysctl -n kern.boottime")
     # Parse boot time: { sec = 1234567890, usec = 0 }
@@ -142,23 +206,29 @@ def collect_network(conn):
             if ip and not ip.startswith("127.") and not ip.startswith("169.254."):
                 interfaces.append({"interface": current_iface, "ip": ip})
 
-    # DNS check — quick ping
-    ping_out, _, ping_rc = run_cmd("ping -c1 -W1 8.8.8.8 2>/dev/null | tail -1")
-    connected = ping_rc == 0
-
-    # External IP
-    ext_ip, _, _ = run_cmd("curl -s --max-time 3 https://api.ipify.org 2>/dev/null")
+    # Reachability only. Asking an outside service for this machine's public IP every few
+    # minutes isn't something anyone signed up for, so that's left out.
+    try:
+        socket.create_connection(("8.8.8.8", 53), timeout=2).close()
+        connected = True
+    except OSError:
+        connected = False
 
     upsert_context(conn, "system", "network", {
         "interfaces": interfaces,
         "internet_connected": connected,
-        "external_ip": ext_ip.strip() if ext_ip else "",
     }, expires_minutes=10)
     logger.info(f"Network: {len(interfaces)} interfaces, connected={connected}")
 
 
 def collect_macos_info(conn):
-    """macOS version and machine info."""
+    """OS version and machine info."""
+    if not IS_MAC:
+        upsert_context(conn, "system", "macos_info", {
+            "os_version": platform.release(), "os_build": platform.version()[:60], "os_name": platform.system(),
+            "hostname": platform.node(), "hw_model": platform.machine(), "username": getpass.getuser(),
+        }, expires_minutes=60)
+        return
     sw_vers, _, _ = run_cmd("sw_vers")
     hostname, _, _ = run_cmd("hostname")
     hw_model, _, _ = run_cmd("sysctl -n hw.model")
@@ -185,12 +255,11 @@ def main():
     config = load_config()
     conn = get_db_conn(config)
 
-    collect_disk(conn)
-    collect_memory(conn)
-    collect_cpu(conn)
-    collect_uptime(conn)
-    collect_network(conn)
-    collect_macos_info(conn)
+    for collect in (collect_disk, collect_memory, collect_cpu, collect_uptime, collect_network, collect_macos_info):
+        try:        # one unreadable figure shouldn't cost the rest
+            collect(conn)
+        except Exception as e:
+            logger.warning(f"{collect.__name__}: {e}")
 
     conn.close()
     logger.info("System collection done")

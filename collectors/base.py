@@ -27,13 +27,9 @@ CONFIG_PATHS = [
 
 
 def load_config() -> dict:
-    for path in CONFIG_PATHS:
-        path = os.path.normpath(path)
-        if os.path.exists(path):
-            with open(path) as f:
-                return yaml.safe_load(f)
-    print("ERROR: No config.yaml found", file=sys.stderr)
-    sys.exit(1)
+    sys.path.insert(0, os.path.normpath(os.path.join(os.path.dirname(__file__), "..")))
+    from cortex.util.cortex_bootstrap import load_config as load
+    return load()
 
 
 def get_db_conn(config: dict):
