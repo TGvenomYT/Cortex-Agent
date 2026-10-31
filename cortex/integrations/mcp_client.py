@@ -27,7 +27,8 @@ class MCPServer:
     def __init__(self, name: str, command: str, env: dict | None = None):
         self.name = name
         self.argv = shlex.split(command)
-        self.env = {**os.environ, **(env or {})}
+        from cortex.llm.viz import clean_env
+        self.env = {**clean_env(), **(env or {})}
         self.proc: subprocess.Popen | None = None
         self.tools: list[dict] = []
         self._id = 0
@@ -175,6 +176,17 @@ class MCPManager:
             return srv.call(tool, args)
         except Exception as e:
             return f"mcp call failed: {e}"
+
+    def is_readonly(self, fqname: str) -> bool:
+        """True only if the server itself declares this tool read-only (MCP annotations)."""
+        try:
+            _, rest = fqname.split("mcp__", 1)
+            sname, tool = rest.split("__", 1)
+        except ValueError:
+            return False
+        srv = self.servers.get(sname)
+        spec = next((t for t in (srv.tools if srv else []) if t.get("name") == tool), None)
+        return bool(((spec or {}).get("annotations") or {}).get("readOnlyHint"))
 
     def status(self) -> list[dict]:
         self.load()

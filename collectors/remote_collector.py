@@ -14,7 +14,7 @@ from base import load_config, get_db_conn, upsert_context
 
 logger = logging.getLogger("collector.remote")
 
-SSH_CMD = 'ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=no -i ~/.ssh/id_ed25519_myserver rathinaswamy@100.100.35.38'
+SSH_CMD = 'ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new -i ~/.ssh/id_ed25519_myserver rathinaswamy@100.100.35.38'
 
 
 def _ssh(command: str, timeout: int = 10) -> str:

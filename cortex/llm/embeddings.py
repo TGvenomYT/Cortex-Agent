@@ -12,7 +12,10 @@ Model: nomic-embed-text (768 dims, local, fast on Apple Silicon).
 """
 
 import os
+import time
 import logging
+import threading
+from collections import OrderedDict
 
 import httpx
 
@@ -23,6 +26,14 @@ EMBED_MODEL = "nomic-embed-text"
 EMBED_DIMS = 768
 
 
+# One chat turn embeds the SAME user text up to three times (semantic context, similar
+# experiences, uploaded-file retrieval). Remember recent successes so that's one model
+# call, not three. Only successes are cached — a failure is retried next time.
+_CACHE: "OrderedDict[str, list]" = OrderedDict()
+_CACHE_MAX = 256
+_CACHE_LOCK = threading.Lock()
+
+
 def embed(text: str, api_key: str = None) -> list[float]:
     """
     Embed a single string using the local nomic-embed-text model via Ollama.
@@ -31,6 +42,35 @@ def embed(text: str, api_key: str = None) -> list[float]:
     Returns a 768-dim vector, or None on failure.
     """
     if not text or not text.strip():
+        return None
+    key = text[:8000]
+    with _CACHE_LOCK:
+        hit = _CACHE.get(key)
+        if hit is not None:
+            _CACHE.move_to_end(key)
+            return list(hit)
+    vec = _embed_uncached(key)
+    if vec is not None:
+        with _CACHE_LOCK:
+            _CACHE[key] = vec
+            while len(_CACHE) > _CACHE_MAX:
+                _CACHE.popitem(last=False)
+    return vec
+
+
+# No local Ollama (a cloud-only machine, or it's just stopped): each call would fail anyway,
+# and one turn makes several. Remember that for a little while instead of retrying.
+_DOWN_UNTIL = 0.0
+_DOWN_FOR = 60.0
+
+
+def available() -> bool:
+    return time.time() >= _DOWN_UNTIL
+
+
+def _embed_uncached(text: str) -> list[float]:
+    global _DOWN_UNTIL
+    if not available():
         return None
     try:
         resp = httpx.post(
@@ -44,6 +84,10 @@ def embed(text: str, api_key: str = None) -> list[float]:
         if not embeddings:
             return None
         return embeddings[0]
+    except httpx.TransportError as e:
+        _DOWN_UNTIL = time.time() + _DOWN_FOR
+        logger.info(f"Local embedding engine unreachable ({e}); semantic search is off for now")
+        return None
     except Exception as e:
         logger.error(f"Local embedding failed: {e}")
         return None

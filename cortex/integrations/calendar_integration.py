@@ -3,19 +3,20 @@ Calendar Integration — Reads macOS Calendar events via AppleScript.
 Gives Cortex awareness of your schedule for time-based context.
 """
 
+import os
 import time
 import hashlib
 import subprocess
 import json
 import logging
-from datetime import datetime, timedelta
 
 logger = logging.getLogger("cortex.calendar")
 
 # AppleScript over all calendars is slow (seconds) and was blocking EVERY LLM
 # turn via build_messages. Cache results briefly and keep the timeout tight so
 # calendar awareness never dominates response latency.
-_CAL_CACHE: dict[str, tuple[float, list]] = {}
+_CAL_FILE = os.path.expanduser("~/.cortex/state/calendar_cache.json")
+_CAL_CACHE: dict[str, tuple] = {}
 _CAL_TTL = 300.0       # seconds (successful reads)
 _CAL_MISS_TTL = 1800.0 # seconds — a denied/unavailable calendar won't fix itself soon,
                        # so cache the empty result long so we don't re-block every turn
@@ -104,6 +105,27 @@ def get_tomorrows_events() -> list[dict]:
     return _run_calendar_script(script)
 
 
+def _load_cache() -> None:
+    """Scheduled jobs live for seconds, so the cache has to be on disk to count for anything."""
+    if _CAL_CACHE:
+        return
+    try:
+        with open(_CAL_FILE, encoding="utf-8") as f:
+            _CAL_CACHE.update({k: tuple(v) for k, v in json.load(f).items()})
+    except (OSError, ValueError):
+        pass
+
+
+def _remember(key: str, events: list, ttl: float) -> None:
+    _CAL_CACHE[key] = (time.time(), events, ttl)
+    try:
+        os.makedirs(os.path.dirname(_CAL_FILE), exist_ok=True)
+        with open(_CAL_FILE, "w", encoding="utf-8") as f:
+            json.dump(_CAL_CACHE, f)
+    except OSError as e:
+        logger.debug(f"calendar cache not saved: {e}")
+
+
 def _run_calendar_script(script: str) -> list[dict]:
     """Run AppleScript and parse the output (cached, tight timeout).
 
@@ -114,6 +136,7 @@ def _run_calendar_script(script: str) -> list[dict]:
     if not osutil.IS_MAC:
         return []
     key = hashlib.md5(script.encode()).hexdigest()
+    _load_cache()
     hit = _CAL_CACHE.get(key)
     if hit:
         ttl = hit[2] if len(hit) > 2 else _CAL_TTL
@@ -126,7 +149,7 @@ def _run_calendar_script(script: str) -> list[dict]:
         )
         if result.returncode != 0:
             logger.warning("Calendar unavailable (permission?) — skipping calendar context")
-            _CAL_CACHE[key] = (time.time(), [], _CAL_MISS_TTL)
+            _remember(key, [], _CAL_MISS_TTL)
             return []
 
         events = []
@@ -140,16 +163,16 @@ def _run_calendar_script(script: str) -> list[dict]:
                     "calendar": parts[3].strip(),
                     "location": parts[4].strip() if len(parts) > 4 else "",
                 })
-        _CAL_CACHE[key] = (time.time(), events, _CAL_TTL)
+        _remember(key, events, _CAL_TTL)
         return events
 
     except subprocess.TimeoutExpired:
         logger.warning("Calendar script timed out — skipping calendar context")
-        _CAL_CACHE[key] = (time.time(), [], _CAL_MISS_TTL)
+        _remember(key, [], _CAL_MISS_TTL)
         return []
     except Exception as e:
         logger.error(f"Calendar error: {e}")
-        _CAL_CACHE[key] = (time.time(), [], _CAL_MISS_TTL)
+        _remember(key, [], _CAL_MISS_TTL)
         return []
 
 

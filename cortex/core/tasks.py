@@ -39,31 +39,66 @@ def get_task(tid: str) -> dict | None:
     return next((t for t in list_tasks() if t["id"] == tid), None)
 
 
-def parse_schedule(s: str) -> tuple[dict, str]:
-    """Return (normalized, human). normalized is either
-    {"type":"interval","seconds":N} or {"type":"daily","hour":H,"minute":M}.
-    Supports 'every N min/hours', 'hourly', 'daily HH:MM' / 'at HH:MM',
-    'every morning/evening/noon'. Defaults to daily 09:00."""
-    s = (s or "").strip().lower()
-    m = re.search(r"every\s+(\d+)\s*(min|minute|hour|hr)", s)
+MIN_TASK_SECONDS = 300      # every run wakes the AI model; a 1-minute task keeps a 12 GB model cycling
+_DAYS = {"sun": 0, "mon": 1, "tue": 2, "wed": 3, "thu": 4, "fri": 5, "sat": 6}
+_DAY_NAMES = ("Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday")
+_PARTS_OF_DAY = {"morning": 8, "noon": 12, "afternoon": 13, "evening": 20, "night": 21, "midnight": 0}
+
+
+def _clock(s: str) -> tuple[int, int] | None:
+    """The time of day mentioned in `s` as (hour, minute), or None."""
+    m = re.search(r"\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b", s)
     if m:
-        n = int(m.group(1))
-        secs = n * (60 if m.group(2).startswith("min") else 3600)
-        return {"type": "interval", "seconds": max(60, secs)}, f"every {n} {m.group(2)}s"
-    if "hourly" in s:
+        if not 1 <= int(m.group(1)) <= 12:
+            raise ValueError(f"'{m.group(0)}' isn't a real time of day")
+        hour, minute = int(m.group(1)) % 12, int(m.group(2) or 0)
+        hour += 12 if m.group(3) == "pm" else 0
+    else:
+        m = re.search(r"\b(\d{1,2}):(\d{2})\b", s)
+        if m:
+            hour, minute = int(m.group(1)), int(m.group(2))
+        else:
+            for word, h in _PARTS_OF_DAY.items():
+                if re.search(rf"\b{word}\b", s):
+                    return h, 0
+            return None
+    if hour > 23 or minute > 59:
+        raise ValueError(f"'{m.group(0)}' isn't a real time of day")
+    return hour, minute
+
+
+def parse_schedule(s: str) -> tuple[dict, str]:
+    """Return (normalized, human). normalized is one of
+    {"type":"interval","seconds":N}, {"type":"daily","hour":H,"minute":M} or
+    {"type":"weekly","weekday":W,"hour":H,"minute":M} (W: 0 = Sunday).
+    Raises ValueError for anything it can't read: guessing a schedule the user didn't
+    ask for is worse than saying so."""
+    raw = s
+    s = (s or "").strip().lower()
+    if re.search(r"\b(in \d+|tomorrow|tonight|once|next)\b", s):
+        raise ValueError(f"'{raw}' sounds like a one-off, which is a reminder rather than a recurring task")
+    m = re.search(r"every\s+(\d+)\s*(sec|second|min|minute|hour|hr|day)", s)
+    if m:
+        n, unit = int(m.group(1)), m.group(2)
+        secs = n * {"se": 1, "mi": 60, "ho": 3600, "hr": 3600, "da": 86400}[unit[:2]]
+        if secs <= MIN_TASK_SECONDS:
+            return {"type": "interval", "seconds": MIN_TASK_SECONDS}, "every 5 minutes (the shortest allowed)"
+        return {"type": "interval", "seconds": secs}, f"every {n} {unit}s".replace("mins", "minutes").replace("hrs", "hours")
+    if "hourly" in s or re.search(r"\bevery hour\b", s):
         return {"type": "interval", "seconds": 3600}, "hourly"
-    tm = re.search(r"(\d{1,2}):(\d{2})", s)
-    hour, minute = 9, 0
-    if tm:
-        hour, minute = int(tm.group(1)), int(tm.group(2))
-    elif "morning" in s:
-        hour, minute = 8, 0
-    elif "evening" in s or "night" in s:
-        hour, minute = 20, 0
-    elif "noon" in s or "afternoon" in s:
-        hour, minute = 13, 0
-    return ({"type": "daily", "hour": hour, "minute": minute},
-            f"daily at {hour:02d}:{minute:02d}")
+    clock = _clock(s)
+    day = re.search(r"\b(sun|mon|tue|wed|thu|fri|sat)[a-z]*\b", s)
+    if day or "weekly" in s or re.search(r"\bevery week\b", s):
+        hour, minute = clock or (9, 0)
+        weekday = _DAYS[day.group(1)] if day else 1
+        return ({"type": "weekly", "weekday": weekday, "hour": hour, "minute": minute},
+                f"every {_DAY_NAMES[weekday]} at {hour:02d}:{minute:02d}")
+    if clock:
+        return ({"type": "daily", "hour": clock[0], "minute": clock[1]},
+                f"daily at {clock[0]:02d}:{clock[1]:02d}")
+    if re.search(r"\b(daily|every day)\b", s):
+        return {"type": "daily", "hour": 9, "minute": 0}, "daily at 09:00"
+    raise ValueError(f"I can't read the schedule '{raw}'. Try 'daily 08:00', 'every 30 min' or 'every friday at 9am'")
 
 
 # ── macOS: launchd ──────────────────────────────────────────────────────────
@@ -78,7 +113,8 @@ def _mac_install(task: dict):
     if sched["type"] == "interval":
         sched_xml = f"<key>StartInterval</key><integer>{sched['seconds']}</integer>"
     else:
-        sched_xml = ("<key>StartCalendarInterval</key><dict>"
+        weekday = f"<key>Weekday</key><integer>{sched['weekday']}</integer>" if sched["type"] == "weekly" else ""
+        sched_xml = (f"<key>StartCalendarInterval</key><dict>{weekday}"
                      f"<key>Hour</key><integer>{sched['hour']}</integer>"
                      f"<key>Minute</key><integer>{sched['minute']}</integer></dict>")
     label = f"com.cortex.task.{task['id']}"
@@ -128,7 +164,11 @@ def _linux_install(task: dict):
     sched, _ = parse_schedule(task["schedule"])
     if sched["type"] == "interval":
         mins = max(1, sched["seconds"] // 60)
-        when = f"*/{mins} * * * *" if mins < 60 else f"0 */{max(1, mins // 60)} * * *"
+        hours = mins // 60
+        when = (f"*/{mins} * * * *" if mins < 60 else f"0 */{hours} * * *" if hours < 24
+                else f"0 0 */{hours // 24} * *")
+    elif sched["type"] == "weekly":
+        when = f"{sched['minute']} {sched['hour']} * * {sched['weekday']}"
     else:
         when = f"{sched['minute']} {sched['hour']} * * *"
     logdir = os.path.join(_DIR, "logs")
@@ -169,6 +209,9 @@ def _win_install(task: dict):
     base = ["schtasks", "/create", "/f", "/tn", _win_name(task["id"]), "/tr", tr]
     if sched["type"] == "interval":
         base += ["/sc", "MINUTE", "/mo", str(max(1, sched["seconds"] // 60))]
+    elif sched["type"] == "weekly":
+        base += ["/sc", "WEEKLY", "/d", _DAY_NAMES[sched["weekday"]][:3].upper(),
+                 "/st", f"{sched['hour']:02d}:{sched['minute']:02d}"]
     else:
         base += ["/sc", "DAILY", "/st", f"{sched['hour']:02d}:{sched['minute']:02d}"]
     proc = subprocess.run(base, capture_output=True, text=True)
@@ -216,3 +259,42 @@ def add_task(desc: str, prompt: str, schedule: str, deliver: str = "notify") -> 
 def remove_task(tid: str):
     settings_store.save({"tasks": [t for t in list_tasks() if t["id"] != tid]})
     _uninstall(tid)
+
+
+def _update(tid: str, **fields) -> None:
+    tasks = list_tasks()
+    for t in tasks:
+        if t["id"] == tid:
+            t.update(fields)
+    settings_store.save({"tasks": tasks})
+
+
+def record_failure(tid: str) -> int:
+    """One more run in a row that couldn't reach a model. -> how many so far."""
+    n = int((get_task(tid) or {}).get("failures", 0)) + 1
+    _update(tid, failures=n)
+    return n
+
+
+def clear_failures(tid: str) -> None:
+    if (get_task(tid) or {}).get("failures"):
+        _update(tid, failures=0)
+
+
+def is_enabled(task: dict) -> bool:
+    return task.get("enabled", True)
+
+
+def set_task_enabled(tid: str, enabled: bool):
+    """Pause or resume one task. Pausing removes it from the OS scheduler (so it stops
+    waking the machine) but keeps it listed here; resuming re-registers it."""
+    tasks = list_tasks()
+    task = next((t for t in tasks if t["id"] == tid), None)
+    if task is None:
+        raise KeyError(f"no task {tid}")
+    if enabled:
+        _install(task)           # may raise — in which case we leave the flag untouched
+    else:
+        _uninstall(tid)
+    task["enabled"] = bool(enabled)
+    settings_store.save({"tasks": tasks})

@@ -57,8 +57,14 @@ def _save_hwm(hwm: dict):
         json.dump(hwm, f)
 
 
+# Local-only columns the remote schema doesn't have (pushing them would make every
+# row of that table fail with "column does not exist").
+_LOCAL_ONLY_COLS = {"parts"}
+
+
 def _cols(slite, table) -> list[str]:
-    return [r[1] for r in slite.execute(f"PRAGMA table_info({table})").fetchall()]
+    return [r[1] for r in slite.execute(f"PRAGMA table_info({table})").fetchall()
+            if r[1] not in _LOCAL_ONLY_COLS]
 
 
 def _val_and_cast(col, v):
@@ -74,8 +80,10 @@ def _val_and_cast(col, v):
     return v, "%s"
 
 
-def _push_table(slite, pg, table, cols, rows, upsert: bool) -> int:
-    pushed = 0
+def _push_table(slite, pg, table, cols, rows, upsert: bool) -> tuple[int, int | None]:
+    """-> (rows pushed, id of the first row that failed or None). Each row has its own
+    savepoint: a bad one is skipped without undoing the rows before it."""
+    pushed, failed = 0, None
     with pg.cursor() as cur:
         for row in rows:
             d = dict(row)
@@ -94,13 +102,16 @@ def _push_table(slite, pg, table, cols, rows, upsert: bool) -> int:
             else:
                 sql = f"INSERT INTO {table} ({collist}) VALUES ({marklist}) ON CONFLICT (id) DO NOTHING"
             try:
+                cur.execute("SAVEPOINT row_push")
                 cur.execute(sql, params)
+                cur.execute("RELEASE SAVEPOINT row_push")
                 pushed += 1
             except Exception as e:
-                pg.rollback()
+                cur.execute("ROLLBACK TO SAVEPOINT row_push")
+                failed = d.get("id") if failed is None else failed
                 log.warning(f"  {table} row {d.get('id')} skipped: {e}")
         pg.commit()
-    return pushed
+    return pushed, failed
 
 
 def main() -> int:
@@ -133,7 +144,7 @@ def main() -> int:
         cols = _cols(slite, table)
         rows = slite.execute(f"SELECT * FROM {table}").fetchall()
         if rows:
-            total += _push_table(slite, pg, table, cols, rows, upsert=True)
+            total += _push_table(slite, pg, table, cols, rows, upsert=True)[0]
         log.info(f"  {table}: {len(rows)} upserted")
 
     for table in APPEND_TABLES:
@@ -141,8 +152,10 @@ def main() -> int:
         last = int(hwm.get(table, 0))
         rows = slite.execute(f"SELECT * FROM {table} WHERE id > ? ORDER BY id", (last,)).fetchall()
         if rows:
-            total += _push_table(slite, pg, table, cols, rows, upsert=False)
-            hwm[table] = rows[-1]["id"]
+            pushed, failed = _push_table(slite, pg, table, cols, rows, upsert=False)
+            total += pushed
+            # Stop the mark before a failed row, so it's tried again rather than lost.
+            hwm[table] = rows[-1]["id"] if failed is None else max(last, failed - 1)
         log.info(f"  {table}: {len(rows)} new (hwm now {hwm.get(table, last)})")
 
     _save_hwm(hwm)

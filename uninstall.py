@@ -164,7 +164,7 @@ def _secret_python():
 def remove_secrets():
     step(2, "Stored secrets")
     accounts = (["cortex-db-password",
-                 "apikey:anthropic", "apikey:openai", "apikey:gemini"]
+                 "apikey:anthropic", "apikey:openai", "apikey:gemini", "apikey:ollama"]
                 + [f"mail:{e}" for e in _email_accounts()])
     if DRY:
         for a in accounts:

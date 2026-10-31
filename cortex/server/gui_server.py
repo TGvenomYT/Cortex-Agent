@@ -14,35 +14,110 @@ from __future__ import annotations
 
 import os
 import json
+import time
+import secrets
 import logging
+import threading
+from urllib.parse import urlsplit
 
 os.chdir(__import__("cortex").ROOT)
 
 import httpx
-from flask import Flask, request, Response, jsonify, stream_with_context
+from flask import Flask, request, Response, jsonify
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
                     datefmt="%H:%M:%S")
 logger = logging.getLogger("cortex.gui")
 
 app = Flask(__name__)
+app.config["MAX_CONTENT_LENGTH"] = 2 * 1024 ** 3     # uploads can be long videos, but not unbounded
 _CORE = None
+_CORE_LOCK = threading.Lock()
 VOICE_PORT = int(os.environ.get("CORTEX_VOICE_PORT", "8005"))
 VOICE_URL = f"http://127.0.0.1:{VOICE_PORT}"
-_voice_proc = None
 
 
 def core():
     global _CORE
     if _CORE is None:
-        from cortex.core.cortex_core import CortexCore
-        _CORE = CortexCore()
+        with _CORE_LOCK:    # the page fires several requests at once on load
+            if _CORE is None:
+                from cortex.core.cortex_core import CortexCore
+                _CORE = CortexCore()
     return _CORE
+
+
+# ── who may talk to this server ─────────────────────────────────────────────
+# It listens on localhost only, but that alone doesn't keep the web out: any page open in a
+# browser on this machine can send requests to 127.0.0.1, and a DNS-rebinding page can even
+# read the replies. So every request must name this machine as its host, must not come from
+# another site, and (for anything beyond the page shell) must carry a token only the page
+# served from here knows. Together with the CSP on the page, this is why a hostile page
+# can't reach the agent.
+_LOCAL_HOSTS = {"127.0.0.1", "localhost", "::1"}
+_PUBLIC_PATHS = {"/", "/manifest.json", "/sw.js", "/favicon.svg", "/favicon.ico", "/favicon-32.png",
+                 "/apple-touch-icon.png"}
+_TOKEN_FILE = os.path.expanduser("~/.cortex/gui_token")
+_TOKEN = None
+
+
+def gui_token() -> str:
+    """Survives restarts, so a window left open keeps working."""
+    global _TOKEN
+    if _TOKEN:
+        return _TOKEN
+    try:
+        with open(_TOKEN_FILE, encoding="utf-8") as f:
+            _TOKEN = f.read().strip()
+    except OSError:
+        _TOKEN = ""
+    if not _TOKEN:
+        _TOKEN = secrets.token_urlsafe(32)
+        os.makedirs(os.path.dirname(_TOKEN_FILE), mode=0o700, exist_ok=True)
+        fd = os.open(_TOKEN_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(_TOKEN)
+    return _TOKEN
+
+
+def _is_public(path: str) -> bool:
+    return (path in _PUBLIC_PATHS or path.startswith(("/icon-", "/artifact/"))
+            or (path == "/avatar" and request.method == "GET"))
+
+
+@app.before_request
+def guard():
+    forbidden = Response(b"", status=403)
+    if urlsplit(f"//{request.host}").hostname not in _LOCAL_HOSTS:     # DNS rebinding
+        return forbidden
+    origin = request.headers.get("Origin")
+    if origin and urlsplit(origin).netloc != request.host:
+        return forbidden
+    site = request.headers.get("Sec-Fetch-Site", "")
+    opening_the_app = request.path == "/" and request.headers.get("Sec-Fetch-Dest") == "document"
+    if site in ("cross-site", "same-site") and not opening_the_app:
+        return forbidden
+    if _is_public(request.path):
+        return None
+    sent = request.headers.get("X-Cortex-Token", "")
+    if request.path in ("/stream", "/attach"):      # EventSource can't set headers
+        sent = sent or request.args.get("t", "")
+    if not secrets.compare_digest(sent, gui_token()):
+        return forbidden
+    return None
+
+
+@app.after_request
+def harden(resp):
+    resp.headers.setdefault("X-Content-Type-Options", "nosniff")
+    resp.headers.setdefault("X-Frame-Options", "DENY")
+    resp.headers.setdefault("Referrer-Policy", "no-referrer")
+    return resp
 
 
 def _model_label() -> str:
     try:
-        m = core().config["llm"]["ollama"]["model"]
+        m = core().llm.primary.model
     except Exception:
         return "Cortex"
     m = m.split("/")[-1]
@@ -54,26 +129,35 @@ def _model_label() -> str:
 
 
 def ensure_voice():
-    global _voice_proc
-    try:
-        httpx.get(VOICE_URL + "/health", timeout=2); return True
-    except Exception:
-        pass
-    import cortex.voice.voice_mode as voice_mode
-    _voice_proc = voice_mode.ensure_server()
-    try:
-        httpx.get(VOICE_URL + "/health", timeout=2); return True
-    except Exception:
-        return False
+    """Start the on-device voice engine on demand (it stops itself when idle)."""
+    import cortex.voice.lifecycle as life
+    ok = life.start()
+    if ok:
+        life.touch()
+    return ok
 
 
 @app.route("/")
 def index():
     from cortex.core.context_reader import ContextReader
-    r = Response(PAGE.replace("__OWNER__", ContextReader.owner_name())
-                     .replace("__MODEL__", _model_label()), mimetype="text/html")
+    nonce = secrets.token_urlsafe(16)
+    owner = _esc_html(ContextReader.owner_name())
+    r = Response(PAGE.replace("__OWNER__", owner).replace("__MODEL__", _esc_html(_model_label()))
+                     .replace("__NONCE__", nonce).replace("__TOKEN__", gui_token()), mimetype="text/html")
     r.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"  # always serve fresh app
+    # Only the script block carrying this response's nonce runs. Even if something slipped
+    # past the escaping into the page, injected handlers and scripts simply won't execute.
+    r.headers["Content-Security-Policy"] = (
+        f"default-src 'none'; script-src 'nonce-{nonce}'; script-src-attr 'none'; "
+        "style-src 'unsafe-inline'; img-src 'self' data: blob: https:; media-src 'self' blob:; "
+        "connect-src 'self'; manifest-src 'self'; font-src 'self' data:; base-uri 'none'; "
+        "form-action 'none'; frame-ancestors 'none'")
     return r
+
+
+def _esc_html(text: str) -> str:
+    import html
+    return html.escape(text or "", quote=True)
 
 
 @app.route("/manifest.json")
@@ -162,40 +246,32 @@ self.addEventListener('activate',e=>e.waitUntil((async()=>{
 
 @app.route("/models")
 def models():
-    """Local Ollama models + cloud models for any provider with an API key."""
     import cortex.llm.llm as llm_mod
-    out = {"current": "", "models": []}
+    out = {"current": ""}
     try:
-        out["current"] = core().llm.primary.model
-    except Exception:
-        pass
-    local = []
-    try:
-        base = core().config["llm"]["ollama"].get("base_url", "http://localhost:11434")
-        data = httpx.get(base + "/api/tags", timeout=4).json()
-        local = sorted(m["name"] for m in data.get("models", []))
+        out["current"] = llm_mod.saved_model() or core().llm.primary.model
+        out["groups"] = llm_mod.available_models(core().config.get("llm", {}))
     except Exception as e:
         logger.warning(f"/models: {e}")
-    cloud = []
-    for prov, has in llm_mod.configured_providers().items():
-        if has:
-            cloud += llm_mod.list_provider_models(prov)  # real models from the provider's API
-    out["models"] = local + cloud
-    out["local"] = local
-    out["cloud"] = cloud
+        out["groups"] = []
+    out["models"] = [m["id"] for g in out["groups"] for m in g["models"]]
     return jsonify(out)
 
 
 @app.route("/set_model", methods=["POST"])
 def set_model():
-    """Switch the live model — rebuilds the backend so cloud providers work too."""
+    """Switch model, and remember it: the terminal and background jobs use the same choice."""
     import cortex.llm.llm as llm_mod
     m = (request.get_json(silent=True) or {}).get("model", "").strip()
     if not m:
         return jsonify({"ok": False}), 400
+    error = llm_mod.choose_model(m)
+    if error:
+        return jsonify({"ok": False, "needs_key": llm_mod.key_provider(m), "error": error}), 400
     try:
         c = core()
-        c.llm.primary = llm_mod.backend_for_model(m, c.config.get("llm", {}))
+        c.llm.primary = llm_mod.backend_for_model(m, c.config.get("llm", {}),
+                                                  timeout=c.config.get("llm", {}).get("ollama", {}).get("timeout", 90))
         logger.info(f"model switched to {m} ({llm_mod.provider_for_model(m)})")
         return jsonify({"ok": True, "current": m})
     except Exception as e:
@@ -212,7 +288,7 @@ def keys_status():
 @app.route("/keys/set", methods=["POST"])
 def keys_set():
     import cortex.llm.llm as llm_mod
-    d = request.get_json(force=True) or {}
+    d = request.get_json(silent=True) or {}
     prov, key = d.get("provider", ""), (d.get("key", "") or "").strip()
     if prov not in llm_mod.CLOUD_MODELS or not key:
         return jsonify({"ok": False, "error": "provider and key required"}), 400
@@ -223,17 +299,22 @@ def keys_set():
 @app.route("/keys/remove", methods=["POST"])
 def keys_remove():
     import cortex.llm.llm as llm_mod
-    prov = (request.get_json(force=True) or {}).get("provider", "")
+    prov = (request.get_json(silent=True) or {}).get("provider", "")
     if prov in llm_mod.CLOUD_MODELS:
         llm_mod.delete_key(prov)
     return jsonify({"ok": True})
+
+
+_PROFILE_KEYS = ("name", "theme", "voice", "onboarded", "server", "devices")
 
 
 @app.route("/settings", methods=["GET", "POST"])
 def settings():
     import cortex.storage.settings_store as settings_store
     if request.method == "POST":
-        return jsonify(settings_store.save(request.get_json(silent=True) or {}))
+        body = request.get_json(silent=True) or {}
+        # Tasks, MCP servers and the like have their own routes; this one is only for the profile.
+        return jsonify(settings_store.save({k: v for k, v in body.items() if k in _PROFILE_KEYS}))
     return jsonify(settings_store.load())
 
 
@@ -410,28 +491,8 @@ _JOB_META = {
 
 @app.route("/jobs")
 def jobs():
-    """What Cortex is running right now: scheduled background jobs + active goals."""
-    import subprocess
-    out = {"scheduled": [], "goals": []}
-    try:
-        res = subprocess.run(["launchctl", "list"], capture_output=True, text=True, timeout=5)
-        for line in res.stdout.splitlines():
-            if "com.cortex." not in line:
-                continue
-            parts = line.split("\t")
-            if len(parts) < 3:
-                continue
-            pid, status, label = parts[0].strip(), parts[1].strip(), parts[2].strip()
-            key = label.replace("com.cortex.", "")
-            if key.startswith("collector.") or key.startswith("task."):
-                continue  # collectors are plumbing; user tasks listed separately below
-            name, desc = _JOB_META.get(key, (key, ""))
-            out["scheduled"].append({
-                "key": key, "name": name, "desc": desc,
-                "running": pid not in ("-", ""), "ok": status in ("0", "-"),
-            })
-    except Exception as e:
-        logger.warning(f"/jobs: {e}")
+    """Goals, reminders and recurring tasks (the background workers themselves are at /workers)."""
+    out = {"goals": [], "reminders": [], "tasks": []}
     try:
         out["goals"] = [g["description"] for g in core().db.get_active_goals(limit=8)]
     except Exception:
@@ -440,30 +501,118 @@ def jobs():
         out["reminders"] = [{"text": r["text"], "due": str(r["due_at"])}
                             for r in core().db.get_all_reminders(include_fired=False)[:8]]
     except Exception:
-        out["reminders"] = []
+        pass
     try:
         import cortex.core.tasks as tasks_mod
         out["tasks"] = tasks_mod.list_tasks()
     except Exception:
-        out["tasks"] = []
+        pass
     return jsonify(out)
+
+
+# ── background workers, model memory, subagents (Settings → Background) ─────
+@app.route("/workers")
+def workers_list():
+    import cortex.core.workers as workers
+    import cortex.core.resources as resources
+    rows = workers.list_workers()
+    try:
+        agents = dict(core().subagents.settings())
+        agents["local_model"] = core().subagents._is_local()
+    except Exception:
+        agents = {}
+    return jsonify({
+        "workers": rows,
+        "groups": [{"id": g, "name": n, "desc": d} for g, n, d in workers.GROUPS],
+        "summary": workers.summary(rows),
+        "profiles": [{"id": k, "blurb": workers.PROFILE_BLURB[k]} for k in workers.PROFILES],
+        "resources": resources.snapshot(),
+        "keep_alive_choices": resources.KEEP_ALIVE_CHOICES,
+        "agents": agents,
+    })
+
+
+@app.route("/workers/set", methods=["POST"])
+def workers_set():
+    import cortex.core.workers as workers
+    d = request.get_json(silent=True) or {}
+    return jsonify(workers.set_enabled(d.get("key", ""), bool(d.get("on"))))
+
+
+@app.route("/workers/profile", methods=["POST"])
+def workers_profile():
+    import cortex.core.workers as workers
+    return jsonify(workers.apply_profile((request.get_json(silent=True) or {}).get("profile", "")))
+
+
+@app.route("/workers/run", methods=["POST"])
+def workers_run():
+    import cortex.core.workers as workers
+    return jsonify(workers.run_now((request.get_json(silent=True) or {}).get("key", "")))
+
+
+@app.route("/resources/set", methods=["POST"])
+def resources_set():
+    import cortex.storage.settings_store as settings_store
+    import cortex.core.resources as resources
+    d = request.get_json(silent=True) or {}
+    patch = {}
+    if d.get("keep_alive") in {c[0] for c in resources.KEEP_ALIVE_CHOICES}:
+        patch["keep_alive"] = d["keep_alive"]
+    if d.get("followups") in ("auto", "off", "always"):
+        patch["followups"] = d["followups"]
+    if "ai_jobs_only_on_ac" in d:
+        patch["ai_jobs_only_on_ac"] = bool(d["ai_jobs_only_on_ac"])
+    if "voice_idle_minutes" in d:
+        try:
+            patch["voice_idle_minutes"] = max(0, min(120, int(d["voice_idle_minutes"])))
+        except (TypeError, ValueError):
+            pass
+    return jsonify(settings_store.update_section("resources", patch))
+
+
+@app.route("/model/unload", methods=["POST"])
+def model_unload():
+    import cortex.core.resources as resources
+    return jsonify({"message": resources.unload_models()})
+
+
+@app.route("/agents/set", methods=["POST"])
+def agents_set():
+    import cortex.storage.settings_store as settings_store
+    from cortex.core.subagents import MODES
+    d = request.get_json(silent=True) or {}
+    patch = {}
+    if d.get("subagents") in MODES:
+        patch["subagents"] = d["subagents"]
+    if d.get("approvals") in ("careful", "balanced"):
+        patch["approvals"] = d["approvals"]
+    for k, lo, hi in (("max_parallel", 0, 4), ("max_helpers", 2, 6), ("helper_steps", 1, 8)):
+        if k in d:
+            try:
+                patch[k] = max(lo, min(hi, int(d[k])))
+            except (TypeError, ValueError):
+                pass
+    return jsonify(settings_store.update_section("agents", patch))
 
 
 @app.route("/tasks/add", methods=["POST"])
 def tasks_add():
     import cortex.core.tasks as tasks_mod
-    d = request.get_json(force=True) or {}
+    d = request.get_json(silent=True) or {}
     if not d.get("prompt") or not d.get("schedule"):
         return jsonify({"error": "prompt and schedule required"}), 400
-    t = tasks_mod.add_task(desc=d.get("desc", ""), prompt=d["prompt"],
-                           schedule=d["schedule"], deliver=d.get("deliver", "notify"))
-    return jsonify(t)
+    try:
+        return jsonify(tasks_mod.add_task(desc=d.get("desc", ""), prompt=d["prompt"],
+                                          schedule=d["schedule"], deliver=d.get("deliver", "notify")))
+    except ValueError as e:     # a schedule it can't read
+        return jsonify({"error": str(e)}), 400
 
 
 @app.route("/tasks/remove", methods=["POST"])
 def tasks_remove():
     import cortex.core.tasks as tasks_mod
-    tid = (request.get_json(force=True) or {}).get("id", "")
+    tid = (request.get_json(silent=True) or {}).get("id", "")
     tasks_mod.remove_task(tid)
     return jsonify({"ok": True})
 
@@ -478,14 +627,14 @@ def nudges_list():
         logger.warning(f"/nudges: {e}")
         items, unread = [], 0
     return jsonify({"nudges": [{"id": n["id"], "title": n["title"], "body": n.get("body", ""),
-                               "kind": n.get("kind", "info"), "read": bool(n["read"]),
+                               "kind": n.get("kind", "info"), "read": bool(n["read"]), "source": n.get("source") or "",
                                "when": str(n["created_at"])} for n in items],
                     "unread": unread})
 
 
 @app.route("/nudges/read", methods=["POST"])
 def nudges_read():
-    nid = (request.get_json(force=True) or {}).get("id")
+    nid = (request.get_json(silent=True) or {}).get("id")
     try:
         core().db.mark_nudges_read(nid)
     except Exception as e:
@@ -505,7 +654,7 @@ def nudges_clear():
 @app.route("/chats")
 def chats():
     try:
-        return jsonify({"chats": core().db.get_chat_sessions(limit=40)})
+        return jsonify({"chats": core().db.get_chat_sessions(limit=300)})
     except Exception as e:
         logger.warning(f"/chats: {e}")
         return jsonify({"chats": []})
@@ -515,8 +664,9 @@ def chats():
 def history():
     session = request.args.get("session", "")
     try:
-        msgs = core().db.get_conversations(session_id=session, limit=80)
-    except Exception:
+        msgs = core().db.get_conversations(session_id=session, limit=600, with_parts=True)
+    except Exception as e:
+        logger.warning(f"/history: {e}")
         msgs = []
     out = []
     for m in msgs:
@@ -526,8 +676,25 @@ def history():
                 content = json.loads(content).get("speak", content)
             except Exception:
                 pass
-        out.append({"role": m.get("role"), "content": content})
-    return jsonify({"messages": out})
+        out.append({"role": m.get("role"), "content": content, "parts": m.get("parts") or []})
+    job = _JOBS.get(session)
+    pending = None
+    try:
+        p = core().db.get_pending_action(session)
+        if p:
+            resume = (p.get("payload") or {}).get("_resume") or {}
+            pending = {"id": p["id"], "can_always": bool(resume.get("grant")), "scope": resume.get("grant") or "",
+                       "after_outside_content": bool((resume.get("job") or {}).get("tainted"))}
+    except Exception as e:
+        logger.warning(f"/history pending: {e}")
+    try:
+        cut_off = core().interrupted(session)
+        last_id = core().db.latest_message_id(session)
+    except Exception as e:
+        logger.warning(f"/history jobs: {e}")
+        cut_off, last_id = [], 0
+    return jsonify({"messages": out, "running": bool(job and not job.done), "pending": pending,
+                    "interrupted": cut_off, "last_id": last_id})
 
 
 @app.route("/files/upload", methods=["POST"])
@@ -556,26 +723,235 @@ def files_list():
         return jsonify({"files": []})
 
 
+@app.route("/history/truncate", methods=["POST"])
+def history_truncate():
+    """'Edit & resend': drop that user turn and everything after it from the stored chat."""
+    d = request.get_json(silent=True) or {}
+    session = d.get("session", "")
+    job = _JOBS.get(session)
+    if job and not job.done:
+        return jsonify({"ok": False, "error": "a reply is still being written"}), 409
+    try:
+        n = core().db.truncate_conversation(session, int(d.get("turn", 0)))
+        return jsonify({"ok": True, "deleted": n})
+    except Exception as e:
+        logger.warning(f"/history/truncate: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+# ── chat turns run in a worker thread, NOT inside the HTTP request ──────────
+# The reply used to be generated inside the SSE response, so refreshing the page (or a
+# dropped connection) killed the turn mid-flight and the exchange vanished. Now the turn
+# runs on its own thread, records its events, and persists itself; /stream and /attach
+# just tail those events — so a refresh can reconnect to a reply that is still being written.
+class _Job:
+    def __init__(self, session: str, make_events):
+        self.session, self.make_events = session, make_events
+        self.events: list = []
+        self.done = False
+        self.started = time.time()
+        self.cv = threading.Condition()
+
+    def push(self, ev: dict):
+        with self.cv:
+            self.events.append(ev)
+            self.cv.notify_all()
+
+    def run(self):
+        try:
+            for ev in self.make_events():
+                self.push(ev)
+        except Exception as e:
+            logger.error(f"turn failed: {e}")
+            self.push({"type": "answer", "text": f"Something went wrong: {e}"})
+        finally:
+            self.push({"type": "done"})
+            with self.cv:
+                self.done = True
+                self.cv.notify_all()
+
+    def tail(self, start: int = 0):
+        """Yield recorded events as they appear (None = heartbeat) until the turn is done."""
+        i = start
+        while True:
+            with self.cv:
+                if i >= len(self.events) and not self.done:
+                    self.cv.wait(timeout=15)
+                batch = self.events[i:]
+                i += len(batch)
+                finished = self.done and i >= len(self.events)
+            if not batch and not finished:
+                yield None
+            for ev in batch:
+                yield ev
+            if finished:
+                return
+
+
+_JOBS: dict = {}
+_JOBS_LOCK = threading.Lock()
+
+
+def _start_job(session: str, make_events):
+    """Begin a turn for this chat; None if one is already running for it."""
+    with _JOBS_LOCK:
+        cur = _JOBS.get(session)
+        if cur and not cur.done:
+            return None
+        for k in [k for k, v in _JOBS.items() if v.done and time.time() - v.started > 900]:
+            del _JOBS[k]                       # finished long ago — it's in the DB now
+        job = _JOBS[session] = _Job(session, make_events)
+    threading.Thread(target=job.run, name=f"turn-{session[-8:]}", daemon=True).start()
+    return job
+
+
+def _sse(events):
+    for ev in events:
+        yield (": ping\n\n" if ev is None else "data: " + json.dumps(ev) + "\n\n")
+
+
+_SSE_HEADERS = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
+
+
 @app.route("/stream")
 def stream():
     q = request.args.get("q", "").strip()
     session = request.args.get("session", "gui")
     if not q:
-        return Response("data: " + json.dumps({"type": "answer", "text": "Ask me something."}) + "\n\n",
+        return Response(_sse([{"type": "answer", "text": "Ask me something."}, {"type": "done"}]),
                         mimetype="text/event-stream")
+    job = _start_job(session, lambda: core().ask_stream(q, session_id=session, source="gui"))
+    if job is None:       # a reply for this chat is still being written — the page should reattach
+        return Response(_sse([{"type": "busy"}, {"type": "done"}]), mimetype="text/event-stream")
+    return Response(_sse(job.tail()), mimetype="text/event-stream", headers=_SSE_HEADERS)
 
-    @stream_with_context
-    def gen():
-        try:
-            for ev in core().ask_stream(q, session_id=session, source="gui"):
-                yield "data: " + json.dumps(ev) + "\n\n"
-        except Exception as e:
-            logger.error(f"stream error: {e}")
-            yield "data: " + json.dumps({"type": "answer", "text": f"Something went wrong: {e}"}) + "\n\n"
-        yield "data: " + json.dumps({"type": "done"}) + "\n\n"
 
-    return Response(gen(), mimetype="text/event-stream",
-                    headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+@app.route("/approve", methods=["POST"])
+def approve():
+    """An approval button was pressed. The job then continues; the page follows it on /attach."""
+    d = request.get_json(silent=True) or {}
+    session, pid, decision = d.get("session", ""), d.get("id"), d.get("decision")
+    if decision not in ("approve", "approve_session", "reject") or not isinstance(pid, int):
+        return jsonify({"ok": False}), 400
+    job = _start_job(session, lambda: core().resolve_stream(session, pid, decision, source="gui"))
+    if job is None:
+        return jsonify({"ok": False, "error": "a reply is still being written"}), 409
+    return jsonify({"ok": True})
+
+
+@app.route("/stop", methods=["POST"])
+def stop():
+    return jsonify({"ok": core().stop((request.get_json(silent=True) or {}).get("session", ""))})
+
+
+@app.route("/undo", methods=["POST"])
+def undo():
+    d = request.get_json(silent=True) or {}
+    result = core().undo.undo_job(d.get("job", ""))
+    if d.get("session"):
+        core().db.save_conversation(d["session"], "assistant", result["message"])
+    return jsonify(result)
+
+
+@app.route("/jobs/resume", methods=["POST"])
+def jobs_resume():
+    d = request.get_json(silent=True) or {}
+    session = d.get("session", "")
+    job = _start_job(session, lambda: core().resume_stream(d.get("id", ""), source="gui"))
+    return (jsonify({"ok": True}) if job else (jsonify({"ok": False}), 409))
+
+
+@app.route("/jobs/dismiss", methods=["POST"])
+def jobs_dismiss():
+    core().dismiss_job((request.get_json(silent=True) or {}).get("id", ""))
+    return jsonify({"ok": True})
+
+
+@app.route("/usage")
+def usage_report():
+    from cortex.core import usage
+    from cortex.core.context_manager import ContextBudget
+    out = usage.report()
+    try:
+        c = core()
+        b = ContextBudget(c.llm.primary, None, c.cloud_context_cap)
+        out["context"] = {"model": b.model, "window": b.window, "usable": b.limit, "source": b.source}
+    except Exception as e:
+        logger.info(f"/usage context: {e}")
+    return jsonify(out)
+
+
+@app.route("/limits/set", methods=["POST"])
+def limits_set():
+    import cortex.storage.settings_store as settings_store
+    d = request.get_json(silent=True) or {}
+    patch = {}
+    for k in ("daily_usd", "monthly_usd", "job_usd", "daily_tokens", "job_tokens"):
+        if k in d:
+            try:
+                patch[k] = max(0.0, float(d[k]))
+            except (TypeError, ValueError):
+                return jsonify({"ok": False, "error": f"{k} needs a number"}), 400
+    return jsonify(settings_store.update_section("limits", patch))
+
+
+@app.route("/watches")
+def watches_list():
+    import cortex.core.watchers as watchers
+    try:
+        return jsonify({"watches": [{"id": w["id"], "label": w["label"], "kind": w["spec"].get("kind")}
+                                    for w in watchers.active(core().db)]})
+    except Exception as e:
+        logger.warning(f"/watches: {e}")
+        return jsonify({"watches": []})
+
+
+@app.route("/watches/stop", methods=["POST"])
+def watches_stop():
+    import cortex.core.watchers as watchers
+    return jsonify({"ok": watchers.stop(core().db, (request.get_json(silent=True) or {}).get("id", ""))})
+
+
+@app.route("/updates")
+def updates():
+    """What arrived in this chat by itself since the page last looked (a watcher's report)."""
+    session, after = request.args.get("session", ""), request.args.get("after", type=int, default=0)
+    try:
+        db = core().db
+        rows = db.recent_messages(session, after_id=after, limit=20) if after else []
+        return jsonify({"last_id": db.latest_message_id(session),
+                        "messages": [{"role": r["role"], "content": r["content"]} for r in rows
+                                     if r["role"] == "assistant"]})
+    except Exception as e:
+        logger.warning(f"/updates: {e}")
+        return jsonify({"last_id": after, "messages": []})
+
+
+@app.route("/approvals")
+def approvals():
+    """The inbox: what scheduled tasks and autonomy want to do."""
+    try:
+        return jsonify({"approvals": core().list_approvals()})
+    except Exception as e:
+        logger.warning(f"/approvals: {e}")
+        return jsonify({"approvals": []})
+
+
+@app.route("/approvals/resolve", methods=["POST"])
+def approvals_resolve():
+    d = request.get_json(silent=True) or {}
+    if not isinstance(d.get("id"), int):
+        return jsonify({"ok": False}), 400
+    return jsonify(core().resolve_approval(d["id"], bool(d.get("approve"))))
+
+
+@app.route("/attach")
+def attach():
+    """Re-join the in-flight (or just-finished) turn of a chat after a refresh/reconnect."""
+    job = _JOBS.get(request.args.get("session", ""))
+    if job is None:
+        return Response(_sse([{"type": "done"}]), mimetype="text/event-stream")
+    return Response(_sse(job.tail()), mimetype="text/event-stream", headers=_SSE_HEADERS)
 
 
 @app.route("/voice/stt", methods=["POST"])
@@ -589,6 +965,8 @@ def voice_stt():
         r = httpx.post(VOICE_URL + "/v1/audio/transcriptions",
                        files={"file": ("speech.webm", f.read(), "audio/webm")},
                        data={"model": "whisper-1", "language": "en"}, timeout=60)
+        import cortex.voice.lifecycle as life
+        life.touch()
         return jsonify({"text": (r.json().get("text") or "").strip()})
     except Exception as e:
         return jsonify({"text": "", "error": str(e)}), 502
@@ -606,6 +984,8 @@ def voice_tts():
         r = httpx.post(VOICE_URL + "/v1/audio/speech",
                        json={"model": "kokoro", "input": text[:1200], "voice": voice,
                              "response_format": "wav"}, timeout=120)
+        import cortex.voice.lifecycle as life
+        life.touch()
         return Response(r.content, mimetype="audio/wav")
     except Exception as e:
         logger.warning(f"tts: {e}")
@@ -614,6 +994,7 @@ def voice_tts():
 
 PAGE = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1"><title>Cortex</title>
+<meta name="cx-token" content="__TOKEN__">
 <link rel="icon" type="image/svg+xml" href="/favicon.svg">
 <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32.png">
 <link rel="shortcut icon" href="/favicon.ico">
@@ -623,9 +1004,11 @@ PAGE = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <style>
 :root{--bg:#131314;--side:#1e1f20;--hover:#333537;--sel:#1b3a5b;--txt:#e3e3e3;
  --mut:#c4c7c5;--dim:#9aa0a6;--line:#444746;--bubble:#1e1f20;--pill:#1e1f20;--blue:#8ab4f8;--card:#17181a;
+ --code:#0b0d11;--onblue:#062e6f;--shim1:#9aa0a6;--shim2:#f4f6fb;
  --grad:linear-gradient(74deg,#4285f4 0%,#9b72cb 48%,#d96570 100%)}
 html[data-theme=light]{--bg:#ffffff;--side:#f0f4f9;--hover:#e4e9f1;--sel:#d3e3fd;--txt:#1f1f1f;
- --mut:#444746;--dim:#5f6368;--line:#c4c7c5;--bubble:#f0f4f9;--pill:#f0f4f9;--blue:#0b57d0;--card:#f7f9fc}
+ --mut:#444746;--dim:#5f6368;--line:#c4c7c5;--bubble:#f0f4f9;--pill:#f0f4f9;--blue:#0b57d0;--card:#f7f9fc;
+ --code:#eaeef4;--onblue:#ffffff;--shim1:#80868b;--shim2:#202124}
 html,body{background:var(--bg)}
 /* circular-reveal theme switch (View Transitions API) */
 ::view-transition-old(root),::view-transition-new(root){animation:none;mix-blend-mode:normal}
@@ -649,7 +1032,7 @@ body{margin:0;background:var(--bg);color:var(--txt);display:flex;
 .chat{border-radius:999px;padding:9px 14px;cursor:pointer;color:var(--mut);white-space:nowrap;
  overflow:hidden;text-overflow:ellipsis;font-size:14px}
 .chat:hover{background:var(--hover)}.chat.sel{background:var(--sel);color:var(--blue)}
-.prof{display:flex;align-items:center;gap:12px;padding:10px 10px;margin-top:6px;border-top:1px solid #2a2c2e}
+.prof{display:flex;align-items:center;gap:12px;padding:10px 10px;margin-top:6px;border-top:1px solid var(--line)}
 .pav{width:30px;height:30px;border-radius:50%;background:var(--grad);flex:0 0 auto}
 .pname{font-size:14px}.psub{font-size:12px;color:var(--dim)}
 /* model dropdown */
@@ -674,14 +1057,14 @@ body{margin:0;background:var(--bg);color:var(--txt);display:flex;
 .trace{border:1px solid var(--line);background:var(--card);border-radius:16px;margin:0 0 12px;overflow:hidden}
 .trace summary{cursor:pointer;padding:8px 14px;color:var(--dim);font-size:13px;list-style:none;display:flex;align-items:center;gap:9px}
 .trace summary::-webkit-details-marker{display:none}
-.trace summary:hover{background:#1d1e20}
+.trace summary:hover{background:var(--hover)}
 .trace .body{padding:4px 14px 9px;border-top:1px solid var(--line)}
 .step{display:flex;gap:8px;padding:3px 0;font-size:13px}.step .k{color:var(--blue);min-width:72px;font-weight:600}
 .step .d,.obs{color:var(--dim);font-family:ui-monospace,Menlo,monospace;font-size:12px;white-space:pre-wrap;word-break:break-word}
 .obs{padding:1px 0 5px 80px}
 .ans h1,.ans h2,.ans h3{line-height:1.3;margin:.7em 0 .35em}.ans h1{font-size:1.3em}.ans h2{font-size:1.15em}.ans h3{font-size:1.04em}
-.ans code{background:#0b0d11;border:1px solid var(--line);border-radius:5px;padding:.08em .35em;font-family:ui-monospace,Menlo,monospace;font-size:.9em}
-.ans pre{background:#0b0d11;border:1px solid var(--line);border-radius:12px;padding:12px;overflow:auto}.ans pre code{border:0;padding:0}
+.ans code{background:var(--code);color:var(--txt);border:1px solid var(--line);border-radius:5px;padding:.08em .35em;font-family:ui-monospace,Menlo,monospace;font-size:.9em}
+.ans pre{background:var(--code);color:var(--txt);border:1px solid var(--line);border-radius:12px;padding:12px;overflow:auto}.ans pre code{background:transparent;border:0;padding:0}
 .ans ul,.ans ol{padding-left:1.3em}.ans a{color:var(--blue)}
 .spin{width:13px;height:13px;border:2px solid var(--line);border-top-color:var(--blue);border-radius:50%;display:inline-block;animation:s .8s linear infinite;vertical-align:-2px;margin-right:7px}
 @keyframes s{to{transform:rotate(360deg)}}
@@ -713,7 +1096,7 @@ body{margin:0;background:var(--bg);color:var(--txt);display:flex;
 .rbtn svg,.ic svg,#srch svg{fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round;display:block}
 .rbtn svg{width:20px;height:20px}.ic svg{width:20px;height:20px}
 #srch svg{width:16px;height:16px;color:var(--dim);flex:0 0 auto}
-#send{display:none}#send.show{display:flex}#send.show{color:#062e6f;background:#8ab4f8}#send.show:hover{background:#a8c7fa}
+#send{display:none}#send.show{display:flex}#send.show{color:var(--onblue);background:var(--blue)}#send.show:hover{filter:brightness(1.1)}
 .chev{width:18px;height:18px;color:var(--dim);transition:transform .25s ease;margin-left:auto;flex:0 0 auto}
 details.trace[open] .chev{transform:rotate(180deg)}
 .jist{font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1;min-width:0}
@@ -773,7 +1156,7 @@ details.trace[open] .chev{transform:rotate(180deg)}
  background:conic-gradient(from 0deg,#4285f4,#9b72cb,#d96570,#f6c343,#34a853,#4285f4);animation:spin 2.4s linear infinite;
  box-shadow:0 0 10px #9b72cb88}
 .rlive:not(.active) .orb{display:none}
-.shimmer{background:linear-gradient(90deg,#9aa0a6 0%,#f4f6fb 22%,#9aa0a6 44%);background-size:200% 100%;
+.shimmer{background:linear-gradient(90deg,var(--shim1) 0%,var(--shim2) 22%,var(--shim1) 44%);background-size:200% 100%;
  -webkit-background-clip:text;background-clip:text;color:transparent;animation:sh 1.7s linear infinite}
 @keyframes sh{to{background-position:-200% 0}}
 .obs,.step{animation:fade .3s ease both}
@@ -796,7 +1179,7 @@ details.trace[open] .chev{transform:rotate(180deg)}
 .inp:focus{border-color:var(--blue)}
 .avedit{display:flex;align-items:center;gap:16px;margin-bottom:6px}
 .avbig{width:60px;height:60px;border-radius:50%;background:var(--grad);background-size:cover;background-position:center;flex:0 0 auto}
-.btn{background:var(--blue);color:#fff;border:0;border-radius:999px;padding:10px 18px;font:inherit;font-weight:600;cursor:pointer}
+.btn{background:var(--blue);color:var(--onblue);border:0;border-radius:999px;padding:10px 18px;font:inherit;font-weight:600;cursor:pointer}
 .btn:hover{filter:brightness(1.08)}.btn.ghost{background:transparent;border:1px solid var(--line);color:var(--txt)}
 .rowline{display:flex;align-items:center;justify-content:space-between;padding:12px 0}
 .sw{width:46px;height:26px;border-radius:999px;background:var(--line);position:relative;cursor:pointer;transition:background .2s;flex:0 0 auto}
@@ -821,43 +1204,89 @@ details.trace[open] .chev{transform:rotate(180deg)}
 .navitem:hover{background:var(--hover)}.navitem.on{background:var(--sel);color:var(--txt)}
 .scontent{flex:1;padding:22px 26px;overflow:auto}.scontent .slabel:first-child{margin-top:0;padding-top:0;border:0}
 select.inp{appearance:none;-webkit-appearance:none}
+.note{font-size:12px;color:var(--dim);font-style:italic;padding:3px 0}
+/* subagent (helper) cards inside the thinking trace */
+.sub{border:1px solid var(--line);border-radius:12px;margin:7px 0;padding:8px 12px;background:var(--bg)}
+.subh{display:flex;align-items:center;gap:8px;font-size:13px}.subh b{font-weight:600;color:var(--txt)}
+.subst{margin-left:auto;color:var(--dim);font-size:12px}
+.subdot{width:8px;height:8px;border-radius:50%;background:var(--dim);flex:0 0 auto}
+.sub.run .subdot{background:var(--blue)}.sub.ok .subdot{background:#34a853}.sub.bad .subdot{background:#ea4335}
+.rlive.active .sub.run .subdot{animation:subp 1s ease-in-out infinite}@keyframes subp{50%{opacity:.25}}
+.subline{font:12px ui-monospace,Menlo,monospace;color:var(--dim);padding:2px 0 0 16px;word-break:break-word}
+.subres{font-size:13px;color:var(--mut);padding:6px 0 2px 16px;white-space:pre-wrap}
+/* Settings → Background */
+.seg{display:flex;gap:4px;background:var(--card);border:1px solid var(--line);border-radius:999px;padding:3px;margin:8px 0}
+.seg button{flex:1;border:0;background:transparent;color:var(--mut);font:inherit;font-size:13px;padding:7px 4px;border-radius:999px;cursor:pointer;transition:background .15s,color .15s}
+.seg button:hover{background:var(--hover)}.seg button.on{background:var(--blue);color:var(--onblue);font-weight:600}
+.chip{display:inline-block;font-size:10px;font-weight:600;letter-spacing:.3px;text-transform:uppercase;border-radius:999px;padding:1px 7px;margin-left:6px;vertical-align:1px;border:1px solid var(--line);color:var(--dim)}
+.chip.medium{color:#b06f00;border-color:#b06f0055}.chip.heavy{color:#c5221f;border-color:#c5221f55}.chip.run{color:#188038;border-color:#18803855}
+html:not([data-theme=light]) .chip.medium{color:#fbbc04;border-color:#fbbc0455}html:not([data-theme=light]) .chip.heavy{color:#f28b82;border-color:#f28b8255}html:not([data-theme=light]) .chip.run{color:#81c995;border-color:#81c99555}
+.wrow{gap:10px}.wrow.off .dname{color:var(--mut)}.wact{display:flex;align-items:center;gap:6px;flex:0 0 auto}
+.bgsum{border:1px solid var(--line);background:var(--card);border-radius:16px;padding:12px 14px;margin-bottom:6px}
+.bgsum .big{font-size:15px;color:var(--txt);font-weight:600}.bgwarn{color:#c5221f;font-size:12px;margin-top:4px}
+html:not([data-theme=light]) .bgwarn{color:#f28b82}
 @media (prefers-reduced-motion:reduce){*{animation:none!important}}
+#stopbtn{display:none}#stopbtn.show{display:flex}#stopbtn svg{fill:var(--txt);stroke:none}
+.watchtag{font-size:12px;color:var(--dim);margin-bottom:4px}
+.utab{width:100%;border-collapse:collapse;font-size:12px}.utab td,.utab th{padding:5px 6px;text-align:left;border-bottom:1px solid var(--line);color:var(--mut)}
+.utab td.n,.utab th.n{text-align:right}
+.ugrid{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:12px}
+.opt.go{background:var(--blue);color:var(--onblue);border-color:var(--blue)}
+.mh{font-size:11px;color:var(--dim);padding:8px 12px 4px;text-transform:uppercase;letter-spacing:.4px}
+.mi.locked{color:var(--dim)}
+.nmd p{margin:0 0 6px}.nmd pre{white-space:pre-wrap;word-break:break-word;font:12px ui-monospace,Menlo,monospace;background:var(--code);border-radius:8px;padding:8px;margin:6px 0}.nitem .opts{margin-top:8px}
 </style></head><body>
 <nav id="side">
  <div class="shead"><div class="logo"><span class="spark">✦</span><span>Cortex</span></div></div>
- <div class="row" id="new" onclick="newChat()"><span class="ic"><svg viewBox="0 0 24 24"><path d="M12 20h9"/><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4z"/></svg></span><span>New chat</span></div>
- <div id="srch"><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg><input id="srchin" placeholder="Search chats" oninput="renderChats()"></div>
+ <div class="row" id="new" data-click="newChat()"><span class="ic"><svg viewBox="0 0 24 24"><path d="M12 20h9"/><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4z"/></svg></span><span>New chat</span></div>
+ <div id="srch"><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg><input id="srchin" placeholder="Search chats" data-input="renderChats()"></div>
  <div class="sect">Recent</div>
  <div id="list"></div>
- <div class="prof" onclick="openSettings()" title="Settings"><span class="pav" id="pav"></span><div class="pt"><div class="pname" id="pname">__OWNER__</div></div></div>
+ <div class="prof" data-click="openSettings()" title="Settings"><span class="pav" id="pav"></span><div class="pt"><div class="pname" id="pname">__OWNER__</div></div></div>
 </nav>
 <div id="main">
- <div id="top"><button class="mbtn" id="modelbtn" onclick="toggleMenu(event)">__MODEL__ ▾</button>
+ <div id="top"><button class="mbtn" id="modelbtn" data-click="toggleMenu(event)">__MODEL__ ▾</button>
   <div id="menu"></div><span style="flex:1"></span>
-  <div class="bellwrap"><button class="rbtn" id="bellbtn" title="Notifications" onclick="toggleNudges(event)"></button><span class="badge" id="nbadge"></span>
+  <div class="bellwrap"><button class="rbtn" id="bellbtn" title="Notifications" data-click="toggleNudges(event)"></button><span class="badge" id="nbadge"></span>
    <div id="nudgepanel"></div></div>
-  <button class="rbtn" id="themebtn" title="Toggle light / dark" onclick="toggleThemeBtn(event)"></button></div>
+  <button class="rbtn" id="themebtn" title="Toggle light / dark" data-click="toggleThemeBtn(event)"></button></div>
  <div id="scroll"><div id="hello">Hello, __OWNER__</div><div id="wrap"></div></div>
  <div id="dock">
   <div id="attached"></div>
   <form id="form">
-   <button type="button" class="rbtn" id="attach" title="Attach files (docs, images, video)" onclick="attachFiles()"><svg viewBox="0 0 24 24"><path d="M21 11.5 12.5 20a5 5 0 0 1-7-7l8.3-8.3a3.4 3.4 0 0 1 4.8 4.8L9.2 18.1a1.8 1.8 0 0 1-2.5-2.5l7.6-7.6"/></svg></button>
+   <button type="button" class="rbtn" id="attach" title="Attach files (docs, images, video)" data-click="attachFiles()"><svg viewBox="0 0 24 24"><path d="M21 11.5 12.5 20a5 5 0 0 1-7-7l8.3-8.3a3.4 3.4 0 0 1 4.8 4.8L9.2 18.1a1.8 1.8 0 0 1-2.5-2.5l7.6-7.6"/></svg></button>
    <textarea id="q" rows="1" placeholder="Ask Cortex, or give it a job…"></textarea>
    <button type="button" class="rbtn" id="mic" title="Voice input (MLX)"><svg viewBox="0 0 24 24"><rect x="9" y="2.5" width="6" height="11" rx="3"/><path d="M5.5 11a6.5 6.5 0 0 0 13 0"/><path d="M12 17.5V21"/></svg></button>
-   <button type="button" class="rbtn spk" id="spk" title="Read answers aloud (Kokoro-MLX)" onclick="toggleSpk()"><svg viewBox="0 0 24 24"><path d="M11 5 6 9H3v6h3l5 4z"/><path d="M15.5 8.5a5 5 0 0 1 0 7"/><path d="M18.5 6a9 9 0 0 1 0 12"/></svg></button>
+   <button type="button" class="rbtn spk" id="spk" title="Read answers aloud (Kokoro-MLX)" data-click="toggleSpk()"><svg viewBox="0 0 24 24"><path d="M11 5 6 9H3v6h3l5 4z"/><path d="M15.5 8.5a5 5 0 0 1 0 7"/><path d="M18.5 6a9 9 0 0 1 0 12"/></svg></button>
+   <button type="button" class="rbtn" id="stopbtn" title="Stop" data-click="stopJob()"><svg viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="2"/></svg></button>
    <button class="rbtn" id="send" title="Send"><svg viewBox="0 0 24 24"><path d="M12 20V5"/><path d="m5 12 7-7 7 7"/></svg></button>
   </form>
-  <div class="foot">Cortex runs on-device and can make mistakes.</div>
+  <div class="foot"><span id="ctx"></span>Cortex can make mistakes.</div>
  </div>
 </div>
 <div id="ov"><div class="modal" id="modal"></div></div>
-<script>
+<script nonce="__NONCE__">
+const TOKEN=document.querySelector('meta[name=cx-token]').content;
+const _fetch=window.fetch.bind(window);   // every request from this page proves it came from this page
+window.fetch=(u,o={})=>{o.headers=new Headers(o.headers||{});o.headers.set('X-Cortex-Token',TOKEN);return _fetch(u,o)};
+// The page has no inline handlers (the CSP forbids them). Controls name an action in
+// data-click/-change/-input and this runs it: only listed functions, only plain arguments.
+const ACTIONS=new Set(__ACTIONS__);
+const arg=v=>encodeURIComponent(v).replace(/'/g,'%27');
+function act(e,attr){const t=e.target.closest&&e.target.closest('['+attr+']');if(!t)return;
+ const m=t.getAttribute(attr).match(/^(\w+)\((.*)\)$/);if(!m||!ACTIONS.has(m[1]))return;
+ const args=m[2]?m[2].split(',').map(a=>{a=a.trim();if(a==='event')return e;if(a==='this.value')return t.value;
+  if(a==='true')return true;if(a==='false')return false;
+  return /^'.*'$/.test(a)?decodeURIComponent(a.slice(1,-1)):Number(a)}):[];
+ window[m[1]](...args)}
+['click','change','input'].forEach(k=>document.addEventListener(k,e=>act(e,'data-'+k)));
 const $=id=>document.getElementById(id);
 const wrap=$('wrap'),form=$('form'),q=$('q'),send=$('send'),mic=$('mic'),hello=$('hello'),list=$('list');
-let sid='gui-'+Date.now(),busy=false,speakOn=false,allChats=[],TABFILL='';
+let sid=localStorage.getItem('cx-sid')||('gui-'+Date.now()),busy=false,speakOn=false,allChats=[],TABFILL='';
 const PEN='<svg viewBox="0 0 24 24"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z"/></svg>';
 const DEFAULT_PH='Ask Cortex, or give it a job…';
-function esc(s){return s.replace(/[&<>]/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[m]))}
+function esc(s){return String(s??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]))}
+const safeUrl=u=>/^https?:\/\//i.test(u||'')?u:'#';
 function el(t,c,h){const e=document.createElement(t);if(c)e.className=c;if(h!=null)e.innerHTML=h;return e}
 const CHEV='<svg class="chev" viewBox="0 0 24 24"><path d="m6 9 6 6 6-6"/></svg>';
 // typewriter — gives the live "thinking" a streaming feel instead of popping in chunks
@@ -866,17 +1295,24 @@ function toggleSpk(){speakOn=!speakOn;$('spk').classList.toggle('on',speakOn);if
 // real model selection (live switch of the Ollama model)
 let curModel='';
 async function loadModels(){try{const d=await (await fetch('/models')).json();curModel=d.current||'';
- const m=$('menu');m.innerHTML='';(d.models||[]).forEach(name=>{const it=el('div','mi',esc(name)+(name===curModel?'<span class="c">✓</span>':''));
-  it.onclick=async()=>{m.classList.remove('show');$('modelbtn').textContent=shortModel(name)+' ▾';
-   try{await fetch('/set_model',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({model:name})});curModel=name;loadModels()}catch(_){}};
-  m.appendChild(it)});
+ const m=$('menu');m.innerHTML='';
+ (d.groups||[]).forEach(g=>{if((d.groups||[]).length>1)m.appendChild(el('div','mh',esc(g.label)));
+  g.models.forEach(x=>{const name=x.id,short=name.replace('ollama-cloud/','');
+   const it=el('div','mi'+(x.needs_key?' locked':''),esc(short)+(name===curModel?'<span class="c">✓</span>':x.needs_key?'<span class="c">key</span>':''));
+   it.onclick=()=>pickModel(name,x.needs_key);m.appendChild(it)})});
+ if(!(d.groups||[]).length)m.appendChild(el('div','mh','No models found. Start Ollama, or add a key in Settings → AI Providers.'));
  if(curModel)$('modelbtn').textContent=shortModel(curModel)+' ▾';
 }catch(_){}}
-function shortModel(n){n=n.split('/').pop();if(n.includes('gemma4-agent')||n.includes('12b'))return 'Gemma 12B';return n.replace(':latest','')}
+async function pickModel(name,locked){const m=$('menu');m.classList.remove('show');
+ if(locked){await openSettings();sTab('providers');return}
+ $('modelbtn').textContent=shortModel(name)+' ▾';
+ try{const r=await fetch('/set_model',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({model:name})});
+  if(!r.ok){await openSettings();sTab('providers');return}curModel=name;loadModels()}catch(_){}}
+function shortModel(n){n=n.replace('ollama-cloud/','').split('/').pop();if(n.includes('gemma4-agent')||n.includes('12b'))return 'Gemma 12B';return n.replace(':latest','')}
 function toggleMenu(e){e.stopPropagation();const m=$('menu');m.classList.toggle('show');if(m.classList.contains('show'))loadModels()}
 document.addEventListener('click',e=>{if(!e.target.closest('#menu')&&e.target.id!=='modelbtn')$('menu').classList.remove('show');
   if(!e.target.closest('.bellwrap'))$('nudgepanel').classList.remove('show')});
-function newChat(){sid='gui-'+Date.now();wrap.innerHTML='';hello.style.display='';renderChats()}
+function newChat(){if(busy)return;sid='gui-'+Date.now();localStorage.setItem('cx-sid',sid);lastId=0;$('ctx').textContent='';wrap.innerHTML='';hello.style.display='';renderChats()}
 q.addEventListener('input',()=>{q.style.height='auto';q.style.height=Math.min(q.scrollHeight,150)+'px';send.classList.toggle('show',q.value.trim().length>0)});
 q.addEventListener('keydown',e=>{
  if(e.key==='Tab'&&TABFILL&&!q.value.trim()){e.preventDefault();q.value=TABFILL;q.dispatchEvent(new Event('input'));return}
@@ -901,7 +1337,7 @@ function mathify(t){return t
  .replace(/\\\(([\s\S]*?)\\\)/g,(_,e)=>tex(e))
  .replace(/\\\[([\s\S]*?)\\\]/g,(_,e)=>tex(e))}
 function md(src){src=src.replace(/\r/g,'');const out=[],L=src.split('\n');let i=0;
- const inl=t=>esc(mathify(t)).replace(/```/g,'').replace(/`([^`]+)`/g,'<code>$1</code>').replace(/\*\*([^*]+)\*\*/g,'<b>$1</b>').replace(/(^|[^*])\*([^*]+)\*/g,'$1<i>$2</i>').replace(/\[([^\]]+)\]\((https?:[^)]+)\)/g,'<a href="$2" target="_blank">$1</a>');
+ const inl=t=>esc(mathify(t)).replace(/```/g,'').replace(/`([^`]+)`/g,'<code>$1</code>').replace(/\*\*([^*]+)\*\*/g,'<b>$1</b>').replace(/(^|[^*])\*([^*]+)\*/g,'$1<i>$2</i>').replace(/\[([^\]]+)\]\((https?:[^)\s]+)\)/g,'<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
  while(i<L.length){let ln=L[i];
   if(/^```/.test(ln)){let b=[];i++;while(i<L.length&&!/^```/.test(L[i])){b.push(esc(L[i]));i++}i++;out.push('<pre><code>'+b.join('\n')+'</code></pre>');continue}
   let h=ln.match(/^(#{1,3})\s+(.*)/);if(h){out.push('<h'+h[1].length+'>'+inl(h[2])+'</h'+h[1].length+'>');i++;continue}
@@ -917,23 +1353,92 @@ function renderChats(){const f=($('srchin')||{}).value?$('srchin').value.toLower
  allChats.filter(c=>!f||c.title.toLowerCase().includes(f)).forEach(c=>{
   const d=el('div','chat'+(c.session_id===sid?' sel':''),esc(c.title||'New chat'));
   d.onclick=()=>openChat(c.session_id);list.appendChild(d)})}
-async function openChat(s){sid=s;hello.style.display='none';wrap.innerHTML='';renderChats();
- try{const msgs=(await (await fetch('/history?session='+encodeURIComponent(s))).json()).messages||[];
-  msgs.forEach(m=>{if(m.role==='user')addUser(m.content);else addResp(m.content)})}catch(_){}
- $('scroll').scrollTop=$('scroll').scrollHeight}
+async function openChat(s){busy=false;sid=s;localStorage.setItem('cx-sid',s);wrap.innerHTML='';renderChats();
+ let d={messages:[],running:false};
+ try{d=await (await fetch('/history?session='+encodeURIComponent(s))).json()}catch(_){}
+ if(s!==sid)return;                       // user switched chats while this was loading
+ const msgs=d.messages||[];
+ hello.style.display=msgs.length?'none':'';
+ msgs.forEach(m=>{if(m.role==='user')addUser(m.content);else addResp(m.content,m.parts)});
+ $('scroll').scrollTop=$('scroll').scrollHeight;
+ lastId=d.last_id||0;(d.interrupted||[]).forEach(interruptedCard);
+ if(d.pending&&!d.running){const last=[...wrap.querySelectorAll('.resp')].pop();if(last)approvalCard(last,d.pending)}
+ if(d.running)attachRunning()}             // the reply is still being written — rejoin it
 function addUser(t){const turn=el('div','turn');const r=el('div','urow');
  const ed=el('span','uedit',PEN);ed.title='Edit & resend';ed.onclick=()=>editFrom(turn,t);r.appendChild(ed);
  const b=el('div','ubub');b.textContent=t;r.appendChild(b);turn.appendChild(r);wrap.appendChild(turn);return turn}
 function editFrom(turn,text){if(busy)return;   // revert: drop this turn + everything after, refill input
+ const idx=[...wrap.children].filter(n=>n.classList.contains('turn')).indexOf(turn);
+ if(idx>=0)fetch('/history/truncate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({session:sid,turn:idx})}).then(loadChats);
  let n=turn;const rm=[];while(n){rm.push(n);n=n.nextElementSibling}rm.forEach(x=>x.remove());
  if(!wrap.children.length)hello.style.display='';
  q.value=text;q.dispatchEvent(new Event('input'));q.focus()}
-function addResp(t){const d=el('div','resp ans');d.innerHTML=md(t);wrap.appendChild(d);return d}
-// stream
+// ── shared by live streaming AND reloaded history, so a chat looks the same after a refresh ──
+function imageCard(p){const card=el('div','chartcard');const im=el('img');im.src=p.src;card.appendChild(im);if(p.caption){const cp=el('div','chartcap');cp.textContent=p.caption;card.appendChild(cp)}return card}
+function imageGrid(p){const g=el('div','imgrid');(p.items||[]).forEach(it=>{const a=el('a');a.href=safeUrl(it.page||it.url);a.target='_blank';a.rel='noopener noreferrer';const im=el('img');im.src=safeUrl(it.thumb||it.url);im.referrerPolicy='no-referrer';im.loading='lazy';im.alt=it.title||'';a.appendChild(im);g.appendChild(a)});return g}
+function subCard(body,ev,subs){let c=subs[ev.id];
+ if(!c){c=subs[ev.id]=el('div','sub','<div class="subh"><span class="subdot"></span><b></b><span class="subst">queued</span></div><div class="subb"></div>');body.appendChild(c)}
+ if(ev.title)c.querySelector('b').textContent=ev.title;
+ const st=c.querySelector('.subst'),b=c.querySelector('.subb');
+ if(ev.state==='start'){c.className='sub run';st.textContent='working…'}
+ else if(ev.state==='step'){const l=el('div','subline');l.textContent=(ev.name||'')+(ev.detail?' · '+ev.detail:'');b.appendChild(l)}
+ else if(ev.state==='done'){c.className='sub '+(ev.ok?'ok':'bad');st.textContent=ev.ok?'done':'failed';const r=el('div','subres');r.textContent=ev.summary||'';b.appendChild(r)}}
+function traceAdd(body,ev,subs){const t=ev.type||ev.t;
+ if(t==='thinking'){const s=el('div','obs');s.textContent=ev.text;body.appendChild(s)}
+ else if(t==='tool'){body.appendChild(el('div','step','<span class="k">'+esc(ev.name||'')+'</span><span class="d">'+esc(ev.detail||'')+'</span>'))}
+ else if(t==='observation'){const s=el('div','obs');s.textContent='→ '+ev.text;body.appendChild(s)}
+ else if(t==='note'){const s=el('div','note');s.textContent=ev.text;body.appendChild(s)}
+ else if(t==='subagent')subCard(body,ev,subs)}
+function addResp(t,parts){parts=parts||[];const resp=el('div','resp');
+ const tr=parts.find(p=>p.t==='trace');
+ if(tr&&(tr.events||[]).length){const live=el('div','rlive');const det=el('details','trace');
+  const sum=el('summary','','<span class="jist">Show thinking</span>'+CHEV);det.appendChild(sum);
+  const body=el('div','body');det.appendChild(body);const subs={};tr.events.forEach(e=>traceAdd(body,e,subs));
+  live.appendChild(det);resp.appendChild(live)}
+ if(parts.some(p=>p.t==='watch')){const w=el('div','watchtag');w.textContent='✦ Cortex, without being asked';resp.appendChild(w)}
+ const ans=el('div','ans');ans.innerHTML=md(t);resp.appendChild(ans);
+ parts.forEach(p=>{if(p.t==='image')resp.appendChild(imageCard(p));else if(p.t==='images')resp.appendChild(imageGrid(p));else if(p.t==='undoable')undoCard(resp,p)});
+ wrap.appendChild(resp);return resp}
+function stopShown(on){$('stopbtn').classList.toggle('show',on);send.classList.toggle('show',!on&&q.value.trim().length>0)}
+function stopJob(){postJ('/stop',{session:sid})}
+function undoCard(resp,u){const o=el('div','opts'),b=el('div','opt');b.textContent=u.complete?'Undo these changes':'Undo what I can';
+ b.onclick=async()=>{b.remove();const j=await postJ('/undo',{job:u.job,session:sid});const n=el('div','note');n.textContent=j.message||'';o.appendChild(n);syncLast()};
+ o.appendChild(b);resp.appendChild(o)}
+// A job cut off by a crash: its last checkpoint is saved, so it can carry on from there.
+function interruptedCard(j){const r=el('div','resp'),n=el('div','note');n.textContent='This job was cut off when Cortex stopped: "'+j.text.slice(0,90)+'"';r.appendChild(n);
+ const o=el('div','opts'),go=el('div','opt go'),no=el('div','opt');go.textContent='Carry on';no.textContent='Dismiss';
+ go.onclick=()=>{if(busy)return;busy=true;r.remove();const turn=addUser('Carry on with that job');
+  fetch('/jobs/resume',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:j.id,session:sid})})
+   .then(x=>{if(x.ok)runTurn(turn,'/attach?session='+encodeURIComponent(sid));else busy=false}).catch(()=>{busy=false})};
+ no.onclick=()=>{r.remove();postJ('/jobs/dismiss',{id:j.id})};
+ o.appendChild(go);o.appendChild(no);r.appendChild(o);wrap.appendChild(r)}
+// What arrives by itself: a watcher reporting back into this chat without being asked.
+let lastId=0;
+async function syncLast(){try{lastId=(await (await fetch('/updates?session='+encodeURIComponent(sid))).json()).last_id||lastId}catch(_){}}
+async function pollUpdates(){if(busy||document.hidden)return;
+ try{const d=await (await fetch('/updates?session='+encodeURIComponent(sid)+'&after='+lastId)).json();if(busy)return;
+  if(lastId&&(d.messages||[]).length){hello.style.display='none';d.messages.forEach(m=>{addResp(m.content,[{t:'watch'}])});$('scroll').scrollTop=$('scroll').scrollHeight;loadNudges()}
+  lastId=d.last_id||lastId}catch(_){}}
+setInterval(pollUpdates,5000);
+// Approval buttons answer one specific held action by id. Nothing is parsed from text, so what
+// runs depends on which button was pressed, and the job carries on from where it paused.
+function approvalCard(resp,a){const o=el('div','opts');const wary=a.after_outside_content;
+ const go=(decision,label)=>{if(busy)return;busy=true;o.remove();const turn=addUser(label);
+  fetch('/approve',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({session:sid,id:a.id,decision})})
+   .then(r=>{if(r.ok){runTurn(turn,'/attach?session='+encodeURIComponent(sid))}else{busy=false;openChat(sid)}}).catch(()=>{busy=false})};
+ const btn=(label,cls,decision)=>{const b=el('div','opt'+cls);b.textContent=label;b.onclick=()=>go(decision,label);o.appendChild(b)};
+ btn('Yes, do it',wary?'':' go','approve');
+ if(a.can_always)btn('Yes, and allow this for the rest of the chat','','approve_session');
+ btn('No, cancel',wary?' go':'','reject');resp.appendChild(o)}
+// stream — the turn runs server-side; this just follows it (and can rejoin it after a refresh)
 function submit(text){if(busy||!text)return;busy=true;send.classList.remove('show');hello.style.display='none';
- TABFILL='';q.placeholder=DEFAULT_PH;
- const first=wrap.children.length===0;q.value='';q.style.height='auto';
+ localStorage.setItem('cx-sid',sid);   // remember this chat so a refresh reopens it
+ TABFILL='';q.placeholder=DEFAULT_PH;q.value='';q.style.height='auto';
  const turn=addUser(text);
+ runTurn(turn,'/stream?session='+encodeURIComponent(sid)+'&q='+encodeURIComponent(text))}
+function attachRunning(){const last=wrap.lastElementChild;if(!last)return;busy=true;
+ runTurn(last,'/attach?session='+encodeURIComponent(sid))}
+function runTurn(turn,url){stopShown(true);
  const resp=el('div','resp');
  const live=el('div','rlive active');
  const det=el('details','trace');          // collapsed by default → retractable; summary = live preview
@@ -944,21 +1449,35 @@ function submit(text){if(busy||!text)return;busy=true;send.classList.remove('sho
  const jist=sum.querySelector('.jist');
  const preview=t=>typeInto(jist,t);          // streaming-feel preview (the "jist")
  preview('Thinking…');
- const es=new EventSource('/stream?session='+encodeURIComponent(sid)+'&q='+encodeURIComponent(text));
+ const subs={};let finished=false;
+ const es=new EventSource(url+(url.includes('?')?'&':'?')+'t='+encodeURIComponent(TOKEN));
+ let buf='',paintT=0;                       // the reply as it's being written
+ const paint=()=>{paintT=0;ans.innerHTML=md(buf);sc.scrollTop=sc.scrollHeight};
  es.onmessage=e=>{let ev;try{ev=JSON.parse(e.data)}catch(_){return}
-  if(ev.type==='status'){preview(ev.text)}
-  else if(ev.type==='thinking'){preview(ev.text.replace(/\s+/g,' ').slice(0,110));const s=el('div','obs');s.textContent=ev.text;body.appendChild(s)}
-  else if(ev.type==='tool'){preview('Using '+ev.name+(ev.detail?' · '+ev.detail:''));body.appendChild(el('div','step','<span class="k">'+esc(ev.name)+'</span><span class="d">'+esc(ev.detail||'')+'</span>'))}
-  else if(ev.type==='observation'){const s=el('div','obs');s.textContent='→ '+ev.text;body.appendChild(s)}
-  else if(ev.type==='image'){const card=el('div','chartcard');const im=el('img');im.src=ev.src;card.appendChild(im);if(ev.caption){const cp=el('div','chartcap');cp.textContent=ev.caption;card.appendChild(cp)}resp.appendChild(card)}
-  else if(ev.type==='images'){const g=el('div','imgrid');(ev.items||[]).forEach(it=>{const a=el('a');a.href=it.page||it.url;a.target='_blank';const im=el('img');im.src=it.thumb||it.url;im.loading='lazy';im.alt=it.title||'';a.appendChild(im);g.appendChild(a)});resp.appendChild(g)}
-  else if(ev.type==='answer'){live.classList.remove('active');jist.classList.remove('shimmer');jist.textContent='Show thinking';ans.innerHTML=md(ev.text);if(speakOn)ttsPlay(ev.text)}
-  else if(ev.type==='ask'){const o=el('div','opts');(ev.options||[]).forEach(opt=>{const bt=el('div','opt',esc(opt));bt.onclick=()=>submit(opt);o.appendChild(bt)});resp.appendChild(o)}
-  else if(ev.type==='followups'){const f=el('div','followups');(ev.items||[]).forEach((it,i)=>{const bt=el('div','fu');bt.innerHTML=esc(it)+(i===0?'<span class="kbd">Tab</span>':'');bt.onclick=()=>submit(it);f.appendChild(bt)});resp.appendChild(f);
+  const t=ev.type;
+  if(t==='delta'){buf+=ev.text;if(!paintT)paintT=setTimeout(paint,80);return}
+  if(t==='context'){$('ctx').textContent='Context '+ev.percent+'% · ';return}
+  if((t==='tool'||t==='answer')&&paintT){clearTimeout(paintT);paintT=0}
+  if(t==='tool'&&buf){buf='';ans.innerHTML=''}     // that was the model talking on its way to a step
+  if(t==='status'){preview(ev.text)}
+  else if(t==='thinking'){preview(ev.text.replace(/\s+/g,' ').slice(0,110));traceAdd(body,ev,subs)}
+  else if(t==='tool'){preview('Using '+ev.name+(ev.detail?' · '+ev.detail:''));traceAdd(body,ev,subs)}
+  else if(t==='observation'||t==='note'){traceAdd(body,ev,subs)}
+  else if(t==='subagent'){traceAdd(body,ev,subs);const all=Object.values(subs),dn=all.filter(c=>c.classList.contains('ok')||c.classList.contains('bad')).length;preview('Helpers · '+dn+'/'+all.length+' done')}
+  else if(t==='image'){resp.appendChild(imageCard(ev))}
+  else if(t==='images'){resp.appendChild(imageGrid(ev))}
+  else if(t==='answer'){live.classList.remove('active');jist.classList.remove('shimmer');jist._k=(jist._k||0)+1;jist.textContent='Show thinking';ans.innerHTML=md(ev.text);if(speakOn)ttsPlay(ev.text)}
+  else if(t==='approval'){approvalCard(resp,ev)}
+  else if(t==='undoable'){undoCard(resp,ev)}
+  else if(t==='ask'){const o=el('div','opts');(ev.options||[]).forEach(opt=>{const bt=el('div','opt',esc(opt));bt.onclick=()=>submit(opt);o.appendChild(bt)});resp.appendChild(o)}
+  else if(t==='followups'){const f=el('div','followups');(ev.items||[]).forEach((it,i)=>{const bt=el('div','fu');bt.innerHTML=esc(it)+(i===0?'<span class="kbd">Tab</span>':'');bt.onclick=()=>submit(it);f.appendChild(bt)});resp.appendChild(f);
    TABFILL=(ev.items&&ev.items[0])||'';if(TABFILL)q.placeholder='⇥ '+TABFILL}
-  else if(ev.type==='done'){es.close();busy=false;if(first)loadChats();q.focus()}
-  if(ev.type==='answer'||ev.type==='done'||det.open)sc.scrollTop=sc.scrollHeight};
- es.onerror=()=>{es.close();busy=false;if(!ans.innerHTML)ans.textContent='(connection dropped)'}}
+  else if(t==='busy'){finished=true;stopShown(false);es.close();live.classList.remove('active');ans.textContent='Still finishing your last message in this chat — give me a moment, then try again.';busy=false}
+  else if(t==='done'){finished=true;stopShown(false);syncLast();es.close();live.classList.remove('active');busy=false;jist._k=(jist._k||0)+1;if(!ans.innerHTML){jist.classList.remove('shimmer');jist.textContent='Show thinking'}loadChats();q.focus()}
+  if(t==='answer'||t==='done'||det.open)sc.scrollTop=sc.scrollHeight};
+ // Connection dropped mid-reply: the server keeps writing it, so reload the chat from the
+ // database and rejoin the live turn instead of showing an error.
+ es.onerror=()=>{es.close();stopShown(false);if(!finished)setTimeout(()=>openChat(sid),1200)}}
 form.addEventListener('submit',e=>{e.preventDefault();submit(q.value.trim())});
 // voice: mic -> MLX whisper ; answers -> MLX kokoro
 let rec=null,chunks=[],recording=false;
@@ -995,15 +1514,16 @@ const DICO={laptop:'<svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height
 // ── settings ──
 let CUR={};
 async function openSettings(){CUR=await (await fetch('/settings')).json();
- showModal(`<button class="mx" onclick="closeOv()" title="Close">${X}</button>
+ showModal(`<button class="mx" data-click="closeOv()" title="Close">${X}</button>
    <div class="snav"><div class="st">Settings</div>
-   <div class="navitem on" data-t="profile" onclick="sTab('profile')">Profile</div>
-   <div class="navitem" data-t="devices" onclick="sTab('devices')">Devices</div>
-   <div class="navitem" data-t="voice" onclick="sTab('voice')">Voice</div>
-   <div class="navitem" data-t="providers" onclick="sTab('providers')">AI Providers</div>
-   <div class="navitem" data-t="email" onclick="sTab('email')">Email</div>
-   <div class="navitem" data-t="mcp" onclick="sTab('mcp')">MCP</div>
-   <div class="navitem" data-t="jobs" onclick="sTab('jobs')">Jobs</div></div>
+   <div class="navitem on" data-t="profile" data-click="sTab('profile')">Profile</div>
+   <div class="navitem" data-t="devices" data-click="sTab('devices')">Devices</div>
+   <div class="navitem" data-t="voice" data-click="sTab('voice')">Voice</div>
+   <div class="navitem" data-t="providers" data-click="sTab('providers')">AI Providers</div>
+   <div class="navitem" data-t="email" data-click="sTab('email')">Email</div>
+   <div class="navitem" data-t="mcp" data-click="sTab('mcp')">MCP</div>
+   <div class="navitem" data-t="bg" data-click="sTab('bg')">Background</div>
+   <div class="navitem" data-t="usage" data-click="sTab('usage')">Usage</div></div>
    <div class="scontent" id="scontent"></div>`,'settings');
  sTab('profile')}
 function sTab(t){document.querySelectorAll('.navitem[data-t]').forEach(n=>n.classList.toggle('on',n.dataset.t===t));
@@ -1014,13 +1534,15 @@ function sTab(t){document.querySelectorAll('.navitem[data-t]').forEach(n=>n.clas
  else if(t==='providers')renderProviders(c);
  else if(t==='email')renderEmail(c);
  else if(t==='mcp')renderMcp(c);
- else renderJobs(c)}
-const PROV=[['anthropic','Claude (Anthropic)','sk-ant-…','console.anthropic.com/settings/keys'],
+ else if(t==='usage')renderUsage(c);
+ else renderBackground(c)}
+const PROV=[['ollama','Ollama Cloud','paste your Ollama key','ollama.com/settings/keys'],
+            ['anthropic','Claude (Anthropic)','sk-ant-…','console.anthropic.com/settings/keys'],
             ['openai','OpenAI','sk-…','platform.openai.com/api-keys'],
             ['gemini','Gemini (Google)','AIza…','aistudio.google.com/apikey']];
 function renderProviders(c){
  c.innerHTML=`<div class="slabel">AI providers</div>
-  <div class="dsub" style="margin-bottom:12px;line-height:1.5">Cortex runs 100% locally by default. Paste an API key to also use a cloud model — keys are stored in your OS keychain, never in a file, and never leave this machine except to call that provider. After adding a key, pick its model from the selector top-left.</div>
+  <div class="dsub" style="margin-bottom:12px;line-height:1.5">Local models run on this computer and need no key. Add a key to use cloud models too — an <b>Ollama Cloud</b> key works even if Ollama isn't installed here. Keys stay in your OS keychain and only ever go to that provider. When you use a cloud model, your messages and what Cortex knows about the task go to that provider. Pick the model from the selector top-left.</div>
   <div id="provlist"><div class="dsub">loading…</div></div>`;
  loadProviders()}
 async function loadProviders(){const L=$('provlist');if(!L)return;
@@ -1031,8 +1553,8 @@ async function loadProviders(){const L=$('provlist');if(!L)return;
     <div class="dsub">${on?'Connected ✓':'Not connected'} · <a href="https://${url}" target="_blank">get a key</a></div>
     <div style="display:flex;gap:8px;margin-top:8px">
      <input class="inp" id="k_${id}" placeholder="${ph}" autocomplete="off" style="flex:1">
-     <button class="btn" onclick="saveKey('${id}')">${on?'Update':'Connect'}</button>
-     ${on?`<span class="xbtn" title="Remove" onclick="rmKey('${id}')">${TRASH}</span>`:''}
+     <button class="btn" data-click="saveKey('${id}')">${on?'Update':'Connect'}</button>
+     ${on?`<span class="xbtn" title="Remove" data-click="rmKey('${id}')">${TRASH}</span>`:''}
     </div></div></div>`}).join('')+'<div class="dsub" id="pstat" style="margin-top:10px"></div>'}
 async function saveKey(id){const k=$('k_'+id).value.trim();if(!k){$('pstat').textContent='Paste a key first.';return}
  $('pstat').textContent='Saving…';
@@ -1048,11 +1570,11 @@ function renderMcp(c){
   <div class="slabel">Add a server</div>
   <div class="field"><label>Name</label><input class="inp" id="mcpname" placeholder="filesystem" autocomplete="off"></div>
   <div class="field"><label>Command</label><input class="inp" id="mcpcmd" placeholder="npx -y @modelcontextprotocol/server-filesystem ~/Documents" autocomplete="off"></div>
-  <div style="display:flex;gap:12px;align-items:center"><button class="btn" onclick="mcpAdd()">Add</button><span class="dsub" id="mcpstat"></span></div>`;
+  <div style="display:flex;gap:12px;align-items:center"><button class="btn" data-click="mcpAdd()">Add</button><span class="dsub" id="mcpstat"></span></div>`;
  loadMcp()}
 async function loadMcp(){const L=$('mcplist');if(!L)return;
  try{const s=(await (await fetch('/mcp/servers')).json()).servers||[];
-  L.innerHTML=s.length?s.map(x=>`<div class="dev"><div class="dico">${PLUG}</div><div style="min-width:0"><div class="dname">${esc(x.name)}</div><div class="dsub" id="mc${mid(x.name)}" style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:320px">checking…</div></div><div class="bars"><span class="xbtn" onclick="mcpRemove('${esc(x.name)}')">${TRASH}</span></div></div>`).join(''):'<div class="dsub">No MCP servers connected yet.</div>';
+  L.innerHTML=s.length?s.map(x=>`<div class="dev"><div class="dico">${PLUG}</div><div style="min-width:0"><div class="dname">${esc(x.name)}</div><div class="dsub" id="mc${mid(x.name)}" style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:320px">checking…</div></div><div class="bars"><span class="xbtn" data-click="mcpRemove('${arg(x.name)}')">${TRASH}</span></div></div>`).join(''):'<div class="dsub">No MCP servers connected yet.</div>';
   if(s.length){const st=(await (await fetch('/mcp/status')).json()).status||[];st.forEach(x=>{const e=$('mc'+mid(x.name));if(e)e.textContent=x.connected?(x.tools+' tools connected'):'not connected — check the command'})}
  }catch(_){L.innerHTML='<div class="dsub">could not load</div>'}}
 async function mcpAdd(){const name=$('mcpname').value.trim(),cmd=$('mcpcmd').value.trim();
@@ -1071,11 +1593,11 @@ function renderEmail(c){
   <div class="slabel">Add a Gmail account</div>
   <div class="field"><label>Gmail address</label><input class="inp" id="maddr" placeholder="you@gmail.com" autocomplete="off"></div>
   <div class="field"><label>App password</label><input class="inp" id="mpw" placeholder="abcd efgh ijkl mnop" autocomplete="off"></div>
-  <div style="display:flex;gap:12px;align-items:center"><button class="btn" onclick="mailAdd()">Connect</button><span class="dsub" id="mstat"></span></div>`;
+  <div style="display:flex;gap:12px;align-items:center"><button class="btn" data-click="mailAdd()">Connect</button><span class="dsub" id="mstat"></span></div>`;
  loadMail()}
 async function loadMail(){const L=$('maillist');if(!L)return;
  try{const a=(await (await fetch('/mail/accounts')).json()).accounts||[];
-  L.innerHTML=a.length?a.map(x=>`<div class="dev"><div class="dico">${MAILIC}</div><div><div class="dname">${esc(x.email)}</div><div class="dsub" id="u${mid(x.email)}">checking…</div></div><div class="bars"><span class="xbtn" title="Remove" onclick="mailRemove('${esc(x.email)}')">${TRASH}</span></div></div>`).join(''):'<div class="dsub">No accounts connected yet.</div>';
+  L.innerHTML=a.length?a.map(x=>`<div class="dev"><div class="dico">${MAILIC}</div><div><div class="dname">${esc(x.email)}</div><div class="dsub" id="u${mid(x.email)}">checking…</div></div><div class="bars"><span class="xbtn" title="Remove" data-click="mailRemove('${arg(x.email)}')">${TRASH}</span></div></div>`).join(''):'<div class="dsub">No accounts connected yet.</div>';
   if(a.length){const u=(await (await fetch('/mail/unread')).json()).accounts||[];u.forEach(x=>{const e=$('u'+mid(x.email));if(e)e.textContent=x.unread>=0?x.unread+' unread':'could not reach (check app password)'})}
  }catch(_){L.innerHTML='<div class="dsub">could not load accounts</div>'}}
 async function mailAdd(){const addr=$('maddr').value.trim(),pw=$('mpw').value.trim();
@@ -1086,9 +1608,9 @@ async function mailAdd(){const addr=$('maddr').value.trim(),pw=$('mpw').value.tr
 async function mailRemove(addr){await fetch('/mail/remove',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email:addr})});loadMail()}
 function renderProfile(c){
  c.innerHTML=`<div class="slabel">Profile</div>
-  <div class="avedit"><span class="avbig" id="savbig"></span><button class="btn ghost" onclick="cxAv('savbig')">Change photo</button></div>
+  <div class="avedit"><span class="avbig" id="savbig"></span><button class="btn ghost" data-click="cxAv('savbig')">Change photo</button></div>
   <div class="field"><label>Your name</label><input class="inp" id="setname" value="${esc(CUR.name||'')}"></div>
-  <div style="display:flex;justify-content:flex-end"><button class="btn" onclick="saveProfile()">Save</button></div>`;
+  <div style="display:flex;justify-content:flex-end"><button class="btn" data-click="saveProfile()">Save</button></div>`;
  if(CUR.has_avatar)setBg('savbig')}
 function renderDevices(c){const sv=CUR.server||{};
  c.innerHTML=`<div class="slabel">Connected devices &amp; status</div><div id="devlist"><div class="dsub">loading…</div></div>
@@ -1096,13 +1618,13 @@ function renderDevices(c){const sv=CUR.server||{};
   <div class="field"><label>Label</label><input class="inp" id="srvlabel" value="${esc(sv.label||'')}" placeholder="myserver"></div>
   <div class="field"><label>Host / Tailscale IP</label><input class="inp" id="srvhost" value="${esc(sv.host||'')}" placeholder="100.x.x.x"></div>
   <div class="field"><label>SSH user</label><input class="inp" id="srvuser" value="${esc(sv.user||'')}"></div>
-  <div style="display:flex;justify-content:flex-end"><button class="btn" onclick="saveServer()">Save</button></div>`;
+  <div style="display:flex;justify-content:flex-end"><button class="btn" data-click="saveServer()">Save</button></div>`;
  loadDevices()}
 const VOICES=[['bm_daniel','Daniel · British male'],['bm_george','George · British male'],['bf_emma','Emma · British female'],['bf_isabella','Isabella · British female'],['am_adam','Adam · American male'],['am_michael','Michael · American male'],['af_heart','Heart · American female'],['af_bella','Bella · American female'],['af_nicole','Nicole · American female'],['af_sarah','Sarah · American female']];
 function renderVoice(c){const cv=CUR.voice||'bm_daniel';
  c.innerHTML=`<div class="slabel">Cortex's voice · Kokoro (MLX)</div>
-  <div class="field"><label>Voice</label><select class="inp" id="voicesel" onchange="saveVoice()">${VOICES.map(v=>`<option value="${v[0]}" ${v[0]===cv?'selected':''}>${v[1]}</option>`).join('')}</select></div>
-  <div style="display:flex;gap:10px;margin-top:4px"><button class="btn ghost" onclick="testVoice()">▶ Test voice</button></div>
+  <div class="field"><label>Voice</label><select class="inp" id="voicesel" data-change="saveVoice()">${VOICES.map(v=>`<option value="${v[0]}" ${v[0]===cv?'selected':''}>${v[1]}</option>`).join('')}</select></div>
+  <div style="display:flex;gap:10px;margin-top:4px"><button class="btn ghost" data-click="testVoice()">▶ Test voice</button></div>
   <div class="dsub" id="vstat" style="margin-top:14px">Used for spoken replies (🔊) and voice mode.</div>`}
 async function saveVoice(){CUR.voice=$('voicesel').value;await fetch('/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({voice:CUR.voice})})}
 async function testVoice(){const v=$('voicesel').value;$('vstat').textContent='Synthesizing…';
@@ -1110,26 +1632,116 @@ async function testVoice(){const v=$('voicesel').value;$('vstat').textContent='S
   if(!r.ok){$('vstat').textContent='Voice server busy — try again in a moment.';return}
   const b=await r.blob();if(window._a)window._a.pause();window._a=new Audio(URL.createObjectURL(b));window._a.play();$('vstat').textContent='Playing a sample…'}catch(_){$('vstat').textContent='Could not play the sample.'}}
 const CLOCK='<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>';
-function renderJobs(c){c.innerHTML=`<div class="slabel">Running jobs</div><div id="joblist"><div class="dsub">loading…</div></div>
-  <div class="slabel">Add a recurring task</div>
-  <div class="dsub" style="margin-bottom:10px;line-height:1.5">Cortex re-runs the instruction on a schedule and delivers the result. e.g. <i>"summarize my unread email"</i> · <i>daily 08:00</i>.</div>
+const PLAY='<svg viewBox="0 0 24 24"><path d="M7 4.5v15l12-7.5z"/></svg>';
+// ── Settings → Background: workers, AI model memory, subagents ──
+let BG=null,bgTimer=null;
+const cap=t=>t.charAt(0).toUpperCase()+t.slice(1);
+function ago(ts){const d=Math.max(0,Date.now()/1000-ts);if(d<90)return 'just now';if(d<5400)return Math.round(d/60)+' min ago';if(d<172800)return Math.round(d/3600)+' h ago';return Math.round(d/86400)+' d ago'}
+function inSecs(n){return n<90?n+' s':Math.round(n/60)+' min'}
+async function postJ(url,body){try{return await (await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body||{})})).json()}catch(_){return {ok:false,error:'request failed'}}}
+function renderBackground(c){
+ c.innerHTML=`<div id="bgbody"><div class="dsub">loading…</div></div>
+  <div id="bgforms">
+  <div class="slabel" style="margin-top:18px">Add a recurring task</div>
+  <div class="dsub" style="margin-bottom:10px;line-height:1.5">Cortex re-runs the instruction on a schedule and delivers the result. e.g. <i>"summarize my unread email"</i> · <i>daily 08:00</i>. Each run wakes the AI model, so it shows up above under AI work.</div>
   <div class="field"><label>Instruction</label><input class="inp" id="tprompt" placeholder="what should Cortex do each time?" autocomplete="off"></div>
-  <div style="display:flex;gap:10px"><div class="field" style="flex:1"><label>Schedule</label><input class="inp" id="tsched" placeholder="daily 08:00 · every 30 min · hourly" autocomplete="off"></div>
+  <div style="display:flex;gap:10px"><div class="field" style="flex:1"><label>Schedule</label><input class="inp" id="tsched" placeholder="daily 08:00 · every 30 min · every friday at 9am" autocomplete="off"></div>
    <div class="field" style="width:130px"><label>Deliver via</label><select class="inp" id="tdeliver"><option value="notify">Notification</option><option value="email">Email</option><option value="both">Both</option></select></div></div>
-  <div style="display:flex;gap:12px;align-items:center"><button class="btn" onclick="addTask()">Schedule</button><span class="dsub" id="tstat"></span></div>`;loadJobs()}
-async function loadJobs(){try{const d=await (await fetch('/jobs')).json();
-  let h=(d.scheduled||[]).map(j=>`<div class="dev"><div class="dico">${CLOCK}</div><div><div class="dname">${esc(j.name)}</div><div class="dsub"><span class="dot2 ${j.running?'on':'off'}"></span>${esc(j.desc)}</div></div><div class="bars"><div class="bar"><div class="bv" style="font-size:12px;color:${j.running?'#34a853':'var(--dim)'}">${j.running?'running':'idle'}</div></div></div></div>`).join('');
-  if((d.tasks||[]).length){h+='<div class="slabel">Your recurring tasks</div>'+d.tasks.map(t=>`<div class="dev"><div class="dico">${CLOCK}</div><div style="min-width:0"><div class="dname">${esc(t.desc)}</div><div class="dsub" style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:300px">${esc(t.human||t.schedule)} · ${esc(t.deliver||'notify')}</div></div><div class="bars"><span class="xbtn" title="Remove" onclick="removeTask('${esc(t.id)}')">${TRASH}</span></div></div>`).join('')}
-  if((d.reminders||[]).length){h+='<div class="slabel">Scheduled reminders</div>'+d.reminders.map(r=>`<div class="dev"><div class="dico">${CLOCK}</div><div><div class="dname">${esc(r.text)}</div><div class="dsub">${esc(r.due)}</div></div></div>`).join('')}
-  if((d.goals||[]).length){h+='<div class="slabel">Active goals</div>'+d.goals.map(g=>`<div class="dev" style="padding:11px 12px"><div class="dname" style="font-size:13px;line-height:1.45">• ${esc(g)}</div></div>`).join('')}
-  $('joblist').innerHTML=h||'<div class="dsub">nothing scheduled</div>'}catch(_){$('joblist').innerHTML='<div class="dsub">could not load jobs</div>'}}
+  <div style="display:flex;gap:12px;align-items:center"><button class="btn" data-click="addTask()">Schedule</button><span class="dsub" id="tstat"></span></div>
+  <div id="joblist"></div></div>`;
+ loadBackground();loadJobs();
+ clearInterval(bgTimer);
+ bgTimer=setInterval(()=>{if(!$('bgbody')){clearInterval(bgTimer);return}
+  const a=document.activeElement;if(a&&a.tagName==='SELECT')return;loadBackground()},8000)}
+async function loadBackground(){if(!$('bgbody'))return;
+ try{BG=await (await fetch('/workers')).json()}catch(_){$('bgbody').innerHTML='<div class="dsub">could not load background status</div>';return}
+ drawBackground()}
+function bgNote(t){const e=$('bgstat');if(e)e.textContent=t}
+function workerRow(w){const canToggle=w.available||w.group==='tasks'||w.group==='services';
+ const exitBad=w.last_exit&&w.last_exit!==0&&!w.running;
+ return `<div class="dev wrow ${w.on?'':'off'}"><div style="min-width:0;flex:1">
+   <div class="dname">${esc(w.name)}<span class="chip ${w.cost}">${w.ai?'AI · ':''}${w.cost}</span>${w.running?'<span class="chip run">running</span>':''}</div>
+   <div class="dsub" style="line-height:1.4">${esc(w.desc)}</div>
+   <div class="dsub">${esc(w.cadence||'')}${w.last_run?' · last ran '+ago(w.last_run):''}${exitBad?' · <span style="color:#ea4335">last exit '+w.last_exit+'</span>':''}</div></div>
+  <div class="wact">${w.available&&w.group!=='services'?`<span class="xbtn" title="Run once now" data-click="runWorker('${arg(w.key)}')">${PLAY}</span>`:''}
+   ${w.removable?`<span class="xbtn" title="Delete this task" data-click="removeTask('${arg(w.key.slice(5))}')">${TRASH}</span>`:''}
+   ${canToggle?`<div class="sw ${w.on?'on':''}" title="${w.on?'On — click to switch off':'Off — click to switch on'}" data-click="toggleWorker('${arg(w.key)}',${!w.on})"></div>`:'<span class="dsub">not installed</span>'}</div></div>`}
+function drawBackground(){const L=$('bgbody');if(!L||!BG)return;
+ const sc=$('scontent'),y=sc?sc.scrollTop:0;
+ const S=BG.summary,R=BG.resources,M=R.models||[],Rs=R.settings||{},A=BG.agents||{};
+ const prof=BG.profiles.find(p=>p.id===S.profile);
+ let h=`<div class="slabel">Background work</div><div class="bgsum">
+   <div class="big">${S.mac?`${S.on} of ${S.total} workers on`:'Built-in workers are macOS-only'} · ${S.ai_on} AI job${S.ai_on===1?'':'s'}${S.tasks_total?` · ${S.tasks_on}/${S.tasks_total} tasks`:''}</div>
+   <div class="dsub" style="margin-top:2px">${R.on_ac?'Plugged in':'On battery'}${R.battery!=null?' · '+R.battery+'%':''} · thermal ${esc(R.thermal)}${R.free_mem_pct!=null?' · '+R.free_mem_pct+'% memory free':''}</div>
+   ${R.constrained?`<div class="bgwarn">Machine is under pressure (${esc(R.constrained_why)}) — optional AI work is paused.</div>`:''}
+   <div class="dsub" id="bgstat" style="margin-top:4px;min-height:16px"></div></div>`;
+ if(S.mac){h+=`<div class="seg">${BG.profiles.map(p=>`<button class="${S.profile===p.id?'on':''}" data-click="setProfile('${p.id}')">${cap(p.id)}</button>`).join('')}</div>
+   <div class="dsub" style="line-height:1.45">${S.profile==='custom'?(S.on===0&&S.tasks_on?'Built-in workers are off, but your recurring tasks still run.':'Custom mix — you switched individual workers below.'):esc((prof||{}).blurb||'')} ${S.profile==='off'?'(Off also pauses your recurring tasks.)':''}</div>`}
+ // AI model memory
+ h+=`<div class="slabel" style="margin-top:18px">AI model memory</div>
+  <div class="dev"><div class="dico">${CLOCK}</div><div style="min-width:0;flex:1"><div class="dname">${M.length?esc(M.map(m=>m.name+' · '+m.size_gb+' GB').join(', ')):'No AI model in memory'}</div>
+   <div class="dsub">${M.length?(M[0].expires_in==null?'stays loaded until you unload it':'frees itself in '+inSecs(M[0].expires_in)):'Cortex isn\'t using the model right now'}</div></div>
+   ${M.length?'<button class="btn ghost" data-click="unloadModel()">Unload now</button>':''}</div>
+  <div class="field"><label>After a reply, keep the model in memory for</label><select class="inp" data-change="setRes('keep_alive',this.value)">${BG.keep_alive_choices.map(c=>`<option value="${c[0]}" ${String(Rs.keep_alive)===c[0]?'selected':''}>${esc(c[1])}</option>`).join('')}</select></div>
+  <div class="rowline"><div style="padding-right:14px"><div class="dname">Only run AI jobs when plugged in</div><div class="dsub" style="line-height:1.4">Autonomy, briefings and recurring tasks skip their turn on battery.</div></div><div class="sw ${Rs.ai_jobs_only_on_ac?'on':''}" data-click="setRes('ai_jobs_only_on_ac',${!Rs.ai_jobs_only_on_ac})"></div></div>
+  <div class="field"><label>Follow-up suggestions (costs one extra model call per reply)</label><select class="inp" data-change="setRes('followups',this.value)">
+   ${[['auto','Auto — skip when it isn\'t worth it'],['always','Always'],['off','Off']].map(c=>`<option value="${c[0]}" ${Rs.followups===c[0]?'selected':''}>${c[1]}</option>`).join('')}</select></div>
+  <div class="field"><label>Stop the voice engine after being idle for</label><select class="inp" data-change="setRes('voice_idle_minutes',this.value)">
+   ${[[2,'2 minutes'],[5,'5 minutes'],[15,'15 minutes'],[60,'1 hour'],[0,'Never']].map(c=>`<option value="${c[0]}" ${Number(Rs.voice_idle_minutes)===c[0]?'selected':''}>${c[1]}</option>`).join('')}</select></div>`;
+ // subagents
+ h+=`<div class="slabel" style="margin-top:18px">Subagents</div>
+  <div class="dsub" style="margin-bottom:8px;line-height:1.5">For a request with several independent parts, Cortex can hand each part to a focused helper and combine the results. Simple requests are never split.</div>
+  <div class="field"><label>When should Cortex use helpers?</label><select class="inp" data-change="setAgents('subagents',this.value)">
+   ${[['auto','Auto — decided per task (recommended)'],['eager','Eager — consider splitting every non-trivial request'],['off','Off — always work alone']].map(c=>`<option value="${c[0]}" ${A.subagents===c[0]?'selected':''}>${c[1]}</option>`).join('')}</select></div>
+  <div class="field"><label>Helpers at the same time</label><select class="inp" data-change="setAgents('max_parallel',this.value)">
+   ${[[0,'Auto'],[1,'1 (one after another)'],[2,'2'],[3,'3'],[4,'4']].map(c=>`<option value="${c[0]}" ${Number(A.max_parallel)===c[0]?'selected':''}>${c[1]}</option>`).join('')}</select></div>
+  <div class="dsub" style="line-height:1.45">${A.local_model?'Your model runs locally, so by default helpers take turns — one set of weights can\'t truly run in parallel. A cloud model fans out up to 3 at once.':'Cloud model: helpers run in parallel (up to 3 by default).'} Helpers can't send email, edit files or change your reminders, and only read-only work runs on its own.</div>`;
+ h+=`<div class="slabel" style="margin-top:18px">Approvals</div>
+  <div class="field"><label>What can Cortex do without asking?</label><select class="inp" data-change="setAgents('approvals',this.value)">
+   ${[['careful','Careful — only read-only actions (recommended)'],['balanced','Balanced — also ordinary commands you asked for']].map(c=>`<option value="${c[0]}" ${(A.approvals||'careful')===c[0]?'selected':''}>${c[1]}</option>`).join('')}</select></div>
+  <div class="dsub" style="line-height:1.45">Anything destructive always asks, and so does everything after Cortex has read a web page, an email or a file. Disks, whole folders and saved passwords are refused outright.</div>`;
+ // workers
+ BG.groups.forEach(g=>{const rows=BG.workers.filter(w=>w.group===g.id);if(!rows.length)return;
+  h+=`<div class="slabel" style="margin-top:18px">${esc(g.name)}</div>${g.desc?`<div class="dsub" style="margin:-4px 0 8px;line-height:1.4">${esc(g.desc)}</div>`:''}`+rows.map(workerRow).join('')});
+ L.innerHTML=h;if(sc)sc.scrollTop=y}
+async function toggleWorker(key,on){bgNote(on?'Switching on…':'Switching off…');const r=await postJ('/workers/set',{key,on});
+ await loadBackground();if(r.error)bgNote(r.error)}
+async function setProfile(p){bgNote('Applying '+p+'…');const r=await postJ('/workers/profile',{profile:p});
+ await loadBackground();if(r.errors&&r.errors.length)bgNote(r.errors[0])}
+async function runWorker(key){const r=await postJ('/workers/run',{key});bgNote(r.ok?'Started — it runs once in the background.':(r.error||'could not start'));setTimeout(loadBackground,2500)}
+async function unloadModel(){const r=await postJ('/model/unload');await loadBackground();bgNote(r.message||'')}
+async function setRes(k,v){await postJ('/resources/set',{[k]:v});loadBackground()}
+async function setAgents(k,v){await postJ('/agents/set',{[k]:v});loadBackground()}
+const LIMITS=[['daily_usd','Dollars a day'],['monthly_usd','Dollars a month'],['job_usd','Dollars per job'],['daily_tokens','Tokens a day'],['job_tokens','Tokens per job']];
+function renderUsage(c){c.innerHTML='<div id="ubody"><div class="dsub">loading…</div></div>';loadUsage()}
+const num=n=>Number(n||0).toLocaleString();
+async function loadUsage(){const L=$('ubody');if(!L)return;let d;try{d=await (await fetch('/usage')).json()}catch(_){L.innerHTML='<div class="dsub">could not load usage</div>';return}
+ const money=n=>'$'+Number(n||0).toFixed(2),cx=d.context,lim=d.limits||{};
+ L.innerHTML=`<div class="slabel">Cloud use</div>
+  <div class="ugrid"><div class="dev"><div><div class="dname">${money(d.day.usd)} today</div><div class="dsub">${num(d.day.tokens)} tokens</div></div></div>
+  <div class="dev"><div><div class="dname">${money(d.month.usd)} this month</div><div class="dsub">${num(d.month.tokens)} tokens</div></div></div></div>
+  <div class="dsub" style="line-height:1.5;margin-bottom:12px">Local models are free and never limited. Dollars are estimates from published prices. A cloud model with no known price, like Ollama Cloud, is held by the token limits.</div>
+  <div class="slabel">Limits (0 means none)</div>
+  ${LIMITS.map(([k,n])=>`<div class="field"><label>${n}</label><input class="inp" type="number" min="0" step="any" value="${esc(lim[k]??0)}" data-change="setLimit('${k}',this.value)"></div>`).join('')}
+  ${cx?`<div class="slabel" style="margin-top:18px">Current model</div><div class="dev"><div><div class="dname">${esc(cx.model)}</div><div class="dsub">Holds ${num(cx.window)} tokens (from ${esc(cx.source)}); Cortex uses up to ${num(cx.usable)} before compressing.</div></div></div>`:''}
+  ${(d.models||[]).length?`<div class="slabel" style="margin-top:18px">This month by model</div><table class="utab"><tr><th>Model</th><th class="n">Calls</th><th class="n">Tokens</th><th class="n">Cost</th></tr>${d.models.map(m=>`<tr><td>${esc(m.model)}</td><td class="n">${num(m.calls)}</td><td class="n">${num((m.input_tokens||0)+(m.output_tokens||0))}</td><td class="n">${m.provider==='local'?'free':(m.cost_usd==null?'not priced':money(m.cost_usd))}</td></tr>`).join('')}</table>`:''}`}
+async function setLimit(k,v){await postJ('/limits/set',{[k]:v})}
+async function stopWatch(id){await postJ('/watches/stop',{id});loadJobs()}
+function openFromNudge(s){$('nudgepanel').classList.remove('show');openChat(s)}
+async function loadJobs(){const L=$('joblist');if(!L)return;
+ try{const d=await (await fetch('/jobs')).json();let h='';
+  const ws=(await (await fetch('/watches')).json()).watches||[];
+  if(ws.length){h+='<div class="slabel" style="margin-top:18px">Watching now</div>'+ws.map(w=>`<div class="dev"><div class="dico">${CLOCK}</div><div style="flex:1;min-width:0"><div class="dname">${esc(w.label)}</div><div class="dsub">Reports back to its chat by itself. Uses no AI while waiting.</div></div><div class="bars"><span class="xbtn" title="Stop watching" data-click="stopWatch('${arg(w.id)}')">${TRASH}</span></div></div>`).join('')}
+  if((d.reminders||[]).length){h+='<div class="slabel" style="margin-top:18px">Scheduled reminders</div>'+d.reminders.map(r=>`<div class="dev"><div class="dico">${CLOCK}</div><div><div class="dname">${esc(r.text)}</div><div class="dsub">${esc(r.due)}</div></div></div>`).join('')}
+  if((d.goals||[]).length){h+='<div class="slabel" style="margin-top:18px">Active goals</div>'+d.goals.map(g=>`<div class="dev" style="padding:11px 12px"><div class="dname" style="font-size:13px;line-height:1.45">• ${esc(g)}</div></div>`).join('')}
+  L.innerHTML=h}catch(_){L.innerHTML=''}}
 async function addTask(){const p=$('tprompt').value.trim(),s=$('tsched').value.trim();
   if(!p||!s){$('tstat').textContent='Need an instruction and a schedule.';return}
   $('tstat').textContent='Scheduling…';
   try{const r=await fetch('/tasks/add',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({desc:p.slice(0,50),prompt:p,schedule:s,deliver:$('tdeliver').value})});
-   if(!r.ok){$('tstat').textContent='Could not schedule that.';return}
-   $('tprompt').value='';$('tsched').value='';$('tstat').textContent='Scheduled.';loadJobs()}catch(_){$('tstat').textContent='Could not schedule that.'}}
-async function removeTask(id){await fetch('/tasks/remove',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id})});loadJobs()}
+   if(!r.ok){let why='Could not schedule that.';try{why=(await r.json()).error||why}catch(_){}$('tstat').textContent=why;return}
+   $('tprompt').value='';$('tsched').value='';$('tstat').textContent='Scheduled.';loadBackground()}catch(_){$('tstat').textContent='Could not schedule that.'}}
+async function removeTask(id){await fetch('/tasks/remove',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id})});loadBackground()}
 function setBg(id){const e=$(id);if(e){e.style.backgroundImage='url(/avatar?t='+Date.now()+')';e.style.backgroundSize='cover';e.style.backgroundPosition='center'}}
 // theme toggle lives OUTSIDE settings (top bar)
 const MOON='<svg viewBox="0 0 24 24"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg>';
@@ -1138,14 +1750,18 @@ function updateThemeIcon(){const t=document.documentElement.getAttribute('data-t
 function toggleThemeBtn(e){const cur=document.documentElement.getAttribute('data-theme')||'dark';setTheme(cur==='dark'?'light':'dark',e);setTimeout(updateThemeIcon,40)}
 // ── notification bell (proactive nudges) ──
 const BELL='<svg viewBox="0 0 24 24"><path d="M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.7 21a2 2 0 0 1-3.4 0"/></svg>';
-let NUDGES=[];
+let NUDGES=[],APPROVALS=[];
 function initBell(){const b=$('bellbtn');if(b)b.innerHTML=BELL;loadNudges();setInterval(loadNudges,60000)}
 async function loadNudges(){try{const d=await (await fetch('/nudges')).json();NUDGES=d.nudges||[];
-  const bg=$('nbadge');if(bg){if(d.unread>0){bg.textContent=d.unread>9?'9+':d.unread;bg.classList.add('show')}else bg.classList.remove('show')}
+  APPROVALS=(await (await fetch('/approvals')).json()).approvals||[];
+  const n=(d.unread||0)+APPROVALS.length,bg=$('nbadge');if(bg){if(n>0){bg.textContent=n>9?'9+':n;bg.classList.add('show')}else bg.classList.remove('show')}
   if($('nudgepanel').classList.contains('show'))renderNudges()}catch(_){}}
 function renderNudges(){const p=$('nudgepanel');
-  const items=NUDGES.length?NUDGES.map(n=>`<div class="nitem ${n.read?'':'un'}"><div class="nt"><span class="ndot ${esc(n.kind)}"></span>${esc(n.title)}</div>${n.body?`<div class="nb">${esc(n.body)}</div>`:''}<div class="nw">${esc(n.when).slice(0,16).replace('T',' ')}</div></div>`).join(''):'<div class="nitem"><div class="nb">Nothing new — Cortex will nudge you here when it notices something.</div></div>';
-  p.innerHTML=`<div class="nhead"><b>Notifications</b>${NUDGES.length?'<span onclick="clearNudges()">Clear all</span>':''}</div>${items}`}
+  const items=NUDGES.length?NUDGES.map(n=>`<div class="nitem ${n.read?'':'un'}" ${(n.source||'').startsWith('chat:')?`style="cursor:pointer" data-click="openFromNudge('${arg(n.source.slice(5))}')"`:''}><div class="nt"><span class="ndot ${esc(n.kind)}"></span>${esc(n.title)}</div>${n.body?`<div class="nb">${esc(n.body)}</div>`:''}<div class="nw">${esc(n.when).slice(0,16).replace('T',' ')}</div></div>`).join(''):'<div class="nitem"><div class="nb">Nothing new — Cortex will nudge you here when it notices something.</div></div>';
+  const asks=APPROVALS.map(a=>`<div class="nitem un"><div class="nt"><span class="ndot warn"></span>Needs your OK</div><div class="nb nmd">${md(a.text)}</div>${a.think?`<div class="nw">${esc(a.think)}</div>`:''}<div class="opts"><div class="opt go" data-click="resolveApproval(${Number(a.id)},true)">Approve</div><div class="opt" data-click="resolveApproval(${Number(a.id)},false)">Reject</div></div></div>`).join('');
+  p.innerHTML=`<div class="nhead"><b>Notifications</b>${NUDGES.length?'<span data-click="clearNudges()">Clear all</span>':''}</div>${asks}${items}`}
+async function resolveApproval(id,ok){const j=await postJ('/approvals/resolve',{id,approve:ok});
+  APPROVALS=APPROVALS.filter(a=>a.id!==id);NUDGES=[{title:ok?'Approved':'Rejected',body:j.message||'',kind:'info',read:true,when:''},...NUDGES];renderNudges();loadNudges()}
 function toggleNudges(e){e.stopPropagation();const p=$('nudgepanel');const open=p.classList.toggle('show');
   if(open){renderNudges();fetch('/nudges/read',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'}).then(()=>{$('nbadge').classList.remove('show')})}}
 async function clearNudges(){await fetch('/nudges/clear',{method:'POST'});NUDGES=[];renderNudges();$('nbadge').classList.remove('show')}
@@ -1168,21 +1784,22 @@ async function loadDevices(){const L=$('devlist');if(!L)return;
 // ── onboarding (first run) ──
 let OB={};
 async function maybeOnboard(){const s=await (await fetch('/settings')).json();if(s.onboarded)return;OB={name:s.name||'',server:s.server||{},has_avatar:s.has_avatar};obStep(0)}
+function obNext(){OB.name=$('obname').value.trim();obStep(1)}
 function pips(n){return `<div class="steps"><div class="pip ${n>=0?'on':''}"></div><div class="pip ${n>=1?'on':''}"></div><div class="pip ${n>=2?'on':''}"></div></div>`}
 function obStep(n){
  if(n===0){showModal(`<h2>Hey — I'm Cortex ✦</h2><div class="sub">Your brother in the machine. Quick setup — about 20 seconds.</div>${pips(0)}
    <div class="field"><label>What should I call you?</label><input class="inp" id="obname" value="${esc(OB.name)}" placeholder="Your name"></div>
-   <div style="display:flex;justify-content:flex-end;margin-top:14px"><button class="btn" onclick="OB.name=document.getElementById('obname').value.trim();obStep(1)">Next</button></div>`);
+   <div style="display:flex;justify-content:flex-end;margin-top:14px"><button class="btn" data-click="obNext()">Next</button></div>`);
   setTimeout(()=>{const e=$('obname');if(e)e.focus()},60)}
  else if(n===1){showModal(`<h2>Add a photo</h2><div class="sub">Optional — makes it yours.</div>${pips(1)}
-   <div class="avedit"><span class="avbig" id="obav"></span><button class="btn ghost" onclick="obAv()">Choose photo</button></div>
-   <div style="display:flex;justify-content:space-between;margin-top:14px"><button class="btn ghost" onclick="obStep(0)">Back</button><button class="btn" onclick="obStep(2)">Next</button></div>`);
+   <div class="avedit"><span class="avbig" id="obav"></span><button class="btn ghost" data-click="obAv()">Choose photo</button></div>
+   <div style="display:flex;justify-content:space-between;margin-top:14px"><button class="btn ghost" data-click="obStep(0)">Back</button><button class="btn" data-click="obStep(2)">Next</button></div>`);
   if(OB.has_avatar)setBg('obav')}
  else{const sv=OB.server||{};showModal(`<h2>Your server &amp; devices</h2><div class="sub">So I can keep an eye on your infrastructure. Skip and add later anytime.</div>${pips(2)}
    <div class="field"><label>Server label</label><input class="inp" id="obslabel" value="${esc(sv.label||'')}" placeholder="myserver"></div>
    <div class="field"><label>Host / Tailscale IP</label><input class="inp" id="obshost" value="${esc(sv.host||'')}" placeholder="100.x.x.x"></div>
    <div class="field"><label>SSH user</label><input class="inp" id="obsuser" value="${esc(sv.user||'')}"></div>
-   <div style="display:flex;justify-content:space-between;margin-top:14px"><button class="btn ghost" onclick="obStep(1)">Back</button><button class="btn" onclick="obFinish()">Finish</button></div>`)}}
+   <div style="display:flex;justify-content:space-between;margin-top:14px"><button class="btn ghost" data-click="obStep(1)">Back</button><button class="btn" data-click="obFinish()">Finish</button></div>`)}}
 function obAv(){const i=document.createElement('input');i.type='file';i.accept='image/*';
  i.onchange=async()=>{const f=i.files[0];if(!f)return;const fd=new FormData();fd.append('avatar',f);await fetch('/avatar',{method:'POST',body:fd});OB.has_avatar=true;setBg('obav')};i.click()}
 async function obFinish(){OB.server={label:$('obslabel').value.trim(),host:$('obshost').value.trim(),user:$('obsuser').value.trim()};
@@ -1201,8 +1818,12 @@ if('serviceWorker' in navigator){
   navigator.serviceWorker.getRegistrations().then(rs=>rs.forEach(r=>r.unregister())).catch(()=>{});
   if(window.caches)caches.keys().then(ks=>ks.forEach(k=>caches.delete(k))).catch(()=>{});
 }
-loadChats();loadModels();refreshProfile();updateThemeIcon();initBell();maybeOnboard();
+loadChats();if(localStorage.getItem('cx-sid'))openChat(sid);loadModels();refreshProfile();updateThemeIcon();initBell();maybeOnboard();
 </script></body></html>"""
+
+# The dispatcher runs only functions the page's own controls name.
+PAGE = PAGE.replace("__ACTIONS__", json.dumps(sorted(set(
+    __import__("re").findall(r'data-(?:click|change|input)="(\w+)\(', PAGE)))))
 
 
 def _open_browser(url):
@@ -1243,8 +1864,16 @@ def _stop_stale_gui(port):
     return stopped
 
 
+def _on_start():
+    """Mark jobs cut off by a crash, and restart watchers lost to a reboot."""
+    import cortex.core.watchers as watchers
+    try:
+        watchers.revive(core().db)
+    except Exception as e:
+        logger.warning(f"startup recovery: {e}")
+
+
 def main():
-    import threading
     port = int(os.environ.get("CORTEX_GUI_PORT", "7860"))
     url = f"http://127.0.0.1:{port}"
     # Only auto-open the browser when explicitly asked (the installer sets this on
@@ -1258,6 +1887,7 @@ def main():
             logger.info(f"Port {port} is in use by another program; Cortex GUI not started.")
             return
     logger.info(f"Cortex GUI running at {url}  (open it in your browser; Ctrl+C to stop)")
+    threading.Thread(target=_on_start, name="gui-startup", daemon=True).start()
     if auto_open:
         threading.Timer(1.0, lambda: _open_browser(url)).start()
     try:

@@ -350,7 +350,8 @@ def main():
             ensure_model(py)
             ensure_embed_model()
         else:
-            say("\n    (continuing without Ollama — chat won't work until it's installed)")
+            say("\n    No local Ollama, and that's fine: open Settings → AI Providers and add an")
+            say("    Ollama Cloud key from https://ollama.com/settings/keys, then pick a cloud model.")
     return launch(py)
 
 

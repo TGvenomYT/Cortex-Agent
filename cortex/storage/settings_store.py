@@ -24,8 +24,25 @@ _DEFAULTS = {
     "devices": [],              # extra devices the user added: [{label,host,user}]
     "emails": [],               # connected Gmail accounts: [{email,label}] (app pw in Keychain)
     "mcp_servers": [],          # MCP servers: [{name, command, env}]
-    "tasks": [],                # user-scheduled recurring tasks: [{id,desc,prompt,schedule,deliver}]
+    "tasks": [],                # user-scheduled recurring tasks: [{id,desc,prompt,schedule,deliver,enabled}]
+    # Subagents: Cortex splitting a big job into focused helpers. mode = auto (decided per
+    # task) | off | eager (consider splitting every non-trivial request). max_parallel 0 = auto (1 for a local model, up to 3 for cloud).
+    # approvals = how much runs without asking: careful | balanced (see cortex/core/safety.py).
+    "agents": {"subagents": "auto", "max_parallel": 0, "max_helpers": 4, "helper_steps": 4,
+               "approvals": "careful"},
+    "llm": {"model": ""},       # the chosen model; empty = config.yaml's default
+    # Cloud spending limits; 0 = no limit. Local models are never limited. A model with no
+    # known price is held by the token limits. See cortex/core/usage.py.
+    "limits": {"daily_usd": 5.0, "monthly_usd": 30.0, "job_usd": 1.0,
+               "daily_tokens": 2000000, "job_tokens": 500000, "prices": {}},
+    # Resource controls. keep_alive = how long the AI model stays in memory after a reply
+    # ("0" = free it right away, "-1" = never unload). followups = auto|off|always.
+    "resources": {"keep_alive": "2m", "followups": "auto", "ai_jobs_only_on_ac": True,
+                  "voice_idle_minutes": 5},
 }
+
+# Nested sections whose missing keys fall back to the defaults above.
+_SECTIONS = ("agents", "resources", "llm", "limits")
 
 
 def load() -> dict:
@@ -42,8 +59,23 @@ def load() -> dict:
                 s["name"] = json.load(f).get("name", "") or ""
         except Exception:
             pass
+    for sec in _SECTIONS:   # a partial section in the file still gets every default key
+        s[sec] = {**_DEFAULTS[sec], **(s.get(sec) or {})}
     s["has_avatar"] = os.path.exists(AVATAR_FILE)
     return s
+
+
+def section(name: str) -> dict:
+    """The agents / resources settings, with defaults filled in."""
+    return load().get(name, {})
+
+
+def update_section(name: str, patch: dict) -> dict:
+    """Merge `patch` into one nested section and persist it."""
+    cur = dict(section(name))
+    cur.update({k: v for k, v in (patch or {}).items() if k in _DEFAULTS[name]})
+    save({name: cur})
+    return cur
 
 
 def save(patch: dict) -> dict:
@@ -51,7 +83,7 @@ def save(patch: dict) -> dict:
     s = load()
     for k, v in (patch or {}).items():
         if k in ("name", "theme", "voice", "onboarded", "server", "devices",
-                 "emails", "mcp_servers", "tasks"):
+                 "emails", "mcp_servers", "tasks", "agents", "resources", "llm", "limits"):
             s[k] = v
     s.pop("has_avatar", None)
     with open(SETTINGS_FILE, "w", encoding="utf-8") as f:

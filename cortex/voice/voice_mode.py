@@ -50,16 +50,12 @@ def ensure_server() -> subprocess.Popen | None:
     if _server_up():
         return None
     print("  Starting the MLX voice server (first run loads models — a few seconds)…")
-    env = dict(os.environ, CORTEX_VOICE_PORT=str(VOICE_PORT))
-    proc = subprocess.Popen([sys.executable, "voice_server.py"], env=env,
-                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    for _ in range(120):
-        if _server_up():
-            print("  Voice server ready.")
-            return proc
-        time.sleep(1)
-    print("  Voice server didn't come up in time.")
-    return proc
+    import cortex.voice.lifecycle as life
+    if life.start():
+        print("  Voice server ready.")
+    else:
+        print("  Voice server didn't come up — see ~/.cortex/logs/voice-server.log")
+    return life._proc
 
 
 # ── mic capture with energy VAD ────────────────────────────────────────────

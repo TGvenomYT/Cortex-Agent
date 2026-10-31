@@ -38,6 +38,19 @@ CREATE TABLE IF NOT EXISTS memory (
 CREATE INDEX IF NOT EXISTS idx_memory_type ON memory(type);
 CREATE INDEX IF NOT EXISTS idx_memory_importance ON memory(importance DESC);
 
+-- A draft action (e.g. an email) held for the user's explicit yes/no before it
+-- actually runs. One pending row per session_id — see safety.needs_confirmation
+-- and cortex_core.ask_stream's confirmation gate.
+CREATE TABLE IF NOT EXISTS pending_actions (
+    id SERIAL PRIMARY KEY,
+    session_id VARCHAR(200) NOT NULL,
+    kind VARCHAR(50) NOT NULL,
+    payload JSONB NOT NULL,
+    confirm_message TEXT,
+    created_at TIMESTAMP DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_pending_actions_session ON pending_actions(session_id);
+
 -- ═══ CONVERSATIONS ═══
 
 CREATE TABLE IF NOT EXISTS conversations (
@@ -47,8 +60,10 @@ CREATE TABLE IF NOT EXISTS conversations (
     content TEXT NOT NULL,
     tokens_used INTEGER,
     model_used VARCHAR(50),
-    timestamp TIMESTAMP DEFAULT NOW()
+    timestamp TIMESTAMP DEFAULT NOW(),
+    parts JSONB                             -- rich bits (charts/images/trace); local SQLite only is fine, never synced
 );
+-- Existing databases: ALTER TABLE conversations ADD COLUMN IF NOT EXISTS parts JSONB;
 
 CREATE INDEX IF NOT EXISTS idx_conv_session ON conversations(session_id);
 CREATE INDEX IF NOT EXISTS idx_conv_time ON conversations(timestamp DESC);
@@ -245,3 +260,66 @@ BEGIN
     RETURN deleted_count;
 END;
 $$ LANGUAGE plpgsql;
+
+-- Runtime tables. Local to each machine: jobs, usage, undo copies and watches aren't synced.
+
+CREATE TABLE IF NOT EXISTS jobs (
+    id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    source TEXT,
+    text TEXT,
+    status TEXT NOT NULL DEFAULT 'running',
+    step INTEGER DEFAULT 0,
+    pid INTEGER,
+    note TEXT,
+    state JSONB,
+    started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    beat_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    ended_at TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
+CREATE INDEX IF NOT EXISTS idx_jobs_session ON jobs(session_id);
+
+CREATE TABLE IF NOT EXISTS usage_log (
+    id SERIAL PRIMARY KEY,
+    at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    provider TEXT NOT NULL,
+    model TEXT NOT NULL,
+    input_tokens INTEGER DEFAULT 0,
+    output_tokens INTEGER DEFAULT 0,
+    cost_usd REAL,
+    job_id TEXT,
+    session_id TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_usage_at ON usage_log(at);
+
+CREATE TABLE IF NOT EXISTS checkpoints (
+    id SERIAL PRIMARY KEY,
+    job_id TEXT NOT NULL,
+    session_id TEXT,
+    label TEXT,
+    items JSONB,
+    complete INTEGER DEFAULT 1,
+    status TEXT DEFAULT 'active',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_checkpoints_job ON checkpoints(job_id);
+
+CREATE TABLE IF NOT EXISTS watches (
+    id TEXT PRIMARY KEY,
+    session_id TEXT,
+    label TEXT,
+    spec JSONB,
+    status TEXT NOT NULL DEFAULT 'active',
+    pid INTEGER,
+    beat_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    ended_at TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS session_summaries (
+    session_id TEXT PRIMARY KEY,
+    summary TEXT,
+    upto_id INTEGER DEFAULT 0,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);

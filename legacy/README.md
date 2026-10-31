@@ -14,3 +14,6 @@ in-process `cortex_core`) and the modules only it imported:
 
 Their imports reference the old flat module layout and will NOT resolve against the
 `cortex/` package. Kept for reference only; safe to delete.
+
+`dashboard.py` and `voice.py` joined these later: both only talked to the retired :7800 daemon.
+The live voice mode is `cortex/voice/voice_mode.py`.

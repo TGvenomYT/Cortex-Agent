@@ -63,8 +63,6 @@ for entry in "${COLLECTORS[@]}"; do
     </array>
     <key>EnvironmentVariables</key>
     <dict>
-        <key>CORTEX_DB_PASSWORD</key>
-        <string>${CORTEX_DB_PASSWORD:-}</string>
         <key>PATH</key>
         <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
     </dict>

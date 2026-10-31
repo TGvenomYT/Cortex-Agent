@@ -174,6 +174,80 @@ CREATE TABLE IF NOT EXISTS memory (
 );
 CREATE INDEX IF NOT EXISTS idx_memory_type ON memory(type);
 
+-- A draft action (e.g. an email) held for the user's explicit yes/no before it
+-- actually runs. One pending row per session_id — see safety.needs_confirmation
+-- and cortex_core.ask_stream's confirmation gate.
+CREATE TABLE IF NOT EXISTS jobs (
+    id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    source TEXT,
+    text TEXT,
+    status TEXT NOT NULL DEFAULT 'running',
+    step INTEGER DEFAULT 0,
+    pid INTEGER,
+    note TEXT,
+    state JSON,
+    started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    beat_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    ended_at TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
+CREATE INDEX IF NOT EXISTS idx_jobs_session ON jobs(session_id);
+
+CREATE TABLE IF NOT EXISTS usage_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    provider TEXT NOT NULL,
+    model TEXT NOT NULL,
+    input_tokens INTEGER DEFAULT 0,
+    output_tokens INTEGER DEFAULT 0,
+    cost_usd REAL,
+    job_id TEXT,
+    session_id TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_usage_at ON usage_log(at);
+
+CREATE TABLE IF NOT EXISTS checkpoints (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id TEXT NOT NULL,
+    session_id TEXT,
+    label TEXT,
+    items JSON,
+    complete INTEGER DEFAULT 1,
+    status TEXT DEFAULT 'active',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_checkpoints_job ON checkpoints(job_id);
+
+CREATE TABLE IF NOT EXISTS watches (
+    id TEXT PRIMARY KEY,
+    session_id TEXT,
+    label TEXT,
+    spec JSON,
+    status TEXT NOT NULL DEFAULT 'active',
+    pid INTEGER,
+    beat_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    ended_at TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS session_summaries (
+    session_id TEXT PRIMARY KEY,
+    summary TEXT,
+    upto_id INTEGER DEFAULT 0,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS pending_actions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    payload JSON NOT NULL,
+    confirm_message TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_pending_actions_session ON pending_actions(session_id);
+
 CREATE TABLE IF NOT EXISTS conversations (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     session_id TEXT NOT NULL,
@@ -181,7 +255,8 @@ CREATE TABLE IF NOT EXISTS conversations (
     content TEXT NOT NULL,
     tokens_used INTEGER,
     model_used TEXT,
-    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    parts JSON
 );
 CREATE INDEX IF NOT EXISTS idx_conv_session ON conversations(session_id);
 
@@ -316,8 +391,16 @@ CREATE INDEX IF NOT EXISTS idx_nudges_read ON nudges(read);
 """
 
 
-def open_db(path: str) -> sqlite3.Connection:
-    """Open (and initialize) the local SQLite DB."""
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Additive, idempotent upgrades for databases created by older versions."""
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(conversations)").fetchall()}
+    if "parts" not in cols:   # rich message parts: charts, image grids, thinking trace
+        conn.execute("ALTER TABLE conversations ADD COLUMN parts JSON")
+
+
+def open_db(path: str, init: bool = True) -> sqlite3.Connection:
+    """Open the local SQLite DB. `init=True` also creates/migrates the schema; extra
+    per-thread connections pass init=False (the schema already exists)."""
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     conn = sqlite3.connect(
         path,
@@ -329,6 +412,8 @@ def open_db(path: str) -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode=WAL;")      # concurrent readers, durable
     conn.execute("PRAGMA foreign_keys=ON;")
     conn.execute("PRAGMA busy_timeout=15000;")
-    conn.executescript(SCHEMA_SQL)
-    conn.commit()
+    if init:
+        conn.executescript(SCHEMA_SQL)
+        _migrate(conn)
+        conn.commit()
     return conn
