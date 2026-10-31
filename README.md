@@ -93,6 +93,44 @@ asked for run without a prompt. Destructive ones always ask.
 
 ---
 
+## Running jobs
+
+Every job is recorded as it goes, so it isn't lost with the app.
+
+- **Stop** a job with the stop button (Ctrl+C in `cx`). That also stops every process it started.
+- **Undo** what a job changed with the button under its reply, by asking, or with `cx undo`. Cortex
+  keeps a copy before it changes files, for 14 days. Approval prompts say up front when something
+  can't be undone: a script, an installer, or anything on another machine.
+- **Crashes:** if Cortex dies mid-job, the chat offers to carry on from the last finished step
+  (`cx` offers on start).
+- **Stuck jobs:** a model that goes silent is cut off and tried once more, a job repeating itself or
+  failing over and over is ended early, and it tells you what happened rather than claiming success.
+- **Long commands** don't get killed. After a minute a command moves to the background and keeps going.
+
+### Looking after something that's running
+
+Ask "tell me when the build finishes" or "keep an eye on that server". A small separate process
+watches it, using no AI while it waits, and keeps going if you close the app. When something
+happens, Cortex writes the result into that chat by itself and raises a notification, with the
+reason if it failed. It can watch a process, a port, a log file, or any read-only command, and
+it warns once if a log goes quiet for 15 minutes. See them with `cx watches` or in Settings → Background.
+
+### Usage limits
+
+Settings → Usage shows what cloud models have used and sets limits for the day, the month and a
+single job (`cx usage`, `cx usage limit daily_usd 10`). Dollar figures are estimates from the
+providers' published prices. Ollama Cloud has no price table here, so it's held by the token
+limits unless you add one (`cx usage price <model> <in> <out>`). Past a limit, cloud calls stop
+and a local model takes over if there is one. Local models are free and never limited.
+
+### Context
+
+Cortex reads each model's real limits from the model itself where it can (Ollama, Anthropic,
+Gemini), and sizes history and tool output to fit. As a job fills up it shortens old results, then
+summarises earlier work, and only then drops the oldest steps. Long chats are folded into a summary
+between turns. The meter under the input shows how full the context is. Cloud models are capped at
+`agent.max_context_tokens` in `config.yaml` (default 100,000), because every token is paid for on every step.
+
 ## Project layout
 
 ```
@@ -102,7 +140,8 @@ Cortex Agent/
   uninstall.py      cross-platform uninstaller
   config.yaml       models, timeouts, feature toggles
   cortex/           the application package
-    core/           agent loop, the safety gate, memory, reminders, automation, autonomy, tasks
+    core/           agent loop, the safety gate, job runtime, undo, watchers, usage limits,
+                    context management, memory, reminders, automation, autonomy, tasks
     llm/            Ollama client, tools, schemas, embeddings, chart + NLG
     web/            web search, crawl, browser automation
     voice/          MLX voice server + voice mode
@@ -127,6 +166,8 @@ Everything is under `~/.cortex/`:
 | `~/.cortex/cortex.db` | the local SQLite database (conversations, memory, tasks, …) |
 | `~/.cortex/settings.json` | your settings (name, connected accounts, scheduled tasks) |
 | `~/.cortex/artifacts/` | generated charts/images |
+| `~/.cortex/checkpoints/` | copies kept for undo (14 days) |
+| `~/.cortex/runs/` | output of background commands (3 days) |
 | OS secret store | DB/email passwords (macOS Keychain · Windows Credential Manager · Linux Secret Service) |
 
 Nothing here is sent anywhere, except that a cloud model sees what it needs for the task

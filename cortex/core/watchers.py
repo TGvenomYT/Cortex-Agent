@@ -93,9 +93,13 @@ class Probe:
             return f"nothing running matches '{s['pattern']}'"
         return None
 
+    def output(self) -> str:
+        """The latest output, errors included: that's usually where the reason is."""
+        parts = [_tail(p) for p in (self.spec.get("log"), self.spec.get("err_log")) if p]
+        return "\n".join(x for x in parts if x)
+
     def _finished(self, detail: str, code=None) -> dict:
-        return {"what": "finished", "final": True, "detail": detail, "code": code,
-                "tail": _tail(self.log) if self.log else ""}
+        return {"what": "finished", "final": True, "detail": detail, "code": code, "tail": self.output()}
 
     def step(self) -> dict | None:
         event = getattr(self, f"_{self.kind}")()
@@ -113,11 +117,13 @@ class Probe:
             word = "finished successfully" if code == 0 else f"failed with exit code {code}"
             return self._finished(word, code)
         if not _pid_alive(s["pid"]):
-            return self._finished("has stopped")
+            return self._finished("has stopped, but there's no way to tell from here whether it succeeded")
         return None
 
     def _process(self):
-        return None if _matching(self.spec["pattern"]) else self._finished("is no longer running")
+        if _matching(self.spec["pattern"]):
+            return None
+        return self._finished("is no longer running, but there's no way to tell from here whether it succeeded")
 
     def _port(self):
         want_open = self.spec.get("until") == "open"
@@ -177,7 +183,7 @@ class Probe:
         minutes = self.spec.get("stall_minutes", STALL_MINUTES)
         if not self.warned_stall and minutes and time.time() - self.log_changed > minutes * 60:
             self.warned_stall = True
-            return {"what": "stalled", "final": False, "tail": _tail(self.log),
+            return {"what": "stalled", "final": False, "tail": self.output(),
                     "detail": f"has written nothing for {minutes} minutes, so it may be stuck"}
         return None
 
@@ -253,7 +259,9 @@ def _prompt(w: dict, event: dict) -> str:
     return (f"[Update from a watcher you started. Nobody typed this.] You were looking after: {w['label']}. "
             f"What the user asked: {why}.\nWhat just happened: it {event['detail']}.\nLatest output:\n{tail}\n\n"
             "Tell them now, in a couple of plain sentences: what happened and, if it went wrong, the likely "
-            "cause and what to do next. Check something with a read-only tool only if you really need to.")
+            "cause from the output and what to do next. Only say it worked if the above shows that; if you "
+            "can't tell, say so. Check something with a read-only tool only if you really need to, and "
+            "do it before you reply: this message is all they'll get, so don't promise to look into it later.")
 
 
 def deliver(db, w: dict, event: dict) -> None:

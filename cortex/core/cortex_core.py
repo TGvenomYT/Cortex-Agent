@@ -32,6 +32,7 @@ import contextvars
 from datetime import datetime
 
 from cortex.core import safety, usage
+from cortex.core.executor import prune_runs
 from cortex.core.runtime import Runtime, JobStopped, ModelStalled
 
 logger = logging.getLogger("cortex.core")
@@ -147,6 +148,7 @@ class CortexCore:
         self.undo = Checkpoints(self.db)
         self.runtime.recover()
         self.undo.prune()
+        prune_runs()
         self._grants: dict[str, set] = {}     # session_id -> what "allow in this chat" covers
         self._last_experience: dict[str, int] = {}
         from cortex.core.subagents import SubagentManager
@@ -1228,7 +1230,8 @@ class CortexCore:
         import cortex.core.watchers as watchers
         label = " ".join(command.split())[:60]
         w = watchers.add(self.db, session_id, label, {"kind": "pid", "pid": d["pid"], "exit_file": d["exit_file"],
-                                                      "log": d["log"], "note": "tell me when it finishes"})
+                                                      "log": d["log"], "err_log": d["err_log"],
+                                                      "note": "tell me when it finishes"})
         if w.get("error"):
             return f"`{command}` was left running as process {d['pid']}, but I couldn't watch it: {w['error']}."
         return (f"`{command}` is still running in the background (process {d['pid']}), with output going to "

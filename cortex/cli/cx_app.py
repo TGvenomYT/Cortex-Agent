@@ -130,7 +130,9 @@ def ask(text: str) -> dict:
 
 
 def _offer_resume():
-    """Offer to carry on any job a crash cut off."""
+    """Restart watchers a reboot took down, and offer to carry on any job a crash cut off."""
+    import cortex.core.watchers as watchers
+    watchers.revive(core().db)
     for job in core().interrupted():
         console.print(f"  [yellow]A job was cut off:[/yellow] {job['text'][:80]}")
         try:

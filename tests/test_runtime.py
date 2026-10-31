@@ -545,6 +545,33 @@ def test_exit_code_is_read_from_a_finished_command(tmp_path):
     assert ev["code"] == 3 and "failed" in ev["detail"] and ev["final"] and "boom" in ev["tail"]
 
 
+def test_a_report_includes_what_went_to_stderr(tmp_path):
+    code, out, err = tmp_path / "c", tmp_path / "o", tmp_path / "e"
+    code.write_text("3")
+    out.write_text("building\n")
+    err.write_text("ERROR: out of disk space\n")
+    ev = watchers.Probe({"kind": "pid", "pid": 1, "exit_file": str(code), "log": str(out), "err_log": str(err)}).step()
+    assert "out of disk space" in ev["tail"] and "building" in ev["tail"]
+
+
+def test_a_process_we_did_not_start_is_not_called_a_success():
+    import subprocess
+    p = subprocess.Popen(["true"])
+    probe = watchers.Probe({"kind": "pid", "pid": p.pid})
+    p.wait()
+    ev = probe.step()
+    assert "no way to tell" in ev["detail"] and ev["code"] is None
+
+
+def test_the_prompt_tells_the_model_not_to_assume():
+    assert "Only say it worked if" in watchers._prompt({"label": "x", "spec": {}}, {"detail": "d", "tail": ""})
+
+
+def test_approval_shows_the_real_schedule():
+    v = safety.evaluate({"action": "schedule_task", "task_op": "add", "task_prompt": "p", "task_schedule": "every 1 min"})
+    assert "every 5 minutes" in v.message
+
+
 def test_a_process_ending_is_noticed():
     import subprocess
     p = subprocess.Popen(["sleep", "0.3"])

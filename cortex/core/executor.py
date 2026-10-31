@@ -35,6 +35,19 @@ def _kill_group(proc) -> None:
         pass
 
 
+def prune_runs(max_age_days: int = 3) -> None:
+    """Output files of finished background commands aren't needed for long."""
+    folder = os.path.expanduser(RUNS_DIR)
+    cutoff = time.time() - max_age_days * 86400
+    try:
+        for name in os.listdir(folder):
+            path = os.path.join(folder, name)
+            if os.path.getmtime(path) < cutoff:
+                os.remove(path)
+    except OSError:
+        pass
+
+
 class CommandExecutor:
     """Executes shell commands and logs everything."""
 
@@ -123,7 +136,7 @@ class CommandExecutor:
                 import threading
                 threading.Thread(target=proc.wait, daemon=True).start()
                 return finish(-3, read(out_path)[-2000:], "", detached={
-                    "pid": proc.pid, "log": out_path, "exit_file": code_path})
+                    "pid": proc.pid, "log": out_path, "err_log": err_path, "exit_file": code_path})
             if elapsed >= timeout:
                 _kill_group(proc)
                 stdout = read(out_path)
