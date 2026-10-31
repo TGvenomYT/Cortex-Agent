@@ -243,13 +243,14 @@ class ContextReader:
         if extra_context:
             context += "\n\n" + extra_context
 
-        try:
-            from cortex.integrations.calendar_integration import get_upcoming_events, format_events_for_context
-            events = get_upcoming_events(hours=4)
-            if events:
-                context += "\n\n[CALENDAR]\n" + format_events_for_context(events)
-        except Exception:
-            pass
+        if source != "task":
+            try:
+                from cortex.integrations.calendar_integration import get_upcoming_events, format_events_for_context
+                events = get_upcoming_events(hours=4)
+                if events:
+                    context += "\n\n[CALENDAR]\n" + format_events_for_context(events)
+            except Exception:
+                pass
 
         # Retrieval-based selection (the "know when to use it" mechanism):
         # relevance is picked by embedding similarity to THIS request, not dumped wholesale.

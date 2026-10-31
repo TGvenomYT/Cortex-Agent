@@ -12,6 +12,7 @@ python-dateutil>=2.9  # date parsing
 rich>=13.0            # CLI output
 keyring>=24.0         # cross-platform API-key / secret storage
 ddgs>=7.0             # web + image search
+pypdf>=5.0            # reading PDFs where pdftotext isn't installed (pure Python)
 beautifulsoup4>=4.12  # page reading (uses the built-in html.parser — no lxml needed)
 
 # Optional extras (installed best-effort by run.py; install by hand any time):

@@ -22,7 +22,6 @@ from cortex.util.notify import notify as _notify_os, say as _say_os
 
 logger = logging.getLogger("cortex.automation")
 
-BASE_URL = "http://localhost:7800"
 
 # Cooldown state must survive across wake-run-exit invocations in the scheduled
 # model, where the in-memory _fired_recently dict would reset every run and

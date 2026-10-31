@@ -12,6 +12,7 @@ Model: nomic-embed-text (768 dims, local, fast on Apple Silicon).
 """
 
 import os
+import time
 import logging
 import threading
 from collections import OrderedDict
@@ -57,7 +58,20 @@ def embed(text: str, api_key: str = None) -> list[float]:
     return vec
 
 
+# No local Ollama (a cloud-only machine, or it's just stopped): each call would fail anyway,
+# and one turn makes several. Remember that for a little while instead of retrying.
+_DOWN_UNTIL = 0.0
+_DOWN_FOR = 60.0
+
+
+def available() -> bool:
+    return time.time() >= _DOWN_UNTIL
+
+
 def _embed_uncached(text: str) -> list[float]:
+    global _DOWN_UNTIL
+    if not available():
+        return None
     try:
         resp = httpx.post(
             f"{OLLAMA_BASE_URL}/api/embed",
@@ -70,6 +84,10 @@ def _embed_uncached(text: str) -> list[float]:
         if not embeddings:
             return None
         return embeddings[0]
+    except httpx.TransportError as e:
+        _DOWN_UNTIL = time.time() + _DOWN_FOR
+        logger.info(f"Local embedding engine unreachable ({e}); semantic search is off for now")
+        return None
     except Exception as e:
         logger.error(f"Local embedding failed: {e}")
         return None

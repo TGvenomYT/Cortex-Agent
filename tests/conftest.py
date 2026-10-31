@@ -1,18 +1,75 @@
-"""Every test runs against a throwaway ~/.cortex and never touches launchd or the Keychain."""
+"""Every test runs against a throwaway home folder and never touches launchd or the Keychain."""
 import os
 import sys
 
 import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 
 @pytest.fixture(autouse=True)
-def isolated_settings(tmp_path, monkeypatch):
+def isolated_home(tmp_path, monkeypatch):
     import cortex.storage.settings_store as ss
+    import cortex.util.osutil as osutil
+    monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setattr(ss, "_DIR", str(tmp_path))
     monkeypatch.setattr(ss, "SETTINGS_FILE", str(tmp_path / "settings.json"))
     monkeypatch.setattr(ss, "OWNER_FILE", str(tmp_path / "owner.json"))
     monkeypatch.setattr(ss, "ONBOARD_FLAG", str(tmp_path / ".onboarded"))
     monkeypatch.setattr(ss, "AVATAR_FILE", str(tmp_path / "avatar.png"))
+    secrets = {}
+    monkeypatch.setattr(osutil, "secret_get", lambda a: secrets.get(a))
+    monkeypatch.setattr(osutil, "secret_set", lambda a, v: secrets.__setitem__(a, v) or True)
+    monkeypatch.setattr(osutil, "secret_delete", lambda a: secrets.pop(a, None))
+    import cortex.llm.embeddings as emb
+    monkeypatch.setattr(emb, "_embed_uncached", lambda text: None)
+    import cortex.llm.llm as llm
+    llm._MODEL_CACHE.clear()
     return tmp_path
+
+
+class Scripted:
+    """A model that says what the test tells it to, and records what it was shown."""
+    primary = None
+
+    def __init__(self, *turns):
+        self.turns, self.seen = list(turns), []
+
+    def complete(self, messages, json_mode=False, schema=None):
+        return "{}"
+
+    def complete_with_tools(self, messages, tools):
+        self.seen.append([dict(m) for m in messages])
+        turn = self.turns.pop(0) if self.turns else "all done"
+        if isinstance(turn, Exception):
+            raise turn
+        if isinstance(turn, str):
+            return {"content": turn, "tool_calls": [], "thinking": ""}
+        return {"content": turn.get("say", ""), "thinking": "",
+                "tool_calls": [{"id": f"c{i}", "function": {"name": n, "arguments": a}}
+                               for i, (n, a) in enumerate(turn["calls"])]}
+
+
+def shell(cmd):
+    return {"calls": [("execute_shell", {"command": cmd})]}
+
+
+@pytest.fixture
+def make_core(tmp_path, monkeypatch):
+    from cortex.core import cortex_core
+
+    def make(*turns):
+        config = {
+            "database": {"backend": "sqlite", "sqlite_path": str(tmp_path / "cortex.db")},
+            "llm": {"ollama": {"model": "fake:1b", "base_url": "http://127.0.0.1:9"}},
+            "context": {"simple_mode": False}, "memory": {"summarize_every": 2}, "autonomy": {},
+        }
+        monkeypatch.setattr("cortex.util.cortex_bootstrap.load_secrets", lambda: None)
+        core = cortex_core.CortexCore(config)
+        core.mcp = None
+        core.llm = Scripted(*turns)
+        core.subagents.assess = lambda text: None
+        monkeypatch.setattr(core, "_want_followups", lambda answer: False)
+        return core
+    return make

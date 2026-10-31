@@ -83,16 +83,10 @@ else
     echo -e "  ${DIM}Run: CORTEX_DB_PASSWORD=... python3 test_connection.py${RESET}"
 fi
 
-# ─── Daemon launchd ───
+# ─── Scheduled jobs (Cortex has no always-on daemon) ───
 echo ""
-echo -e "${CYAN}Installing Cortex daemon...${RESET}"
-mkdir -p "$PLIST_DIR"
-PLIST_FILE="$PLIST_DIR/com.cortex.daemon.plist"
-cp "$PROJECT_DIR/com.cortex.daemon.plist" "$PLIST_FILE"
-launchctl unload "$PLIST_FILE" 2>/dev/null || true
-launchctl load "$PLIST_FILE"
-echo -e "  ${GREEN}✓${RESET} Daemon installed (auto-starts on login)"
-echo -e "  ${DIM}Control: launchctl unload/load $PLIST_FILE${RESET}"
+echo -e "${CYAN}Installing scheduled jobs...${RESET}"
+bash "$PROJECT_DIR/install_scheduled.sh"
 
 # ─── Collector schedules ───
 echo ""

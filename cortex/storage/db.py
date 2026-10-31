@@ -887,7 +887,8 @@ class Database:
                     FROM autonomy_log
                     WHERE id = %s AND decision = 'proposed' AND confirmed IS NULL
                 """, (proposal_id,))
-                return cur.fetchone()
+                row = cur.fetchone()
+                return dict(row) if row else None
 
     def get_open_proposals(self, limit: int = 30, max_age_days: int = 7) -> list:
         """The approvals inbox: proposals nobody has answered yet, newest first."""
@@ -1023,6 +1024,47 @@ class Database:
                     FROM documents WHERE embedding IS NOT NULL
                     ORDER BY embedding <=> %s::vector LIMIT %s""", (vec, vec, limit))
                 return [dict(r) for r in cur.fetchall()]
+
+    _STOPWORDS = frozenset("a about an and are as at be but by can could did do does for from had has have how "
+                           "i in is it its me my of on or our should so that the their them this to was we "
+                           "were what when where which who why will with would you your".split())
+
+    @classmethod
+    def _keywords(cls, text: str) -> set:
+        """Meaningful words, lightly stemmed so 'ship' finds 'ships' and 'shipping'."""
+        import re
+        out = set()
+        for w in re.findall(r"[a-z0-9]{2,}", (text or "").lower()):
+            if w in cls._STOPWORDS:
+                continue
+            for end in ("ing", "ed", "es", "s"):
+                if w.endswith(end) and len(w) - len(end) >= 3:
+                    w = w[:-len(end)]
+                    break
+            out.add(w)
+        return out
+
+    def search_documents_keyword(self, query: str, limit: int = 6) -> list:
+        """Find chunks stored without a vector by the words they share with the query.
+        `similarity` is the share of the query's meaningful words that the chunk contains."""
+        words = self._keywords(query)
+        if not words:
+            return []
+        with self.get_conn() as conn:
+            with conn.cursor(cursor_factory=extras.RealDictCursor) as cur:
+                cur.execute("SELECT source, chunk FROM documents WHERE embedding IS NULL")
+                rows = cur.fetchall()
+        scored = []
+        for r in rows:
+            share = len(words & self._keywords(r["chunk"])) / len(words)
+            if share > 0:
+                scored.append({"source": r["source"], "chunk": r["chunk"], "similarity": share})
+        return sorted(scored, key=lambda h: -h["similarity"])[:limit]
+
+    def clear_document(self, source: str):
+        with self.get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM documents WHERE source = %s", (source,))
 
     def list_documents(self) -> list:
         with self.get_conn() as conn:

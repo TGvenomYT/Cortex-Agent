@@ -13,6 +13,7 @@ from __future__ import annotations
 import os
 import re
 import base64
+import shutil
 import zipfile
 import tempfile
 import subprocess
@@ -53,12 +54,16 @@ def _text(path: str, limit: int = 300_000) -> str:
 
 
 def _pdf(path: str) -> str:
+    """pdftotext keeps the layout best, but isn't on Windows by default; pypdf is everywhere."""
+    if shutil.which("pdftotext"):
+        r = subprocess.run(["pdftotext", "-layout", path, "-"], capture_output=True, text=True, timeout=90)
+        if r.stdout.strip():
+            return r.stdout.strip()
     try:
-        r = subprocess.run(["pdftotext", "-layout", path, "-"],
-                           capture_output=True, text=True, timeout=90)
-        return r.stdout.strip() or "[pdf: no extractable text]"
-    except Exception as e:
-        return f"[pdf error: {e}]"
+        from pypdf import PdfReader
+        return "\n\n".join(page.extract_text() or "" for page in PdfReader(path).pages).strip()
+    except ImportError:
+        raise RuntimeError("reading PDFs needs pdftotext, or: pip install pypdf")
 
 
 def _docx(path: str) -> str:
@@ -75,17 +80,26 @@ def _docx(path: str) -> str:
 
 
 def _vision(image_path: str, prompt: str) -> str:
-    """Describe/transcribe an image with a vision model (qwen3-vl via Ollama)."""
+    """Describe/transcribe an image with a vision model: locally (qwen3-vl via Ollama), or
+    through Ollama Cloud when there's a key and the local engine can't do it."""
     import httpx
+    from cortex.llm import llm
+    with open(image_path, "rb") as f:
+        b = base64.b64encode(f.read()).decode()
+    body = {"messages": [{"role": "user", "content": prompt, "images": [b]}], "stream": False}
     try:
-        b = base64.b64encode(open(image_path, "rb").read()).decode()
-        r = httpx.post("http://localhost:11434/api/chat", json={
-            "model": os.environ.get("CORTEX_VISION_MODEL", "qwen3-vl:8b"),
-            "messages": [{"role": "user", "content": prompt, "images": [b]}],
-            "stream": False}, timeout=180)
+        r = httpx.post("http://localhost:11434/api/chat", timeout=180,
+                       json={**body, "model": os.environ.get("CORTEX_VISION_MODEL", "qwen3-vl:8b")})
+        r.raise_for_status()
         return (r.json().get("message", {}) or {}).get("content", "").strip()
     except Exception as e:
-        return f"[vision error: {e}]"
+        key = llm.get_key("ollama")
+        if not key:
+            raise RuntimeError(f"reading images needs a local vision model or an Ollama Cloud key ({e})")
+    r = httpx.post(f"{llm.OLLAMA_CLOUD_URL}/api/chat", timeout=180, headers={"Authorization": f"Bearer {key}"},
+                   json={**body, "model": os.environ.get("CORTEX_CLOUD_VISION_MODEL", "gemma4:31b")})
+    r.raise_for_status()
+    return (r.json().get("message", {}) or {}).get("content", "").strip()
 
 
 def _image(path: str) -> str:
@@ -136,9 +150,8 @@ def chunk(text: str, size: int = 900, overlap: int = 150) -> list[str]:
 def ingest(db, path: str, source: str = None) -> tuple[str, int]:
     """Extract -> chunk -> embed -> store. Returns (source_name, n_embedded_chunks).
 
-    Fails LOUDLY (raises) rather than silently storing chunks with no embedding —
-    an un-embedded chunk is invisible to retrieval, so a 'successful' upload that
-    can never be found is worse than a clear error.
+    With no embedding model (a machine that only uses cloud models, or Ollama stopped)
+    the chunks are stored without vectors, and retrieve() finds those by keyword.
     """
     from cortex.llm.embeddings import embed, to_pgvector
     source = source or os.path.basename(path)
@@ -148,28 +161,18 @@ def ingest(db, path: str, source: str = None) -> tuple[str, int]:
     chunks = chunk(text)
     if not chunks:
         raise RuntimeError(f"no content to index in {source}")
-    # Probe the embedder once up front so we fail fast with a helpful message
-    # instead of silently storing hundreds of unretrievable chunks.
-    probe = embed(chunks[0])
-    if probe is None:
-        raise RuntimeError(
-            "couldn't reach the embedding model — make sure Ollama is running and the "
-            "embedding model is installed:  ollama pull nomic-embed-text")
+    db.clear_document(source)       # uploading a file again replaces it
     embedded = 0
-    for i, ch in enumerate(chunks):
-        vec = probe if i == 0 else embed(ch)
-        if vec:
-            db.add_document(source, ch, to_pgvector(vec))
-            embedded += 1
-    if embedded == 0:
-        raise RuntimeError(f"embedding failed for every chunk of {source}")
-    logger.info(f"ingested {source}: {embedded}/{len(chunks)} chunks embedded")
-    return source, embedded
+    for ch in chunks:
+        vec = embed(ch)
+        db.add_document(source, ch, to_pgvector(vec) if vec else None)
+        embedded += 1 if vec else 0
+    logger.info(f"ingested {source}: {len(chunks)} chunks, {embedded} embedded")
+    return source, len(chunks)
 
 
 def retrieve(db, query: str, k: int = 6) -> list[dict]:
     from cortex.llm.embeddings import embed
     qv = embed(query)
-    if not qv:
-        return []
-    return db.search_documents(qv, limit=k)
+    hits = db.search_documents(qv, limit=k) if qv else []
+    return hits + db.search_documents_keyword(query, limit=k)

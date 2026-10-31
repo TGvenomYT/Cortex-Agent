@@ -27,7 +27,10 @@ _DEFAULTS = {
     "tasks": [],                # user-scheduled recurring tasks: [{id,desc,prompt,schedule,deliver,enabled}]
     # Subagents: Cortex splitting a big job into focused helpers. mode = auto (decided per
     # task) | off | eager (consider splitting every non-trivial request). max_parallel 0 = auto (1 for a local model, up to 3 for cloud).
-    "agents": {"subagents": "auto", "max_parallel": 0, "max_helpers": 4, "helper_steps": 4},
+    # approvals = how much runs without asking: careful | balanced (see cortex/core/safety.py).
+    "agents": {"subagents": "auto", "max_parallel": 0, "max_helpers": 4, "helper_steps": 4,
+               "approvals": "careful"},
+    "llm": {"model": ""},       # the chosen model; empty = config.yaml's default
     # Resource controls. keep_alive = how long the AI model stays in memory after a reply
     # ("0" = free it right away, "-1" = never unload). followups = auto|off|always.
     "resources": {"keep_alive": "2m", "followups": "auto", "ai_jobs_only_on_ac": True,
@@ -35,7 +38,7 @@ _DEFAULTS = {
 }
 
 # Nested sections whose missing keys fall back to the defaults above.
-_SECTIONS = ("agents", "resources")
+_SECTIONS = ("agents", "resources", "llm")
 
 
 def load() -> dict:
@@ -76,7 +79,7 @@ def save(patch: dict) -> dict:
     s = load()
     for k, v in (patch or {}).items():
         if k in ("name", "theme", "voice", "onboarded", "server", "devices",
-                 "emails", "mcp_servers", "tasks", "agents", "resources"):
+                 "emails", "mcp_servers", "tasks", "agents", "resources", "llm"):
             s[k] = v
     s.pop("has_avatar", None)
     with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
