@@ -174,6 +174,19 @@ CREATE TABLE IF NOT EXISTS memory (
 );
 CREATE INDEX IF NOT EXISTS idx_memory_type ON memory(type);
 
+-- A draft action (e.g. an email) held for the user's explicit yes/no before it
+-- actually runs. One pending row per session_id — see safety.needs_confirmation
+-- and cortex_core.ask_stream's confirmation gate.
+CREATE TABLE IF NOT EXISTS pending_actions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    payload JSON NOT NULL,
+    confirm_message TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_pending_actions_session ON pending_actions(session_id);
+
 CREATE TABLE IF NOT EXISTS conversations (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     session_id TEXT NOT NULL,
@@ -181,7 +194,8 @@ CREATE TABLE IF NOT EXISTS conversations (
     content TEXT NOT NULL,
     tokens_used INTEGER,
     model_used TEXT,
-    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    parts JSON
 );
 CREATE INDEX IF NOT EXISTS idx_conv_session ON conversations(session_id);
 
@@ -316,8 +330,16 @@ CREATE INDEX IF NOT EXISTS idx_nudges_read ON nudges(read);
 """
 
 
-def open_db(path: str) -> sqlite3.Connection:
-    """Open (and initialize) the local SQLite DB."""
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Additive, idempotent upgrades for databases created by older versions."""
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(conversations)").fetchall()}
+    if "parts" not in cols:   # rich message parts: charts, image grids, thinking trace
+        conn.execute("ALTER TABLE conversations ADD COLUMN parts JSON")
+
+
+def open_db(path: str, init: bool = True) -> sqlite3.Connection:
+    """Open the local SQLite DB. `init=True` also creates/migrates the schema; extra
+    per-thread connections pass init=False (the schema already exists)."""
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     conn = sqlite3.connect(
         path,
@@ -329,6 +351,8 @@ def open_db(path: str) -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode=WAL;")      # concurrent readers, durable
     conn.execute("PRAGMA foreign_keys=ON;")
     conn.execute("PRAGMA busy_timeout=15000;")
-    conn.executescript(SCHEMA_SQL)
-    conn.commit()
+    if init:
+        conn.executescript(SCHEMA_SQL)
+        _migrate(conn)
+        conn.commit()
     return conn

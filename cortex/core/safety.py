@@ -57,6 +57,26 @@ def needs_confirmation(response_json: dict) -> tuple[bool, str]:
         rid = response_json.get("reminder", {}).get("id")
         return True, f"Delete reminder #{rid}?"
 
+    if action == "email_send":
+        to = response_json.get("email_to") or "(no recipient)"
+        subject = response_json.get("email_subject") or "(no subject)"
+        body = (response_json.get("email_body") or "").strip()
+        draft = f"To: {to}\nSubject: {subject}" + (f"\n\n{body}" if body else "")
+        # Unconditional — there is no "obvious" email that's safe to fire off
+        # without the user seeing it first, no matter how clearly they asked.
+        return True, f"Here's the draft — nothing has been sent yet:\n\n{draft}\n\nSend it?"
+
+    if action == "workers":
+        op, w, prof = response_json.get("workers_op"), response_json.get("worker"), response_json.get("profile")
+        # Turning things OFF is always fine. Turning background work ON (it costs battery and,
+        # for AI jobs, gigabytes of model memory) is held for an explicit yes — so injected
+        # text in a web page can't quietly switch Cortex's autonomy back on.
+        if op == "enable":
+            return True, f"Turn on the background worker `{w}`? It will keep running on its schedule until you switch it off."
+        if op == "profile" and prof in ("balanced", "full"):
+            return True, f"Switch background work to the '{prof}' profile? That starts several scheduled jobs" + \
+                (", including the AI model." if prof == "full" else ".")
+
     if action in ("execute", "devops") and command:
         if any(p in command for p in DANGEROUS_PATTERNS):
             return True, f"I'm about to run: `{command}`. This looks destructive. Proceed?"

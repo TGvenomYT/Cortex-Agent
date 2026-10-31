@@ -271,6 +271,97 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "remember",
+            "description": (
+                "Permanently store a fact, preference, or standing rule the moment it comes "
+                "up — do NOT wait, and do not assume you'll pick it up passively later. Use "
+                "type='rule' for a standing instruction about how you must behave going "
+                "forward (e.g. the user says 'remember:', 'always...', 'never...', or "
+                "corrects something you did) — rules are never pruned and are always included "
+                "in your instructions, every single turn. Use type='fact'/'preference'/"
+                "'project_info' for ordinary things worth remembering."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "content": {"type": "string"},
+                    "type": {"type": "string", "enum": ["fact", "preference", "rule", "project_info"]},
+                },
+                "required": ["content", "type"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "forget",
+            "description": "Delete a previously stored memory or rule, e.g. when the user says to forget it, it's no longer true, or they want a standing rule lifted.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "memory_id": {"type": ["integer", "null"], "description": "the memory's id, if known"},
+                    "search": {"type": ["string", "null"], "description": "a snippet of its content, if the id isn't known"},
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "delegate",
+            "description": (
+                "Hand parts of a big job to helper agents that each work on one part with a focused "
+                "context. Use ONLY when the request has 2+ clearly INDEPENDENT parts (e.g. 'check my "
+                "disk, search the web for X, and summarise my unread mail'). NEVER for a single "
+                "question, a simple task, chit-chat, or steps that depend on each other's results. "
+                "Make every subtask fully self-contained."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "subtasks": {
+                        "type": "array",
+                        "description": "2-4 independent parts",
+                        "items": {"type": "object",
+                                  "properties": {"title": {"type": "string", "description": "3-5 words"},
+                                                 "prompt": {"type": "string", "description": "complete instruction for the helper"}},
+                                  "required": ["title", "prompt"]},
+                    },
+                },
+                "required": ["subtasks"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "manage_workers",
+            "description": (
+                "Control Cortex's OWN background workers — the scheduled jobs that run when the user "
+                "isn't chatting (reminders, system collectors, AI autonomy, daily briefings, sync, and "
+                "recurring tasks) — and the AI model's memory use. Use for 'what's running in the "
+                "background', 'stop/pause the background workers', 'turn off autonomy', 'free up "
+                "memory'. op: list | enable | disable | profile | run | unload_model."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "op": {"type": "string", "enum": ["list", "enable", "disable", "profile", "run", "unload_model"]},
+                    "worker": {"type": ["string", "null"],
+                               "description": "worker key or name from op=list (autonomy, reminders, collector.system, "
+                                              "report-morning, task.<id>…), for enable/disable/run"},
+                    "profile": {"type": ["string", "null"], "enum": ["off", "essential", "balanced", "full", None],
+                                "description": "preset for op=profile: off = nothing runs, essential = reminders+rules only, "
+                                               "balanced = + machine awareness, full = + AI autonomy/briefings"},
+                },
+                "required": ["op"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "request_credentials",
             "description": "Trigger a native macOS dialog asking the user for login credentials to a site you need to access.",
             "parameters": {
@@ -335,6 +426,17 @@ def tool_call_to_action_data(tool_call: dict) -> dict:
                 "task_desc": args.get("desc"), "task_prompt": args.get("prompt"),
                 "task_schedule": args.get("schedule"), "task_deliver": args.get("deliver") or "notify",
                 "task_id": args.get("id")}
+    if name == "remember":
+        return {"action": "remember", "remember_content": args.get("content"),
+                "remember_type": args.get("type", "fact")}
+    if name == "forget":
+        return {"action": "forget", "forget_id": args.get("memory_id"),
+                "forget_search": args.get("search")}
+    if name == "delegate":
+        return {"action": "delegate", "subtasks": args.get("subtasks") or []}
+    if name == "manage_workers":
+        return {"action": "workers", "workers_op": args.get("op", "list"),
+                "worker": args.get("worker"), "profile": args.get("profile")}
     if name == "request_credentials":
         return {"action": "credential_prompt", "credential_prompt_site": args.get("site"), "credential_prompt_for": args.get("purpose")}
 

@@ -1,6 +1,14 @@
 """
 Memory System — Persistent knowledge across all sessions.
-Facts, preferences, learned commands — auto-extracted from conversations by LLM.
+Facts, preferences, learned commands — auto-extracted from conversations by LLM,
+plus explicit remember()/forget() the user or Cortex itself can call immediately
+(see the `remember`/`forget` tools in cortex/llm/tools.py) instead of waiting on
+passive extraction.
+
+type="rule" is a standing behavioral instruction ("never send an email without
+showing me the draft first"), not just a fact. Rules are always included in the
+prompt (never cut by the `limit`) and are exempt from pruning — a correction the
+user gave once shouldn't quietly age out.
 """
 
 import json
@@ -60,6 +68,24 @@ class MemoryManager:
         """Get top memories by importance for the system prompt."""
         return self.db.get_memories(limit=limit)
 
+    def remember_rule(self, content: str, source: str = "conversation"):
+        """Store a standing behavioral instruction — always obeyed, never pruned, never capped."""
+        self.store_fact(content, mem_type="rule", source=source, importance=5)
+
+    def forget(self, memory_id: int = None, search: str = None) -> str:
+        """Delete a memory by id, or by a content snippet if the id isn't known."""
+        if memory_id:
+            return f"forgot memory #{memory_id}" if self.db.delete_memory(memory_id) \
+                else f"no memory #{memory_id} found"
+        if search:
+            hits = [m for m in self.db.get_memories(limit=500)
+                    if search.lower() in m["content"].lower()]
+            if not hits:
+                return f"couldn't find a stored memory matching '{search}'"
+            self.db.delete_memory(hits[0]["id"])
+            return f"forgot: {hits[0]['content'][:80]}"
+        return "need either a memory id or a search snippet to forget something"
+
     def on_conversation_turn(self, session_id: str):
         """
         Call this after every conversation turn.
@@ -115,11 +141,13 @@ class MemoryManager:
     def prune(self):
         """
         Remove oldest low-importance memories when over the limit.
-        Keeps high-importance facts safe.
+        Keeps high-importance facts safe, and never touches rules — a standing
+        instruction doesn't get to quietly age out just because the fact table
+        filled up.
         """
         with self.db.get_conn() as conn:
             with conn.cursor() as cur:
-                cur.execute("SELECT COUNT(*) FROM memory")
+                cur.execute("SELECT COUNT(*) FROM memory WHERE type != 'rule'")
                 count = cur.fetchone()[0]
 
                 if count > self.max_facts:
@@ -128,6 +156,7 @@ class MemoryManager:
                         DELETE FROM memory
                         WHERE id IN (
                             SELECT id FROM memory
+                            WHERE type != 'rule'
                             ORDER BY importance ASC, created_at ASC
                             LIMIT %s
                         )
@@ -135,11 +164,26 @@ class MemoryManager:
                     logger.info(f"Pruned {excess} low-importance memories")
 
     def format_for_prompt(self, limit: int = 15) -> str:
-        """Format memories as a string for the LLM system prompt."""
-        memories = self.get_relevant(limit=limit)
-        if not memories:
+        """
+        Format memories for the LLM system prompt. Rules are a separate,
+        uncapped block up front so they can't be crowded out by facts —
+        everything else is ranked by importance under `limit`.
+        """
+        rules = self.db.get_memories(type="rule", limit=200)
+        facts = [m for m in self.get_relevant(limit=limit + len(rules)) if m["type"] != "rule"][:limit]
+        if not rules and not facts:
             return "(No memories stored yet)"
-        lines = []
-        for m in memories:
-            lines.append(f"- [{m['type']}] {m['content']}")
-        return "\n".join(lines)
+
+        parts = []
+        if rules:
+            parts.append(
+                "STANDING RULES THE USER GAVE YOU — these are not suggestions, obey them "
+                "every time even if it feels repetitive or no one reminds you again:\n" +
+                "\n".join(f"- {r['content']}" for r in rules)
+            )
+        if facts:
+            parts.append(
+                "OTHER REMEMBERED FACTS / PREFERENCES:\n" +
+                "\n".join(f"- [{m['type']}] {m['content']}" for m in facts)
+            )
+        return "\n\n".join(parts)

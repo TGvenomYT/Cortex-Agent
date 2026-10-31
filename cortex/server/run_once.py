@@ -241,6 +241,16 @@ def main() -> int:
     args = p.parse_args()
 
     ensure_state_dir()
+    # Scheduled runs are background work: tell the LLM layer to free the model's memory
+    # almost immediately afterwards instead of leaving it resident for minutes.
+    if args.cmd in ("autonomy", "report", "task"):
+        os.environ["CORTEX_BACKGROUND"] = "1"
+    if not args.force:
+        import cortex.core.workers as workers
+        allowed, why = workers.is_allowed(args.cmd, getattr(args, "name", None) if args.cmd == "report" else None)
+        if not allowed:
+            logger.info(f"{args.cmd} skipped ({why})")
+            return 0
     return {
         "autonomy": cmd_autonomy,
         "reminders": cmd_reminders,

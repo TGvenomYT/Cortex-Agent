@@ -6,6 +6,7 @@ Connection pool + helpers for all Cortex data operations.
 import os
 import json
 import logging
+import threading
 from datetime import datetime, timedelta
 from contextlib import contextmanager
 
@@ -42,14 +43,21 @@ class Database:
         self.password = password or os.environ.get("CORTEX_DB_PASSWORD", "")
         self.sqlite_path = sqlite_path or os.path.expanduser("~/.cortex/cortex.db")
         self._pool = None
-        self._sqlite = None  # the raw sqlite3 connection (local-first backend)
+        # Local-first backend: ONE sqlite3 connection PER THREAD. A single shared
+        # connection let one thread's rollback() undo another thread's uncommitted
+        # write (a silent way for chat turns to vanish). WAL + busy_timeout make
+        # multiple connections safe; each thread lazily opens its own.
+        self._local = threading.local()
+        self._sqlite_ready = False
+        self._parts_ok = None    # does the (Postgres) conversations table have `parts`?
 
     def connect(self):
         """Initialize the backend. SQLite = local-first (works offline)."""
         if self.backend == "sqlite":
             try:
                 import cortex.storage.sqlite_backend as sqlite_backend
-                self._sqlite = sqlite_backend.open_db(self.sqlite_path)
+                self._local.conn = sqlite_backend.open_db(self.sqlite_path)   # creates/migrates schema
+                self._sqlite_ready = True
                 logger.info(f"Connected to local SQLite at {self.sqlite_path}")
                 return True
             except Exception as e:
@@ -77,9 +85,11 @@ class Database:
 
     def close(self):
         """Close the backend."""
-        if self._sqlite:
-            self._sqlite.close()
-            self._sqlite = None
+        conn = getattr(self._local, "conn", None)
+        if conn is not None:
+            conn.close()
+            self._local.conn = None
+        self._sqlite_ready = False
         if self._pool:
             self._pool.closeall()
             logger.info("Database pool closed")
@@ -89,7 +99,11 @@ class Database:
         """Get a connection (context manager). Commits on success, rolls back on error."""
         if self.backend == "sqlite":
             import cortex.storage.sqlite_backend as sqlite_backend
-            conn = sqlite_backend._Conn(self._sqlite)
+            raw = getattr(self._local, "conn", None)
+            if raw is None:
+                raw = sqlite_backend.open_db(self.sqlite_path, init=False)
+                self._local.conn = raw
+            conn = sqlite_backend._Conn(raw)
             try:
                 yield conn
                 conn.commit()
@@ -250,58 +264,112 @@ class Database:
 
     # ─── Conversations ───
 
+    def _conv_has_parts(self) -> bool:
+        """SQLite always has it (migrated on open). A remote Postgres may not — probe once."""
+        if self.backend == "sqlite":
+            return True
+        if self._parts_ok is None:
+            try:
+                with self.get_conn() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute("""SELECT 1 FROM information_schema.columns
+                                       WHERE table_name = 'conversations' AND column_name = 'parts'""")
+                        self._parts_ok = cur.fetchone() is not None
+            except Exception:
+                self._parts_ok = False
+        return self._parts_ok
+
     def save_conversation(self, session_id: str, role: str, content: str,
-                          tokens: int = None, model: str = None):
-        """Store a conversation turn."""
+                          tokens: int = None, model: str = None, parts: list = None):
+        """Store a conversation turn. `parts` = rich bits (charts, image grids, thinking
+        trace) so a reloaded chat looks the way it did live."""
         with self.get_conn() as conn:
             with conn.cursor() as cur:
-                cur.execute("""
-                    INSERT INTO conversations (session_id, role, content, tokens_used, model_used)
-                    VALUES (%s, %s, %s, %s, %s)
-                """, (session_id, role, content, tokens, model))
+                if parts and self._conv_has_parts():
+                    cur.execute("""
+                        INSERT INTO conversations (session_id, role, content, tokens_used, model_used, parts)
+                        VALUES (%s, %s, %s, %s, %s, %s)
+                    """, (session_id, role, content, tokens, model, json.dumps(parts)))
+                else:
+                    cur.execute("""
+                        INSERT INTO conversations (session_id, role, content, tokens_used, model_used)
+                        VALUES (%s, %s, %s, %s, %s)
+                    """, (session_id, role, content, tokens, model))
 
-    def get_conversations(self, session_id: str, limit: int = 10) -> list:
-        """Get recent conversation history for a session."""
+    def get_conversations(self, session_id: str, limit: int = 10, with_parts: bool = False) -> list:
+        """Recent conversation history for a session, oldest -> newest.
+
+        Ordered by the monotonic row id, NOT the timestamp: timestamps have 1-second
+        resolution, a question and its answer are written in the same second, and
+        ordering ties are arbitrary — which used to flip every reloaded exchange
+        (answer above question)."""
+        want_parts = with_parts and self._conv_has_parts()
+        cols = "role, content, parts" if want_parts else "role, content"
         with self.get_conn() as conn:
             with conn.cursor(cursor_factory=extras.RealDictCursor) as cur:
-                cur.execute("""
-                    SELECT role, content, timestamp
+                cur.execute(f"""
+                    SELECT {cols}
                     FROM conversations
                     WHERE session_id = %s
-                    ORDER BY timestamp DESC
+                    ORDER BY id DESC
                     LIMIT %s
                 """, (session_id, limit))
                 rows = cur.fetchall()
 
-        # Return in chronological order
-        return [{"role": r["role"], "content": r["content"]} for r in reversed(rows)]
+        out = []
+        for r in reversed(rows):
+            m = {"role": r["role"], "content": r["content"]}
+            if want_parts:
+                pj = r["parts"]
+                if isinstance(pj, (str, bytes)):
+                    try:
+                        pj = json.loads(pj)
+                    except ValueError:
+                        pj = None
+                m["parts"] = pj or []
+            out.append(m)
+        return out
 
-    def get_chat_sessions(self, limit: int = 40) -> list:
-        """Recent chat sessions (for the sidebar): session_id + title (first user
-        message) + last activity. Real history, newest first."""
+    def truncate_conversation(self, session_id: str, from_user_turn: int) -> int:
+        """Delete the Nth (0-based) user message of a chat and everything after it — what
+        'edit & resend' means, so the removed turns don't reappear after a reload."""
         with self.get_conn() as conn:
             with conn.cursor(cursor_factory=extras.RealDictCursor) as cur:
                 cur.execute("""
-                    SELECT session_id, MAX(timestamp) AS last_ts, COUNT(*) AS n
-                    FROM conversations
-                    GROUP BY session_id
-                    ORDER BY last_ts DESC
+                    SELECT id FROM conversations
+                    WHERE session_id = %s AND role = 'user'
+                    ORDER BY id ASC LIMIT 1 OFFSET %s
+                """, (session_id, max(0, int(from_user_turn))))
+                row = cur.fetchone()
+                if not row:
+                    return 0
+                cur.execute("DELETE FROM conversations WHERE session_id = %s AND id >= %s",
+                            (session_id, row["id"]))
+                n = cur.rowcount or 0
+        self.clear_pending_action(session_id)
+        return n
+
+    def get_chat_sessions(self, limit: int = 200) -> list:
+        """Recent chat sessions for the sidebar: session_id + title (first user message)
+        + last activity, newest first — one query (was 1 + N)."""
+        with self.get_conn() as conn:
+            with conn.cursor(cursor_factory=extras.RealDictCursor) as cur:
+                cur.execute("""
+                    SELECT c.session_id AS session_id,
+                           MAX(c.id) AS last_id,
+                           MAX(c.timestamp) AS last_ts,
+                           (SELECT x.content FROM conversations x
+                             WHERE x.session_id = c.session_id AND x.role = 'user'
+                             ORDER BY x.id ASC LIMIT 1) AS title
+                    FROM conversations c
+                    GROUP BY c.session_id
+                    ORDER BY last_id DESC
                     LIMIT %s
                 """, (limit,))
-                sessions = [dict(r) for r in cur.fetchall()]
-                out = []
-                for s in sessions:
-                    cur.execute("""
-                        SELECT content FROM conversations
-                        WHERE session_id = %s AND role = 'user'
-                        ORDER BY id ASC LIMIT 1
-                    """, (s["session_id"],))
-                    row = cur.fetchone()
-                    title = (dict(row)["content"] if row else "") or "New chat"
-                    out.append({"session_id": s["session_id"],
-                                "title": title.strip()[:60],
-                                "last_ts": str(s["last_ts"])})
-        return out
+                rows = [dict(r) for r in cur.fetchall()]
+        return [{"session_id": r["session_id"],
+                 "title": ((r["title"] or "New chat").strip().replace("\n", " "))[:60],
+                 "last_ts": str(r["last_ts"])} for r in rows]
 
     # ─── Memory ───
 
@@ -318,7 +386,7 @@ class Database:
         """Retrieve memories, ordered by importance."""
         with self.get_conn() as conn:
             with conn.cursor(cursor_factory=extras.RealDictCursor) as cur:
-                query = "SELECT type, content, importance FROM memory"
+                query = "SELECT id, type, content, importance FROM memory"
                 params = []
 
                 if type:
@@ -331,8 +399,66 @@ class Database:
                 cur.execute(query, params)
                 rows = cur.fetchall()
 
-        return [{"type": r["type"], "content": r["content"], "importance": r["importance"]}
+        return [{"id": r["id"], "type": r["type"], "content": r["content"], "importance": r["importance"]}
                 for r in rows]
+
+    def delete_memory(self, memory_id: int) -> bool:
+        """Forget one stored memory by id. Returns True if a row was removed."""
+        with self.get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM memory WHERE id = %s", (memory_id,))
+                return (cur.rowcount or 0) > 0
+
+    # ─── Pending actions (held for the user's explicit yes/no) ───
+
+    def save_pending_action(self, session_id: str, kind: str, payload: dict,
+                            confirm_message: str = None) -> int:
+        """
+        Replace any existing pending action for this session with a new one
+        (only one draft can be awaiting confirmation per session at a time).
+        """
+        with self.get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM pending_actions WHERE session_id = %s", (session_id,))
+                cur.execute("""
+                    INSERT INTO pending_actions (session_id, kind, payload, confirm_message)
+                    VALUES (%s, %s, %s, %s)
+                    RETURNING id
+                """, (session_id, kind, json.dumps(payload), confirm_message))
+                return cur.fetchone()[0]
+
+    def get_pending_action(self, session_id: str, max_age_minutes: float = 15.0) -> dict | None:
+        """The draft awaiting this session's yes/no, or None if there isn't one or it's stale.
+
+        The staleness cutoff is computed in naive UTC and compared in SQL — both
+        SQLite's CURRENT_TIMESTAMP and Postgres' NOW() land in `created_at` as
+        naive UTC-ish values (see count_recent_autonomy_actions for the same
+        pattern), so comparing against datetime.now() (local time) would make
+        every row in a UTC+ timezone look instantly "expired" and delete itself
+        unread.
+        """
+        from datetime import timezone
+        cutoff = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=max_age_minutes)
+        with self.get_conn() as conn:
+            with conn.cursor(cursor_factory=extras.RealDictCursor) as cur:
+                cur.execute("""
+                    SELECT id, kind, payload, confirm_message
+                    FROM pending_actions
+                    WHERE session_id = %s AND created_at > %s
+                """, (session_id, cutoff))
+                row = cur.fetchone()
+        if not row:
+            return None
+        payload = row["payload"]
+        if isinstance(payload, str):
+            payload = json.loads(payload)
+        return {"id": row["id"], "kind": row["kind"], "payload": payload,
+                "confirm_message": row["confirm_message"]}
+
+    def clear_pending_action(self, session_id: str):
+        with self.get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM pending_actions WHERE session_id = %s", (session_id,))
 
     # ─── Reminders ───
 

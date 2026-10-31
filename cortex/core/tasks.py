@@ -216,3 +216,22 @@ def add_task(desc: str, prompt: str, schedule: str, deliver: str = "notify") -> 
 def remove_task(tid: str):
     settings_store.save({"tasks": [t for t in list_tasks() if t["id"] != tid]})
     _uninstall(tid)
+
+
+def is_enabled(task: dict) -> bool:
+    return task.get("enabled", True)
+
+
+def set_task_enabled(tid: str, enabled: bool):
+    """Pause or resume one task. Pausing removes it from the OS scheduler (so it stops
+    waking the machine) but keeps it listed here; resuming re-registers it."""
+    tasks = list_tasks()
+    task = next((t for t in tasks if t["id"] == tid), None)
+    if task is None:
+        raise KeyError(f"no task {tid}")
+    if enabled:
+        _install(task)           # may raise — in which case we leave the flag untouched
+    else:
+        _uninstall(tid)
+    task["enabled"] = bool(enabled)
+    settings_store.save({"tasks": tasks})

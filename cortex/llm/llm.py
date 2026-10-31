@@ -154,6 +154,24 @@ class LLMBackend:
         raise NotImplementedError
 
 
+def resolve_keep_alive() -> str:
+    """How long Ollama keeps the model resident AFTER a request (its RAM/GPU is the
+    single biggest thing Cortex costs you). Background jobs (run_once sets
+    CORTEX_BACKGROUND) free it almost immediately; the interactive chat uses the
+    user's Settings → Background choice (default 2m, so a conversation stays snappy
+    but the model doesn't squat on ~8-15 GB for Ollama's default 5 min)."""
+    if os.environ.get("CORTEX_BACKGROUND"):
+        return os.environ.get("CORTEX_BG_KEEP_ALIVE", "15s")
+    try:
+        import cortex.storage.settings_store as settings_store
+        v = (settings_store.load().get("resources") or {}).get("keep_alive")
+        if v not in (None, ""):
+            return str(v)
+    except Exception:
+        pass
+    return "2m"
+
+
 # ── Ollama (local) ───────────────────────────────────────────────────────────
 class OllamaBackend(LLMBackend):
     """Any local Ollama model. No cloud calls, no API keys."""
@@ -165,7 +183,8 @@ class OllamaBackend(LLMBackend):
         self.timeout = timeout
 
     def complete(self, messages: list[dict], json_mode: bool = False, schema: dict = None) -> str:
-        payload = {"model": self.model, "messages": messages, "stream": False}
+        payload = {"model": self.model, "messages": messages, "stream": False,
+                   "keep_alive": resolve_keep_alive()}
         if schema is not None:
             payload["format"] = schema
         elif json_mode:
@@ -177,7 +196,8 @@ class OllamaBackend(LLMBackend):
         return r.json()["message"]["content"]
 
     def complete_with_tools(self, messages: list[dict], tools: list[dict]) -> dict:
-        payload = {"model": self.model, "messages": messages, "tools": tools, "stream": False}
+        payload = {"model": self.model, "messages": messages, "tools": tools, "stream": False,
+                   "keep_alive": resolve_keep_alive()}
         start = time.time()
         r = httpx.post(f"{self.base_url}/api/chat", json=payload, timeout=self.timeout)
         r.raise_for_status()
@@ -197,7 +217,8 @@ class OllamaBackend(LLMBackend):
         return {"content": msg.get("content", ""), "tool_calls": tcs, "thinking": msg.get("thinking", "")}
 
     def stream(self, messages: list[dict]):
-        payload = {"model": self.model, "messages": messages, "stream": True}
+        payload = {"model": self.model, "messages": messages, "stream": True,
+                   "keep_alive": resolve_keep_alive()}
         with httpx.stream("POST", f"{self.base_url}/api/chat", json=payload, timeout=self.timeout) as r:
             r.raise_for_status()
             for line in r.iter_lines():

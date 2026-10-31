@@ -334,8 +334,21 @@ class ContextReader:
 
         history_limit = 15 if source == "siri" else 10
         history = self.db.get_conversations(session_id=session_id, limit=history_limit)
+        # The current message is persisted the moment it arrives (so a refresh/crash can't
+        # lose it) — don't feed it back as history, we append it below.
+        if history and history[-1]["role"] == "user" and history[-1]["content"] == user_text:
+            history = history[:-1]
 
         messages = [{"role": "system", "content": system_prompt}]
+
+        def add(role: str, content: str):
+            # An interrupted turn leaves two user messages in a row; merge same-role
+            # neighbours so every provider sees a clean user/assistant alternation.
+            if messages[-1]["role"] == role:
+                messages[-1]["content"] += "\n\n" + content
+            else:
+                messages.append({"role": role, "content": content})
+
         for msg in history:
             role = msg["role"]
             content = msg["content"]
@@ -345,7 +358,7 @@ class ContextReader:
                     content = parsed.get("speak", content)
                 except Exception:
                     pass
-            messages.append({"role": role, "content": content})
+            add(role, content)
 
-        messages.append({"role": "user", "content": user_text})
+        add("user", user_text)
         return messages

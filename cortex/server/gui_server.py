@@ -14,7 +14,9 @@ from __future__ import annotations
 
 import os
 import json
+import time
 import logging
+import threading
 
 os.chdir(__import__("cortex").ROOT)
 
@@ -29,7 +31,6 @@ app = Flask(__name__)
 _CORE = None
 VOICE_PORT = int(os.environ.get("CORTEX_VOICE_PORT", "8005"))
 VOICE_URL = f"http://127.0.0.1:{VOICE_PORT}"
-_voice_proc = None
 
 
 def core():
@@ -54,17 +55,12 @@ def _model_label() -> str:
 
 
 def ensure_voice():
-    global _voice_proc
-    try:
-        httpx.get(VOICE_URL + "/health", timeout=2); return True
-    except Exception:
-        pass
-    import cortex.voice.voice_mode as voice_mode
-    _voice_proc = voice_mode.ensure_server()
-    try:
-        httpx.get(VOICE_URL + "/health", timeout=2); return True
-    except Exception:
-        return False
+    """Start the on-device voice engine on demand (it stops itself when idle)."""
+    import cortex.voice.lifecycle as life
+    ok = life.start()
+    if ok:
+        life.touch()
+    return ok
 
 
 @app.route("/")
@@ -410,28 +406,8 @@ _JOB_META = {
 
 @app.route("/jobs")
 def jobs():
-    """What Cortex is running right now: scheduled background jobs + active goals."""
-    import subprocess
-    out = {"scheduled": [], "goals": []}
-    try:
-        res = subprocess.run(["launchctl", "list"], capture_output=True, text=True, timeout=5)
-        for line in res.stdout.splitlines():
-            if "com.cortex." not in line:
-                continue
-            parts = line.split("\t")
-            if len(parts) < 3:
-                continue
-            pid, status, label = parts[0].strip(), parts[1].strip(), parts[2].strip()
-            key = label.replace("com.cortex.", "")
-            if key.startswith("collector.") or key.startswith("task."):
-                continue  # collectors are plumbing; user tasks listed separately below
-            name, desc = _JOB_META.get(key, (key, ""))
-            out["scheduled"].append({
-                "key": key, "name": name, "desc": desc,
-                "running": pid not in ("-", ""), "ok": status in ("0", "-"),
-            })
-    except Exception as e:
-        logger.warning(f"/jobs: {e}")
+    """Goals, reminders and recurring tasks (the background workers themselves are at /workers)."""
+    out = {"goals": [], "reminders": [], "tasks": []}
     try:
         out["goals"] = [g["description"] for g in core().db.get_active_goals(limit=8)]
     except Exception:
@@ -440,13 +416,97 @@ def jobs():
         out["reminders"] = [{"text": r["text"], "due": str(r["due_at"])}
                             for r in core().db.get_all_reminders(include_fired=False)[:8]]
     except Exception:
-        out["reminders"] = []
+        pass
     try:
         import cortex.core.tasks as tasks_mod
         out["tasks"] = tasks_mod.list_tasks()
     except Exception:
-        out["tasks"] = []
+        pass
     return jsonify(out)
+
+
+# ── background workers, model memory, subagents (Settings → Background) ─────
+@app.route("/workers")
+def workers_list():
+    import cortex.core.workers as workers
+    import cortex.core.resources as resources
+    rows = workers.list_workers()
+    try:
+        agents = dict(core().subagents.settings())
+        agents["local_model"] = core().subagents._is_local()
+    except Exception:
+        agents = {}
+    return jsonify({
+        "workers": rows,
+        "groups": [{"id": g, "name": n, "desc": d} for g, n, d in workers.GROUPS],
+        "summary": workers.summary(rows),
+        "profiles": [{"id": k, "blurb": workers.PROFILE_BLURB[k]} for k in workers.PROFILES],
+        "resources": resources.snapshot(),
+        "keep_alive_choices": resources.KEEP_ALIVE_CHOICES,
+        "agents": agents,
+    })
+
+
+@app.route("/workers/set", methods=["POST"])
+def workers_set():
+    import cortex.core.workers as workers
+    d = request.get_json(force=True) or {}
+    return jsonify(workers.set_enabled(d.get("key", ""), bool(d.get("on"))))
+
+
+@app.route("/workers/profile", methods=["POST"])
+def workers_profile():
+    import cortex.core.workers as workers
+    return jsonify(workers.apply_profile((request.get_json(force=True) or {}).get("profile", "")))
+
+
+@app.route("/workers/run", methods=["POST"])
+def workers_run():
+    import cortex.core.workers as workers
+    return jsonify(workers.run_now((request.get_json(force=True) or {}).get("key", "")))
+
+
+@app.route("/resources/set", methods=["POST"])
+def resources_set():
+    import cortex.storage.settings_store as settings_store
+    import cortex.core.resources as resources
+    d = request.get_json(force=True) or {}
+    patch = {}
+    if d.get("keep_alive") in {c[0] for c in resources.KEEP_ALIVE_CHOICES}:
+        patch["keep_alive"] = d["keep_alive"]
+    if d.get("followups") in ("auto", "off", "always"):
+        patch["followups"] = d["followups"]
+    if "ai_jobs_only_on_ac" in d:
+        patch["ai_jobs_only_on_ac"] = bool(d["ai_jobs_only_on_ac"])
+    if "voice_idle_minutes" in d:
+        try:
+            patch["voice_idle_minutes"] = max(0, min(120, int(d["voice_idle_minutes"])))
+        except (TypeError, ValueError):
+            pass
+    return jsonify(settings_store.update_section("resources", patch))
+
+
+@app.route("/model/unload", methods=["POST"])
+def model_unload():
+    import cortex.core.resources as resources
+    return jsonify({"message": resources.unload_models()})
+
+
+@app.route("/agents/set", methods=["POST"])
+def agents_set():
+    import cortex.storage.settings_store as settings_store
+    from cortex.core.subagents import MODES
+    d = request.get_json(force=True) or {}
+    patch = {}
+    if d.get("subagents") in MODES:
+        patch["subagents"] = d["subagents"]
+    for k, lo, hi in (("max_parallel", 0, 4), ("max_helpers", 2, 6), ("helper_steps", 1, 8)):
+        if k in d:
+            try:
+                patch[k] = max(lo, min(hi, int(d[k])))
+            except (TypeError, ValueError):
+                pass
+    return jsonify(settings_store.update_section("agents", patch))
 
 
 @app.route("/tasks/add", methods=["POST"])
@@ -505,7 +565,7 @@ def nudges_clear():
 @app.route("/chats")
 def chats():
     try:
-        return jsonify({"chats": core().db.get_chat_sessions(limit=40)})
+        return jsonify({"chats": core().db.get_chat_sessions(limit=300)})
     except Exception as e:
         logger.warning(f"/chats: {e}")
         return jsonify({"chats": []})
@@ -515,8 +575,9 @@ def chats():
 def history():
     session = request.args.get("session", "")
     try:
-        msgs = core().db.get_conversations(session_id=session, limit=80)
-    except Exception:
+        msgs = core().db.get_conversations(session_id=session, limit=600, with_parts=True)
+    except Exception as e:
+        logger.warning(f"/history: {e}")
         msgs = []
     out = []
     for m in msgs:
@@ -526,8 +587,9 @@ def history():
                 content = json.loads(content).get("speak", content)
             except Exception:
                 pass
-        out.append({"role": m.get("role"), "content": content})
-    return jsonify({"messages": out})
+        out.append({"role": m.get("role"), "content": content, "parts": m.get("parts") or []})
+    job = _JOBS.get(session)
+    return jsonify({"messages": out, "running": bool(job and not job.done)})
 
 
 @app.route("/files/upload", methods=["POST"])
@@ -556,26 +618,116 @@ def files_list():
         return jsonify({"files": []})
 
 
+@app.route("/history/truncate", methods=["POST"])
+def history_truncate():
+    """'Edit & resend': drop that user turn and everything after it from the stored chat."""
+    d = request.get_json(force=True) or {}
+    session = d.get("session", "")
+    job = _JOBS.get(session)
+    if job and not job.done:
+        return jsonify({"ok": False, "error": "a reply is still being written"}), 409
+    try:
+        n = core().db.truncate_conversation(session, int(d.get("turn", 0)))
+        return jsonify({"ok": True, "deleted": n})
+    except Exception as e:
+        logger.warning(f"/history/truncate: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+# ── chat turns run in a worker thread, NOT inside the HTTP request ──────────
+# The reply used to be generated inside the SSE response, so refreshing the page (or a
+# dropped connection) killed the turn mid-flight and the exchange vanished. Now the turn
+# runs on its own thread, records its events, and persists itself; /stream and /attach
+# just tail those events — so a refresh can reconnect to a reply that is still being written.
+class _Job:
+    def __init__(self, session: str, text: str):
+        self.session, self.text = session, text
+        self.events: list = []
+        self.done = False
+        self.started = time.time()
+        self.cv = threading.Condition()
+
+    def push(self, ev: dict):
+        with self.cv:
+            self.events.append(ev)
+            self.cv.notify_all()
+
+    def run(self):
+        try:
+            for ev in core().ask_stream(self.text, session_id=self.session, source="gui"):
+                self.push(ev)
+        except Exception as e:
+            logger.error(f"turn failed: {e}")
+            self.push({"type": "answer", "text": f"Something went wrong: {e}"})
+        finally:
+            self.push({"type": "done"})
+            with self.cv:
+                self.done = True
+                self.cv.notify_all()
+
+    def tail(self, start: int = 0):
+        """Yield recorded events as they appear (None = heartbeat) until the turn is done."""
+        i = start
+        while True:
+            with self.cv:
+                if i >= len(self.events) and not self.done:
+                    self.cv.wait(timeout=15)
+                batch = self.events[i:]
+                i += len(batch)
+                finished = self.done and i >= len(self.events)
+            if not batch and not finished:
+                yield None
+            for ev in batch:
+                yield ev
+            if finished:
+                return
+
+
+_JOBS: dict = {}
+_JOBS_LOCK = threading.Lock()
+
+
+def _start_job(session: str, text: str):
+    """Begin a turn for this chat; None if one is already running for it."""
+    with _JOBS_LOCK:
+        cur = _JOBS.get(session)
+        if cur and not cur.done:
+            return None
+        for k in [k for k, v in _JOBS.items() if v.done and time.time() - v.started > 900]:
+            del _JOBS[k]                       # finished long ago — it's in the DB now
+        job = _JOBS[session] = _Job(session, text)
+    threading.Thread(target=job.run, name=f"turn-{session[-8:]}", daemon=True).start()
+    return job
+
+
+def _sse(events):
+    for ev in events:
+        yield (": ping\n\n" if ev is None else "data: " + json.dumps(ev) + "\n\n")
+
+
+_SSE_HEADERS = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
+
+
 @app.route("/stream")
 def stream():
     q = request.args.get("q", "").strip()
     session = request.args.get("session", "gui")
     if not q:
-        return Response("data: " + json.dumps({"type": "answer", "text": "Ask me something."}) + "\n\n",
+        return Response(_sse([{"type": "answer", "text": "Ask me something."}, {"type": "done"}]),
                         mimetype="text/event-stream")
+    job = _start_job(session, q)
+    if job is None:       # a reply for this chat is still being written — the page should reattach
+        return Response(_sse([{"type": "busy"}, {"type": "done"}]), mimetype="text/event-stream")
+    return Response(_sse(job.tail()), mimetype="text/event-stream", headers=_SSE_HEADERS)
 
-    @stream_with_context
-    def gen():
-        try:
-            for ev in core().ask_stream(q, session_id=session, source="gui"):
-                yield "data: " + json.dumps(ev) + "\n\n"
-        except Exception as e:
-            logger.error(f"stream error: {e}")
-            yield "data: " + json.dumps({"type": "answer", "text": f"Something went wrong: {e}"}) + "\n\n"
-        yield "data: " + json.dumps({"type": "done"}) + "\n\n"
 
-    return Response(gen(), mimetype="text/event-stream",
-                    headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+@app.route("/attach")
+def attach():
+    """Re-join the in-flight (or just-finished) turn of a chat after a refresh/reconnect."""
+    job = _JOBS.get(request.args.get("session", ""))
+    if job is None:
+        return Response(_sse([{"type": "done"}]), mimetype="text/event-stream")
+    return Response(_sse(job.tail()), mimetype="text/event-stream", headers=_SSE_HEADERS)
 
 
 @app.route("/voice/stt", methods=["POST"])
@@ -589,6 +741,8 @@ def voice_stt():
         r = httpx.post(VOICE_URL + "/v1/audio/transcriptions",
                        files={"file": ("speech.webm", f.read(), "audio/webm")},
                        data={"model": "whisper-1", "language": "en"}, timeout=60)
+        import cortex.voice.lifecycle as life
+        life.touch()
         return jsonify({"text": (r.json().get("text") or "").strip()})
     except Exception as e:
         return jsonify({"text": "", "error": str(e)}), 502
@@ -606,6 +760,8 @@ def voice_tts():
         r = httpx.post(VOICE_URL + "/v1/audio/speech",
                        json={"model": "kokoro", "input": text[:1200], "voice": voice,
                              "response_format": "wav"}, timeout=120)
+        import cortex.voice.lifecycle as life
+        life.touch()
         return Response(r.content, mimetype="audio/wav")
     except Exception as e:
         logger.warning(f"tts: {e}")
@@ -623,9 +779,11 @@ PAGE = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <style>
 :root{--bg:#131314;--side:#1e1f20;--hover:#333537;--sel:#1b3a5b;--txt:#e3e3e3;
  --mut:#c4c7c5;--dim:#9aa0a6;--line:#444746;--bubble:#1e1f20;--pill:#1e1f20;--blue:#8ab4f8;--card:#17181a;
+ --code:#0b0d11;--onblue:#062e6f;--shim1:#9aa0a6;--shim2:#f4f6fb;
  --grad:linear-gradient(74deg,#4285f4 0%,#9b72cb 48%,#d96570 100%)}
 html[data-theme=light]{--bg:#ffffff;--side:#f0f4f9;--hover:#e4e9f1;--sel:#d3e3fd;--txt:#1f1f1f;
- --mut:#444746;--dim:#5f6368;--line:#c4c7c5;--bubble:#f0f4f9;--pill:#f0f4f9;--blue:#0b57d0;--card:#f7f9fc}
+ --mut:#444746;--dim:#5f6368;--line:#c4c7c5;--bubble:#f0f4f9;--pill:#f0f4f9;--blue:#0b57d0;--card:#f7f9fc;
+ --code:#eaeef4;--onblue:#ffffff;--shim1:#80868b;--shim2:#202124}
 html,body{background:var(--bg)}
 /* circular-reveal theme switch (View Transitions API) */
 ::view-transition-old(root),::view-transition-new(root){animation:none;mix-blend-mode:normal}
@@ -649,7 +807,7 @@ body{margin:0;background:var(--bg);color:var(--txt);display:flex;
 .chat{border-radius:999px;padding:9px 14px;cursor:pointer;color:var(--mut);white-space:nowrap;
  overflow:hidden;text-overflow:ellipsis;font-size:14px}
 .chat:hover{background:var(--hover)}.chat.sel{background:var(--sel);color:var(--blue)}
-.prof{display:flex;align-items:center;gap:12px;padding:10px 10px;margin-top:6px;border-top:1px solid #2a2c2e}
+.prof{display:flex;align-items:center;gap:12px;padding:10px 10px;margin-top:6px;border-top:1px solid var(--line)}
 .pav{width:30px;height:30px;border-radius:50%;background:var(--grad);flex:0 0 auto}
 .pname{font-size:14px}.psub{font-size:12px;color:var(--dim)}
 /* model dropdown */
@@ -674,14 +832,14 @@ body{margin:0;background:var(--bg);color:var(--txt);display:flex;
 .trace{border:1px solid var(--line);background:var(--card);border-radius:16px;margin:0 0 12px;overflow:hidden}
 .trace summary{cursor:pointer;padding:8px 14px;color:var(--dim);font-size:13px;list-style:none;display:flex;align-items:center;gap:9px}
 .trace summary::-webkit-details-marker{display:none}
-.trace summary:hover{background:#1d1e20}
+.trace summary:hover{background:var(--hover)}
 .trace .body{padding:4px 14px 9px;border-top:1px solid var(--line)}
 .step{display:flex;gap:8px;padding:3px 0;font-size:13px}.step .k{color:var(--blue);min-width:72px;font-weight:600}
 .step .d,.obs{color:var(--dim);font-family:ui-monospace,Menlo,monospace;font-size:12px;white-space:pre-wrap;word-break:break-word}
 .obs{padding:1px 0 5px 80px}
 .ans h1,.ans h2,.ans h3{line-height:1.3;margin:.7em 0 .35em}.ans h1{font-size:1.3em}.ans h2{font-size:1.15em}.ans h3{font-size:1.04em}
-.ans code{background:#0b0d11;border:1px solid var(--line);border-radius:5px;padding:.08em .35em;font-family:ui-monospace,Menlo,monospace;font-size:.9em}
-.ans pre{background:#0b0d11;border:1px solid var(--line);border-radius:12px;padding:12px;overflow:auto}.ans pre code{border:0;padding:0}
+.ans code{background:var(--code);color:var(--txt);border:1px solid var(--line);border-radius:5px;padding:.08em .35em;font-family:ui-monospace,Menlo,monospace;font-size:.9em}
+.ans pre{background:var(--code);color:var(--txt);border:1px solid var(--line);border-radius:12px;padding:12px;overflow:auto}.ans pre code{background:transparent;border:0;padding:0}
 .ans ul,.ans ol{padding-left:1.3em}.ans a{color:var(--blue)}
 .spin{width:13px;height:13px;border:2px solid var(--line);border-top-color:var(--blue);border-radius:50%;display:inline-block;animation:s .8s linear infinite;vertical-align:-2px;margin-right:7px}
 @keyframes s{to{transform:rotate(360deg)}}
@@ -713,7 +871,7 @@ body{margin:0;background:var(--bg);color:var(--txt);display:flex;
 .rbtn svg,.ic svg,#srch svg{fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round;display:block}
 .rbtn svg{width:20px;height:20px}.ic svg{width:20px;height:20px}
 #srch svg{width:16px;height:16px;color:var(--dim);flex:0 0 auto}
-#send{display:none}#send.show{display:flex}#send.show{color:#062e6f;background:#8ab4f8}#send.show:hover{background:#a8c7fa}
+#send{display:none}#send.show{display:flex}#send.show{color:var(--onblue);background:var(--blue)}#send.show:hover{filter:brightness(1.1)}
 .chev{width:18px;height:18px;color:var(--dim);transition:transform .25s ease;margin-left:auto;flex:0 0 auto}
 details.trace[open] .chev{transform:rotate(180deg)}
 .jist{font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1;min-width:0}
@@ -773,7 +931,7 @@ details.trace[open] .chev{transform:rotate(180deg)}
  background:conic-gradient(from 0deg,#4285f4,#9b72cb,#d96570,#f6c343,#34a853,#4285f4);animation:spin 2.4s linear infinite;
  box-shadow:0 0 10px #9b72cb88}
 .rlive:not(.active) .orb{display:none}
-.shimmer{background:linear-gradient(90deg,#9aa0a6 0%,#f4f6fb 22%,#9aa0a6 44%);background-size:200% 100%;
+.shimmer{background:linear-gradient(90deg,var(--shim1) 0%,var(--shim2) 22%,var(--shim1) 44%);background-size:200% 100%;
  -webkit-background-clip:text;background-clip:text;color:transparent;animation:sh 1.7s linear infinite}
 @keyframes sh{to{background-position:-200% 0}}
 .obs,.step{animation:fade .3s ease both}
@@ -796,7 +954,7 @@ details.trace[open] .chev{transform:rotate(180deg)}
 .inp:focus{border-color:var(--blue)}
 .avedit{display:flex;align-items:center;gap:16px;margin-bottom:6px}
 .avbig{width:60px;height:60px;border-radius:50%;background:var(--grad);background-size:cover;background-position:center;flex:0 0 auto}
-.btn{background:var(--blue);color:#fff;border:0;border-radius:999px;padding:10px 18px;font:inherit;font-weight:600;cursor:pointer}
+.btn{background:var(--blue);color:var(--onblue);border:0;border-radius:999px;padding:10px 18px;font:inherit;font-weight:600;cursor:pointer}
 .btn:hover{filter:brightness(1.08)}.btn.ghost{background:transparent;border:1px solid var(--line);color:var(--txt)}
 .rowline{display:flex;align-items:center;justify-content:space-between;padding:12px 0}
 .sw{width:46px;height:26px;border-radius:999px;background:var(--line);position:relative;cursor:pointer;transition:background .2s;flex:0 0 auto}
@@ -821,6 +979,27 @@ details.trace[open] .chev{transform:rotate(180deg)}
 .navitem:hover{background:var(--hover)}.navitem.on{background:var(--sel);color:var(--txt)}
 .scontent{flex:1;padding:22px 26px;overflow:auto}.scontent .slabel:first-child{margin-top:0;padding-top:0;border:0}
 select.inp{appearance:none;-webkit-appearance:none}
+.note{font-size:12px;color:var(--dim);font-style:italic;padding:3px 0}
+/* subagent (helper) cards inside the thinking trace */
+.sub{border:1px solid var(--line);border-radius:12px;margin:7px 0;padding:8px 12px;background:var(--bg)}
+.subh{display:flex;align-items:center;gap:8px;font-size:13px}.subh b{font-weight:600;color:var(--txt)}
+.subst{margin-left:auto;color:var(--dim);font-size:12px}
+.subdot{width:8px;height:8px;border-radius:50%;background:var(--dim);flex:0 0 auto}
+.sub.run .subdot{background:var(--blue)}.sub.ok .subdot{background:#34a853}.sub.bad .subdot{background:#ea4335}
+.rlive.active .sub.run .subdot{animation:subp 1s ease-in-out infinite}@keyframes subp{50%{opacity:.25}}
+.subline{font:12px ui-monospace,Menlo,monospace;color:var(--dim);padding:2px 0 0 16px;word-break:break-word}
+.subres{font-size:13px;color:var(--mut);padding:6px 0 2px 16px;white-space:pre-wrap}
+/* Settings → Background */
+.seg{display:flex;gap:4px;background:var(--card);border:1px solid var(--line);border-radius:999px;padding:3px;margin:8px 0}
+.seg button{flex:1;border:0;background:transparent;color:var(--mut);font:inherit;font-size:13px;padding:7px 4px;border-radius:999px;cursor:pointer;transition:background .15s,color .15s}
+.seg button:hover{background:var(--hover)}.seg button.on{background:var(--blue);color:var(--onblue);font-weight:600}
+.chip{display:inline-block;font-size:10px;font-weight:600;letter-spacing:.3px;text-transform:uppercase;border-radius:999px;padding:1px 7px;margin-left:6px;vertical-align:1px;border:1px solid var(--line);color:var(--dim)}
+.chip.medium{color:#b06f00;border-color:#b06f0055}.chip.heavy{color:#c5221f;border-color:#c5221f55}.chip.run{color:#188038;border-color:#18803855}
+html:not([data-theme=light]) .chip.medium{color:#fbbc04;border-color:#fbbc0455}html:not([data-theme=light]) .chip.heavy{color:#f28b82;border-color:#f28b8255}html:not([data-theme=light]) .chip.run{color:#81c995;border-color:#81c99555}
+.wrow{gap:10px}.wrow.off .dname{color:var(--mut)}.wact{display:flex;align-items:center;gap:6px;flex:0 0 auto}
+.bgsum{border:1px solid var(--line);background:var(--card);border-radius:16px;padding:12px 14px;margin-bottom:6px}
+.bgsum .big{font-size:15px;color:var(--txt);font-weight:600}.bgwarn{color:#c5221f;font-size:12px;margin-top:4px}
+html:not([data-theme=light]) .bgwarn{color:#f28b82}
 @media (prefers-reduced-motion:reduce){*{animation:none!important}}
 </style></head><body>
 <nav id="side">
@@ -854,7 +1033,7 @@ select.inp{appearance:none;-webkit-appearance:none}
 <script>
 const $=id=>document.getElementById(id);
 const wrap=$('wrap'),form=$('form'),q=$('q'),send=$('send'),mic=$('mic'),hello=$('hello'),list=$('list');
-let sid='gui-'+Date.now(),busy=false,speakOn=false,allChats=[],TABFILL='';
+let sid=localStorage.getItem('cx-sid')||('gui-'+Date.now()),busy=false,speakOn=false,allChats=[],TABFILL='';
 const PEN='<svg viewBox="0 0 24 24"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z"/></svg>';
 const DEFAULT_PH='Ask Cortex, or give it a job…';
 function esc(s){return s.replace(/[&<>]/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[m]))}
@@ -876,7 +1055,7 @@ function shortModel(n){n=n.split('/').pop();if(n.includes('gemma4-agent')||n.inc
 function toggleMenu(e){e.stopPropagation();const m=$('menu');m.classList.toggle('show');if(m.classList.contains('show'))loadModels()}
 document.addEventListener('click',e=>{if(!e.target.closest('#menu')&&e.target.id!=='modelbtn')$('menu').classList.remove('show');
   if(!e.target.closest('.bellwrap'))$('nudgepanel').classList.remove('show')});
-function newChat(){sid='gui-'+Date.now();wrap.innerHTML='';hello.style.display='';renderChats()}
+function newChat(){if(busy)return;sid='gui-'+Date.now();localStorage.setItem('cx-sid',sid);wrap.innerHTML='';hello.style.display='';renderChats()}
 q.addEventListener('input',()=>{q.style.height='auto';q.style.height=Math.min(q.scrollHeight,150)+'px';send.classList.toggle('show',q.value.trim().length>0)});
 q.addEventListener('keydown',e=>{
  if(e.key==='Tab'&&TABFILL&&!q.value.trim()){e.preventDefault();q.value=TABFILL;q.dispatchEvent(new Event('input'));return}
@@ -917,23 +1096,58 @@ function renderChats(){const f=($('srchin')||{}).value?$('srchin').value.toLower
  allChats.filter(c=>!f||c.title.toLowerCase().includes(f)).forEach(c=>{
   const d=el('div','chat'+(c.session_id===sid?' sel':''),esc(c.title||'New chat'));
   d.onclick=()=>openChat(c.session_id);list.appendChild(d)})}
-async function openChat(s){sid=s;hello.style.display='none';wrap.innerHTML='';renderChats();
- try{const msgs=(await (await fetch('/history?session='+encodeURIComponent(s))).json()).messages||[];
-  msgs.forEach(m=>{if(m.role==='user')addUser(m.content);else addResp(m.content)})}catch(_){}
- $('scroll').scrollTop=$('scroll').scrollHeight}
+async function openChat(s){busy=false;sid=s;localStorage.setItem('cx-sid',s);wrap.innerHTML='';renderChats();
+ let d={messages:[],running:false};
+ try{d=await (await fetch('/history?session='+encodeURIComponent(s))).json()}catch(_){}
+ if(s!==sid)return;                       // user switched chats while this was loading
+ const msgs=d.messages||[];
+ hello.style.display=msgs.length?'none':'';
+ msgs.forEach(m=>{if(m.role==='user')addUser(m.content);else addResp(m.content,m.parts)});
+ $('scroll').scrollTop=$('scroll').scrollHeight;
+ if(d.running)attachRunning()}             // the reply is still being written — rejoin it
 function addUser(t){const turn=el('div','turn');const r=el('div','urow');
  const ed=el('span','uedit',PEN);ed.title='Edit & resend';ed.onclick=()=>editFrom(turn,t);r.appendChild(ed);
  const b=el('div','ubub');b.textContent=t;r.appendChild(b);turn.appendChild(r);wrap.appendChild(turn);return turn}
 function editFrom(turn,text){if(busy)return;   // revert: drop this turn + everything after, refill input
+ const idx=[...wrap.children].filter(n=>n.classList.contains('turn')).indexOf(turn);
+ if(idx>=0)fetch('/history/truncate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({session:sid,turn:idx})}).then(loadChats);
  let n=turn;const rm=[];while(n){rm.push(n);n=n.nextElementSibling}rm.forEach(x=>x.remove());
  if(!wrap.children.length)hello.style.display='';
  q.value=text;q.dispatchEvent(new Event('input'));q.focus()}
-function addResp(t){const d=el('div','resp ans');d.innerHTML=md(t);wrap.appendChild(d);return d}
-// stream
+// ── shared by live streaming AND reloaded history, so a chat looks the same after a refresh ──
+function imageCard(p){const card=el('div','chartcard');const im=el('img');im.src=p.src;card.appendChild(im);if(p.caption){const cp=el('div','chartcap');cp.textContent=p.caption;card.appendChild(cp)}return card}
+function imageGrid(p){const g=el('div','imgrid');(p.items||[]).forEach(it=>{const a=el('a');a.href=it.page||it.url;a.target='_blank';const im=el('img');im.src=it.thumb||it.url;im.loading='lazy';im.alt=it.title||'';a.appendChild(im);g.appendChild(a)});return g}
+function subCard(body,ev,subs){let c=subs[ev.id];
+ if(!c){c=subs[ev.id]=el('div','sub','<div class="subh"><span class="subdot"></span><b></b><span class="subst">queued</span></div><div class="subb"></div>');body.appendChild(c)}
+ if(ev.title)c.querySelector('b').textContent=ev.title;
+ const st=c.querySelector('.subst'),b=c.querySelector('.subb');
+ if(ev.state==='start'){c.className='sub run';st.textContent='working…'}
+ else if(ev.state==='step'){const l=el('div','subline');l.textContent=(ev.name||'')+(ev.detail?' · '+ev.detail:'');b.appendChild(l)}
+ else if(ev.state==='done'){c.className='sub '+(ev.ok?'ok':'bad');st.textContent=ev.ok?'done':'failed';const r=el('div','subres');r.textContent=ev.summary||'';b.appendChild(r)}}
+function traceAdd(body,ev,subs){const t=ev.type||ev.t;
+ if(t==='thinking'){const s=el('div','obs');s.textContent=ev.text;body.appendChild(s)}
+ else if(t==='tool'){body.appendChild(el('div','step','<span class="k">'+esc(ev.name||'')+'</span><span class="d">'+esc(ev.detail||'')+'</span>'))}
+ else if(t==='observation'){const s=el('div','obs');s.textContent='→ '+ev.text;body.appendChild(s)}
+ else if(t==='note'){const s=el('div','note');s.textContent=ev.text;body.appendChild(s)}
+ else if(t==='subagent')subCard(body,ev,subs)}
+function addResp(t,parts){parts=parts||[];const resp=el('div','resp');
+ const tr=parts.find(p=>p.t==='trace');
+ if(tr&&(tr.events||[]).length){const live=el('div','rlive');const det=el('details','trace');
+  const sum=el('summary','','<span class="jist">Show thinking</span>'+CHEV);det.appendChild(sum);
+  const body=el('div','body');det.appendChild(body);const subs={};tr.events.forEach(e=>traceAdd(body,e,subs));
+  live.appendChild(det);resp.appendChild(live)}
+ const ans=el('div','ans');ans.innerHTML=md(t);resp.appendChild(ans);
+ parts.forEach(p=>{if(p.t==='image')resp.appendChild(imageCard(p));else if(p.t==='images')resp.appendChild(imageGrid(p))});
+ wrap.appendChild(resp);return resp}
+// stream — the turn runs server-side; this just follows it (and can rejoin it after a refresh)
 function submit(text){if(busy||!text)return;busy=true;send.classList.remove('show');hello.style.display='none';
- TABFILL='';q.placeholder=DEFAULT_PH;
- const first=wrap.children.length===0;q.value='';q.style.height='auto';
+ localStorage.setItem('cx-sid',sid);   // remember this chat so a refresh reopens it
+ TABFILL='';q.placeholder=DEFAULT_PH;q.value='';q.style.height='auto';
  const turn=addUser(text);
+ runTurn(turn,'/stream?session='+encodeURIComponent(sid)+'&q='+encodeURIComponent(text))}
+function attachRunning(){const last=wrap.lastElementChild;if(!last)return;busy=true;
+ runTurn(last,'/attach?session='+encodeURIComponent(sid))}
+function runTurn(turn,url){
  const resp=el('div','resp');
  const live=el('div','rlive active');
  const det=el('details','trace');          // collapsed by default → retractable; summary = live preview
@@ -944,21 +1158,27 @@ function submit(text){if(busy||!text)return;busy=true;send.classList.remove('sho
  const jist=sum.querySelector('.jist');
  const preview=t=>typeInto(jist,t);          // streaming-feel preview (the "jist")
  preview('Thinking…');
- const es=new EventSource('/stream?session='+encodeURIComponent(sid)+'&q='+encodeURIComponent(text));
+ const subs={};let finished=false;
+ const es=new EventSource(url);
  es.onmessage=e=>{let ev;try{ev=JSON.parse(e.data)}catch(_){return}
-  if(ev.type==='status'){preview(ev.text)}
-  else if(ev.type==='thinking'){preview(ev.text.replace(/\s+/g,' ').slice(0,110));const s=el('div','obs');s.textContent=ev.text;body.appendChild(s)}
-  else if(ev.type==='tool'){preview('Using '+ev.name+(ev.detail?' · '+ev.detail:''));body.appendChild(el('div','step','<span class="k">'+esc(ev.name)+'</span><span class="d">'+esc(ev.detail||'')+'</span>'))}
-  else if(ev.type==='observation'){const s=el('div','obs');s.textContent='→ '+ev.text;body.appendChild(s)}
-  else if(ev.type==='image'){const card=el('div','chartcard');const im=el('img');im.src=ev.src;card.appendChild(im);if(ev.caption){const cp=el('div','chartcap');cp.textContent=ev.caption;card.appendChild(cp)}resp.appendChild(card)}
-  else if(ev.type==='images'){const g=el('div','imgrid');(ev.items||[]).forEach(it=>{const a=el('a');a.href=it.page||it.url;a.target='_blank';const im=el('img');im.src=it.thumb||it.url;im.loading='lazy';im.alt=it.title||'';a.appendChild(im);g.appendChild(a)});resp.appendChild(g)}
-  else if(ev.type==='answer'){live.classList.remove('active');jist.classList.remove('shimmer');jist.textContent='Show thinking';ans.innerHTML=md(ev.text);if(speakOn)ttsPlay(ev.text)}
-  else if(ev.type==='ask'){const o=el('div','opts');(ev.options||[]).forEach(opt=>{const bt=el('div','opt',esc(opt));bt.onclick=()=>submit(opt);o.appendChild(bt)});resp.appendChild(o)}
-  else if(ev.type==='followups'){const f=el('div','followups');(ev.items||[]).forEach((it,i)=>{const bt=el('div','fu');bt.innerHTML=esc(it)+(i===0?'<span class="kbd">Tab</span>':'');bt.onclick=()=>submit(it);f.appendChild(bt)});resp.appendChild(f);
+  const t=ev.type;
+  if(t==='status'){preview(ev.text)}
+  else if(t==='thinking'){preview(ev.text.replace(/\s+/g,' ').slice(0,110));traceAdd(body,ev,subs)}
+  else if(t==='tool'){preview('Using '+ev.name+(ev.detail?' · '+ev.detail:''));traceAdd(body,ev,subs)}
+  else if(t==='observation'||t==='note'){traceAdd(body,ev,subs)}
+  else if(t==='subagent'){traceAdd(body,ev,subs);const all=Object.values(subs),dn=all.filter(c=>c.classList.contains('ok')||c.classList.contains('bad')).length;preview('Helpers · '+dn+'/'+all.length+' done')}
+  else if(t==='image'){resp.appendChild(imageCard(ev))}
+  else if(t==='images'){resp.appendChild(imageGrid(ev))}
+  else if(t==='answer'){live.classList.remove('active');jist.classList.remove('shimmer');jist._k=(jist._k||0)+1;jist.textContent='Show thinking';ans.innerHTML=md(ev.text);if(speakOn)ttsPlay(ev.text)}
+  else if(t==='ask'){const o=el('div','opts');(ev.options||[]).forEach(opt=>{const bt=el('div','opt',esc(opt));bt.onclick=()=>submit(opt);o.appendChild(bt)});resp.appendChild(o)}
+  else if(t==='followups'){const f=el('div','followups');(ev.items||[]).forEach((it,i)=>{const bt=el('div','fu');bt.innerHTML=esc(it)+(i===0?'<span class="kbd">Tab</span>':'');bt.onclick=()=>submit(it);f.appendChild(bt)});resp.appendChild(f);
    TABFILL=(ev.items&&ev.items[0])||'';if(TABFILL)q.placeholder='⇥ '+TABFILL}
-  else if(ev.type==='done'){es.close();busy=false;if(first)loadChats();q.focus()}
-  if(ev.type==='answer'||ev.type==='done'||det.open)sc.scrollTop=sc.scrollHeight};
- es.onerror=()=>{es.close();busy=false;if(!ans.innerHTML)ans.textContent='(connection dropped)'}}
+  else if(t==='busy'){finished=true;es.close();live.classList.remove('active');ans.textContent='Still finishing your last message in this chat — give me a moment, then try again.';busy=false}
+  else if(t==='done'){finished=true;es.close();live.classList.remove('active');busy=false;jist._k=(jist._k||0)+1;if(!ans.innerHTML){jist.classList.remove('shimmer');jist.textContent='Show thinking'}loadChats();q.focus()}
+  if(t==='answer'||t==='done'||det.open)sc.scrollTop=sc.scrollHeight};
+ // Connection dropped mid-reply: the server keeps writing it, so reload the chat from the
+ // database and rejoin the live turn instead of showing an error.
+ es.onerror=()=>{es.close();if(!finished)setTimeout(()=>openChat(sid),1200)}}
 form.addEventListener('submit',e=>{e.preventDefault();submit(q.value.trim())});
 // voice: mic -> MLX whisper ; answers -> MLX kokoro
 let rec=null,chunks=[],recording=false;
@@ -1003,7 +1223,7 @@ async function openSettings(){CUR=await (await fetch('/settings')).json();
    <div class="navitem" data-t="providers" onclick="sTab('providers')">AI Providers</div>
    <div class="navitem" data-t="email" onclick="sTab('email')">Email</div>
    <div class="navitem" data-t="mcp" onclick="sTab('mcp')">MCP</div>
-   <div class="navitem" data-t="jobs" onclick="sTab('jobs')">Jobs</div></div>
+   <div class="navitem" data-t="bg" onclick="sTab('bg')">Background</div></div>
    <div class="scontent" id="scontent"></div>`,'settings');
  sTab('profile')}
 function sTab(t){document.querySelectorAll('.navitem[data-t]').forEach(n=>n.classList.toggle('on',n.dataset.t===t));
@@ -1014,7 +1234,7 @@ function sTab(t){document.querySelectorAll('.navitem[data-t]').forEach(n=>n.clas
  else if(t==='providers')renderProviders(c);
  else if(t==='email')renderEmail(c);
  else if(t==='mcp')renderMcp(c);
- else renderJobs(c)}
+ else renderBackground(c)}
 const PROV=[['anthropic','Claude (Anthropic)','sk-ant-…','console.anthropic.com/settings/keys'],
             ['openai','OpenAI','sk-…','platform.openai.com/api-keys'],
             ['gemini','Gemini (Google)','AIza…','aistudio.google.com/apikey']];
@@ -1110,26 +1330,94 @@ async function testVoice(){const v=$('voicesel').value;$('vstat').textContent='S
   if(!r.ok){$('vstat').textContent='Voice server busy — try again in a moment.';return}
   const b=await r.blob();if(window._a)window._a.pause();window._a=new Audio(URL.createObjectURL(b));window._a.play();$('vstat').textContent='Playing a sample…'}catch(_){$('vstat').textContent='Could not play the sample.'}}
 const CLOCK='<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>';
-function renderJobs(c){c.innerHTML=`<div class="slabel">Running jobs</div><div id="joblist"><div class="dsub">loading…</div></div>
-  <div class="slabel">Add a recurring task</div>
-  <div class="dsub" style="margin-bottom:10px;line-height:1.5">Cortex re-runs the instruction on a schedule and delivers the result. e.g. <i>"summarize my unread email"</i> · <i>daily 08:00</i>.</div>
+const PLAY='<svg viewBox="0 0 24 24"><path d="M7 4.5v15l12-7.5z"/></svg>';
+// ── Settings → Background: workers, AI model memory, subagents ──
+let BG=null,bgTimer=null;
+const cap=t=>t.charAt(0).toUpperCase()+t.slice(1);
+function ago(ts){const d=Math.max(0,Date.now()/1000-ts);if(d<90)return 'just now';if(d<5400)return Math.round(d/60)+' min ago';if(d<172800)return Math.round(d/3600)+' h ago';return Math.round(d/86400)+' d ago'}
+function inSecs(n){return n<90?n+' s':Math.round(n/60)+' min'}
+async function postJ(url,body){try{return await (await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body||{})})).json()}catch(_){return {ok:false,error:'request failed'}}}
+function renderBackground(c){
+ c.innerHTML=`<div id="bgbody"><div class="dsub">loading…</div></div>
+  <div id="bgforms">
+  <div class="slabel" style="margin-top:18px">Add a recurring task</div>
+  <div class="dsub" style="margin-bottom:10px;line-height:1.5">Cortex re-runs the instruction on a schedule and delivers the result. e.g. <i>"summarize my unread email"</i> · <i>daily 08:00</i>. Each run wakes the AI model, so it shows up above under AI work.</div>
   <div class="field"><label>Instruction</label><input class="inp" id="tprompt" placeholder="what should Cortex do each time?" autocomplete="off"></div>
   <div style="display:flex;gap:10px"><div class="field" style="flex:1"><label>Schedule</label><input class="inp" id="tsched" placeholder="daily 08:00 · every 30 min · hourly" autocomplete="off"></div>
    <div class="field" style="width:130px"><label>Deliver via</label><select class="inp" id="tdeliver"><option value="notify">Notification</option><option value="email">Email</option><option value="both">Both</option></select></div></div>
-  <div style="display:flex;gap:12px;align-items:center"><button class="btn" onclick="addTask()">Schedule</button><span class="dsub" id="tstat"></span></div>`;loadJobs()}
-async function loadJobs(){try{const d=await (await fetch('/jobs')).json();
-  let h=(d.scheduled||[]).map(j=>`<div class="dev"><div class="dico">${CLOCK}</div><div><div class="dname">${esc(j.name)}</div><div class="dsub"><span class="dot2 ${j.running?'on':'off'}"></span>${esc(j.desc)}</div></div><div class="bars"><div class="bar"><div class="bv" style="font-size:12px;color:${j.running?'#34a853':'var(--dim)'}">${j.running?'running':'idle'}</div></div></div></div>`).join('');
-  if((d.tasks||[]).length){h+='<div class="slabel">Your recurring tasks</div>'+d.tasks.map(t=>`<div class="dev"><div class="dico">${CLOCK}</div><div style="min-width:0"><div class="dname">${esc(t.desc)}</div><div class="dsub" style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:300px">${esc(t.human||t.schedule)} · ${esc(t.deliver||'notify')}</div></div><div class="bars"><span class="xbtn" title="Remove" onclick="removeTask('${esc(t.id)}')">${TRASH}</span></div></div>`).join('')}
-  if((d.reminders||[]).length){h+='<div class="slabel">Scheduled reminders</div>'+d.reminders.map(r=>`<div class="dev"><div class="dico">${CLOCK}</div><div><div class="dname">${esc(r.text)}</div><div class="dsub">${esc(r.due)}</div></div></div>`).join('')}
-  if((d.goals||[]).length){h+='<div class="slabel">Active goals</div>'+d.goals.map(g=>`<div class="dev" style="padding:11px 12px"><div class="dname" style="font-size:13px;line-height:1.45">• ${esc(g)}</div></div>`).join('')}
-  $('joblist').innerHTML=h||'<div class="dsub">nothing scheduled</div>'}catch(_){$('joblist').innerHTML='<div class="dsub">could not load jobs</div>'}}
+  <div style="display:flex;gap:12px;align-items:center"><button class="btn" onclick="addTask()">Schedule</button><span class="dsub" id="tstat"></span></div>
+  <div id="joblist"></div></div>`;
+ loadBackground();loadJobs();
+ clearInterval(bgTimer);
+ bgTimer=setInterval(()=>{if(!$('bgbody')){clearInterval(bgTimer);return}
+  const a=document.activeElement;if(a&&a.tagName==='SELECT')return;loadBackground()},8000)}
+async function loadBackground(){if(!$('bgbody'))return;
+ try{BG=await (await fetch('/workers')).json()}catch(_){$('bgbody').innerHTML='<div class="dsub">could not load background status</div>';return}
+ drawBackground()}
+function bgNote(t){const e=$('bgstat');if(e)e.textContent=t}
+function workerRow(w){const canToggle=w.available||w.group==='tasks'||w.group==='services';
+ const exitBad=w.last_exit&&w.last_exit!==0&&!w.running;
+ return `<div class="dev wrow ${w.on?'':'off'}"><div style="min-width:0;flex:1">
+   <div class="dname">${esc(w.name)}<span class="chip ${w.cost}">${w.ai?'AI · ':''}${w.cost}</span>${w.running?'<span class="chip run">running</span>':''}</div>
+   <div class="dsub" style="line-height:1.4">${esc(w.desc)}</div>
+   <div class="dsub">${esc(w.cadence||'')}${w.last_run?' · last ran '+ago(w.last_run):''}${exitBad?' · <span style="color:#ea4335">last exit '+w.last_exit+'</span>':''}</div></div>
+  <div class="wact">${w.available&&w.group!=='services'?`<span class="xbtn" title="Run once now" onclick="runWorker('${w.key}')">${PLAY}</span>`:''}
+   ${w.removable?`<span class="xbtn" title="Delete this task" onclick="removeTask('${esc(w.key.slice(5))}')">${TRASH}</span>`:''}
+   ${canToggle?`<div class="sw ${w.on?'on':''}" title="${w.on?'On — click to switch off':'Off — click to switch on'}" onclick="toggleWorker('${w.key}',${!w.on})"></div>`:'<span class="dsub">not installed</span>'}</div></div>`}
+function drawBackground(){const L=$('bgbody');if(!L||!BG)return;
+ const sc=$('scontent'),y=sc?sc.scrollTop:0;
+ const S=BG.summary,R=BG.resources,M=R.models||[],Rs=R.settings||{},A=BG.agents||{};
+ const prof=BG.profiles.find(p=>p.id===S.profile);
+ let h=`<div class="slabel">Background work</div><div class="bgsum">
+   <div class="big">${S.mac?`${S.on} of ${S.total} workers on`:'Built-in workers are macOS-only'} · ${S.ai_on} AI job${S.ai_on===1?'':'s'}${S.tasks_total?` · ${S.tasks_on}/${S.tasks_total} tasks`:''}</div>
+   <div class="dsub" style="margin-top:2px">${R.on_ac?'Plugged in':'On battery'}${R.battery!=null?' · '+R.battery+'%':''} · thermal ${esc(R.thermal)}${R.free_mem_pct!=null?' · '+R.free_mem_pct+'% memory free':''}</div>
+   ${R.constrained?`<div class="bgwarn">Machine is under pressure (${esc(R.constrained_why)}) — optional AI work is paused.</div>`:''}
+   <div class="dsub" id="bgstat" style="margin-top:4px;min-height:16px"></div></div>`;
+ if(S.mac){h+=`<div class="seg">${BG.profiles.map(p=>`<button class="${S.profile===p.id?'on':''}" onclick="setProfile('${p.id}')">${cap(p.id)}</button>`).join('')}</div>
+   <div class="dsub" style="line-height:1.45">${S.profile==='custom'?'Custom mix — you switched individual workers below.':esc((prof||{}).blurb||'')} ${S.profile==='off'?'(Off also pauses your recurring tasks.)':''}</div>`}
+ // AI model memory
+ h+=`<div class="slabel" style="margin-top:18px">AI model memory</div>
+  <div class="dev"><div class="dico">${CLOCK}</div><div style="min-width:0;flex:1"><div class="dname">${M.length?esc(M.map(m=>m.name+' · '+m.size_gb+' GB').join(', ')):'No AI model in memory'}</div>
+   <div class="dsub">${M.length?(M[0].expires_in==null?'stays loaded until you unload it':'frees itself in '+inSecs(M[0].expires_in)):'Cortex isn\'t using the model right now'}</div></div>
+   ${M.length?'<button class="btn ghost" onclick="unloadModel()">Unload now</button>':''}</div>
+  <div class="field"><label>After a reply, keep the model in memory for</label><select class="inp" onchange="setRes('keep_alive',this.value)">${BG.keep_alive_choices.map(c=>`<option value="${c[0]}" ${String(Rs.keep_alive)===c[0]?'selected':''}>${esc(c[1])}</option>`).join('')}</select></div>
+  <div class="rowline"><div style="padding-right:14px"><div class="dname">Only run AI jobs when plugged in</div><div class="dsub" style="line-height:1.4">Autonomy, briefings and recurring tasks skip their turn on battery.</div></div><div class="sw ${Rs.ai_jobs_only_on_ac?'on':''}" onclick="setRes('ai_jobs_only_on_ac',${!Rs.ai_jobs_only_on_ac})"></div></div>
+  <div class="field"><label>Follow-up suggestions (costs one extra model call per reply)</label><select class="inp" onchange="setRes('followups',this.value)">
+   ${[['auto','Auto — skip when it isn\'t worth it'],['always','Always'],['off','Off']].map(c=>`<option value="${c[0]}" ${Rs.followups===c[0]?'selected':''}>${c[1]}</option>`).join('')}</select></div>
+  <div class="field"><label>Stop the voice engine after being idle for</label><select class="inp" onchange="setRes('voice_idle_minutes',this.value)">
+   ${[[2,'2 minutes'],[5,'5 minutes'],[15,'15 minutes'],[60,'1 hour'],[0,'Never']].map(c=>`<option value="${c[0]}" ${Number(Rs.voice_idle_minutes)===c[0]?'selected':''}>${c[1]}</option>`).join('')}</select></div>`;
+ // subagents
+ h+=`<div class="slabel" style="margin-top:18px">Subagents</div>
+  <div class="dsub" style="margin-bottom:8px;line-height:1.5">For a request with several independent parts, Cortex can hand each part to a focused helper and combine the results. Simple requests are never split.</div>
+  <div class="field"><label>When should Cortex use helpers?</label><select class="inp" onchange="setAgents('subagents',this.value)">
+   ${[['auto','Auto — decided per task (recommended)'],['eager','Eager — consider splitting every non-trivial request'],['off','Off — always work alone']].map(c=>`<option value="${c[0]}" ${A.subagents===c[0]?'selected':''}>${c[1]}</option>`).join('')}</select></div>
+  <div class="field"><label>Helpers at the same time</label><select class="inp" onchange="setAgents('max_parallel',this.value)">
+   ${[[0,'Auto'],[1,'1 (one after another)'],[2,'2'],[3,'3'],[4,'4']].map(c=>`<option value="${c[0]}" ${Number(A.max_parallel)===c[0]?'selected':''}>${c[1]}</option>`).join('')}</select></div>
+  <div class="dsub" style="line-height:1.45">${A.local_model?'Your model runs locally, so by default helpers take turns — one set of weights can\'t truly run in parallel. A cloud model fans out up to 3 at once.':'Cloud model: helpers run in parallel (up to 3 by default).'} Helpers get a safe tool set: no sending email, editing files, or changing your reminders.</div>`;
+ // workers
+ BG.groups.forEach(g=>{const rows=BG.workers.filter(w=>w.group===g.id);if(!rows.length)return;
+  h+=`<div class="slabel" style="margin-top:18px">${esc(g.name)}</div>${g.desc?`<div class="dsub" style="margin:-4px 0 8px;line-height:1.4">${esc(g.desc)}</div>`:''}`+rows.map(workerRow).join('')});
+ L.innerHTML=h;if(sc)sc.scrollTop=y}
+async function toggleWorker(key,on){bgNote(on?'Switching on…':'Switching off…');const r=await postJ('/workers/set',{key,on});
+ await loadBackground();if(r.error)bgNote(r.error)}
+async function setProfile(p){bgNote('Applying '+p+'…');const r=await postJ('/workers/profile',{profile:p});
+ await loadBackground();if(r.errors&&r.errors.length)bgNote(r.errors[0])}
+async function runWorker(key){const r=await postJ('/workers/run',{key});bgNote(r.ok?'Started — it runs once in the background.':(r.error||'could not start'));setTimeout(loadBackground,2500)}
+async function unloadModel(){const r=await postJ('/model/unload');await loadBackground();bgNote(r.message||'')}
+async function setRes(k,v){await postJ('/resources/set',{[k]:v});loadBackground()}
+async function setAgents(k,v){await postJ('/agents/set',{[k]:v});loadBackground()}
+async function loadJobs(){const L=$('joblist');if(!L)return;
+ try{const d=await (await fetch('/jobs')).json();let h='';
+  if((d.reminders||[]).length){h+='<div class="slabel" style="margin-top:18px">Scheduled reminders</div>'+d.reminders.map(r=>`<div class="dev"><div class="dico">${CLOCK}</div><div><div class="dname">${esc(r.text)}</div><div class="dsub">${esc(r.due)}</div></div></div>`).join('')}
+  if((d.goals||[]).length){h+='<div class="slabel" style="margin-top:18px">Active goals</div>'+d.goals.map(g=>`<div class="dev" style="padding:11px 12px"><div class="dname" style="font-size:13px;line-height:1.45">• ${esc(g)}</div></div>`).join('')}
+  L.innerHTML=h}catch(_){L.innerHTML=''}}
 async function addTask(){const p=$('tprompt').value.trim(),s=$('tsched').value.trim();
   if(!p||!s){$('tstat').textContent='Need an instruction and a schedule.';return}
   $('tstat').textContent='Scheduling…';
   try{const r=await fetch('/tasks/add',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({desc:p.slice(0,50),prompt:p,schedule:s,deliver:$('tdeliver').value})});
    if(!r.ok){$('tstat').textContent='Could not schedule that.';return}
-   $('tprompt').value='';$('tsched').value='';$('tstat').textContent='Scheduled.';loadJobs()}catch(_){$('tstat').textContent='Could not schedule that.'}}
-async function removeTask(id){await fetch('/tasks/remove',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id})});loadJobs()}
+   $('tprompt').value='';$('tsched').value='';$('tstat').textContent='Scheduled.';loadBackground()}catch(_){$('tstat').textContent='Could not schedule that.'}}
+async function removeTask(id){await fetch('/tasks/remove',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id})});loadBackground()}
 function setBg(id){const e=$(id);if(e){e.style.backgroundImage='url(/avatar?t='+Date.now()+')';e.style.backgroundSize='cover';e.style.backgroundPosition='center'}}
 // theme toggle lives OUTSIDE settings (top bar)
 const MOON='<svg viewBox="0 0 24 24"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg>';
@@ -1201,7 +1489,7 @@ if('serviceWorker' in navigator){
   navigator.serviceWorker.getRegistrations().then(rs=>rs.forEach(r=>r.unregister())).catch(()=>{});
   if(window.caches)caches.keys().then(ks=>ks.forEach(k=>caches.delete(k))).catch(()=>{});
 }
-loadChats();loadModels();refreshProfile();updateThemeIcon();initBell();maybeOnboard();
+loadChats();if(localStorage.getItem('cx-sid'))openChat(sid);loadModels();refreshProfile();updateThemeIcon();initBell();maybeOnboard();
 </script></body></html>"""
 
 

@@ -34,6 +34,35 @@ _FINAL_SYNTH = (
 )
 
 
+class _TurnRecorder:
+    """Watches the event stream of one turn so the reply can be stored WITH what made it
+    rich — the thinking/tool/helper trace, charts, image grids — and a reloaded chat looks
+    like it did live (it used to come back as bare text)."""
+    _TRACE = ("thinking", "tool", "observation", "subagent", "note")
+    _MAX_EVENTS = 60
+
+    def __init__(self):
+        self.trace, self.media, self.answer = [], [], None
+
+    def feed(self, ev: dict) -> None:
+        t = ev.get("type")
+        if t in self._TRACE:
+            if len(self.trace) < self._MAX_EVENTS:
+                self.trace.append({k: v for k, v in ev.items() if k != "type"} | {"t": t})
+        elif t == "image":
+            self.media.append({"t": "image", "src": ev.get("src"), "caption": ev.get("caption", "")})
+        elif t == "images":
+            self.media.append({"t": "images", "items": ev.get("items", [])[:8], "query": ev.get("query", "")})
+        elif t == "answer":
+            self.answer = ev.get("text") or ""
+
+    def parts(self) -> list:
+        out = []
+        if self.trace:
+            out.append({"t": "trace", "events": self.trace})
+        return out + self.media
+
+
 class CortexCore:
     def __init__(self, config: dict = None):
         from cortex.util.cortex_bootstrap import load_config, load_secrets, build_for_autonomy
@@ -49,6 +78,8 @@ class CortexCore:
         self.memory_mgr = deps["memory_mgr"]
         self._owner = self.config.get("owner", {}).get("name", "you")
         self.max_steps = self.config.get("agent", {}).get("max_steps", 6)
+        from cortex.core.subagents import SubagentManager
+        self.subagents = SubagentManager(self)
         # MCP: connect to any configured MCP servers (lazy — loaded on first use)
         self.mcp = None
         try:
@@ -177,7 +208,10 @@ class CortexCore:
                 extra = self.mcp.openai_tools()
             except Exception as e:
                 logger.info(f"MCP tools load failed: {e}")
-        return TOOLS + extra
+        tools = TOOLS
+        if self.subagents.settings()["mode"] == "off":      # don't even offer it
+            tools = [t for t in tools if (t.get("function") or {}).get("name") != "delegate"]
+        return tools + extra
 
     # ── public: non-streaming (consumes the stream) ────────────────────────
     def ask(self, text: str, session_id: str = "cli", source: str = "cli") -> dict:
@@ -187,8 +221,44 @@ class CortexCore:
                 final = ev["action"]
         return final
 
+    # ── persistence ───────────────────────────────────────────────────────
+    def _save_turn(self, session_id: str, role: str, content: str, parts: list = None) -> None:
+        """Write one chat row. Loud on failure (it used to be `except: pass`, so a lost turn
+        left no trace) and retried once — a transient 'database is locked' shouldn't eat a message."""
+        for attempt in (1, 2):
+            try:
+                self.db.save_conversation(session_id, role, content, parts=parts)
+                return
+            except Exception as e:
+                logger.warning(f"couldn't save {role} turn (attempt {attempt}): {e}")
+                import time as _t
+                _t.sleep(0.4)
+
     # ── public: streaming — yields live events so a UI/CLI can show thinking ─
     def ask_stream(self, text: str, session_id: str = "cli", source: str = "cli"):
+        """Same event stream as _ask_stream, plus crash-proof persistence: the user's message
+        is stored the instant it arrives (a refresh or crash mid-reply can't lose it), and the
+        reply is stored — with its trace/charts — however the turn ends."""
+        self._save_turn(session_id, "user", text)
+        rec = _TurnRecorder()
+        failure = None
+        try:
+            for ev in self._ask_stream(text, session_id, source):
+                rec.feed(ev)
+                yield ev
+        except GeneratorExit:
+            raise                     # consumer walked away; nothing more to store
+        except Exception as e:
+            failure = e
+            logger.exception("ask_stream failed")
+            raise
+        finally:
+            if rec.answer is not None:
+                self._save_turn(session_id, "assistant", rec.answer, parts=rec.parts())
+            elif failure is not None:
+                self._save_turn(session_id, "assistant", f"Something went wrong: {str(failure)[:200]}")
+
+    def _ask_stream(self, text: str, session_id: str = "cli", source: str = "cli"):
         """
         Generator of events as Cortex works:
           {"type":"thinking","text":...}      model reasoning before a step
@@ -198,7 +268,37 @@ class CortexCore:
           {"type":"final","action":{...}}      full action dict (for ask())
         """
         from cortex.llm.tools import tool_call_to_action_data
+        from cortex.core.safety import needs_confirmation
         tools_list = self._tools()
+
+        # A previous turn left a draft (e.g. an email) awaiting this session's
+        # explicit yes/no. Resolve it in code — deterministically, not by
+        # handing it back to the LLM to re-decide — before anything else.
+        pending = None
+        try:
+            pending = self.db.get_pending_action(session_id)
+        except Exception as e:
+            logger.debug(f"pending-action lookup failed: {e}")
+        if pending:
+            verdict = self._classify_confirmation(text)
+            if verdict in ("yes", "no"):
+                self.db.clear_pending_action(session_id)
+                if verdict == "yes":
+                    yield {"type": "tool", "name": pending["kind"], "detail": "confirmed by you"}
+                    obs = self._execute_tool(pending["payload"], source)
+                    final_speak = obs
+                else:
+                    obs = "cancelled by the user before it ran"
+                    final_speak = "Okay — cancelled, didn't do that."
+                last_action = {**pending["payload"], "speak": final_speak, "steps": 1}
+                self._finish(session_id, text, last_action)
+                yield {"type": "observation", "text": obs[:400]}
+                yield {"type": "answer", "text": final_speak}
+                yield {"type": "final", "action": last_action}
+                return
+            # anything else: the user moved on — drop the stale draft (it was
+            # never sent/run) and handle `text` as a normal new message below.
+            self.db.clear_pending_action(session_id)
 
         yield {"type": "status", "text": "thinking…"}
         try:
@@ -212,6 +312,32 @@ class CortexCore:
         )
 
         work_log: list[str] = []
+
+        # Should this job be split across helper agents? Decided per task — a cheap
+        # signal check first, a planner call only if the task looks multi-part.
+        try:
+            plan = self.subagents.assess(text)
+        except Exception as e:
+            logger.warning(f"subagent assessment failed: {e}")
+            plan = None
+        if plan and plan.get("note"):
+            yield {"type": "note", "text": plan["note"]}
+        if plan and plan.get("delegate"):
+            subs = plan["subtasks"]
+            yield {"type": "status", "text": f"splitting this across {len(subs)} helpers…"}
+            pace = " (one after another)" if plan["parallel"] == 1 else f" ({plan['parallel']} at a time)"
+            yield {"type": "note", "text": f"Splitting into {len(subs)} helpers{pace} — {plan['reason']}"}
+            results = None
+            for ev in self.subagents.run_stream(subs, text, source, plan["parallel"]):
+                if ev.get("type") == "_results":
+                    results = ev["results"]
+                else:
+                    yield ev
+            messages.append({"role": "user",
+                             "content": self.subagents.format_findings(subs, results or [], text)})
+            for st, r in zip(subs, results or []):
+                work_log.append(f"[helper: {st['title']}] {(r or {}).get('summary', '')}")
+
         last_action = {"action": "answer"}
         final_speak = None
         asked, ask_options = False, []
@@ -249,6 +375,13 @@ class CortexCore:
                 else:
                     action = tool_call_to_action_data(tc)
                 last_action = action
+                need_confirm, confirm_msg = needs_confirmation(action)
+                if need_confirm:   # outward-facing/irreversible — hold for an explicit yes
+                    self.db.save_pending_action(session_id, action.get("action", ""), action, confirm_msg)
+                    final_speak = confirm_msg
+                    ask_options = ["Yes, do it", "No, cancel"]
+                    asked = stop = True
+                    break
                 if action.get("action") == "ask":   # the model needs the user to decide
                     final_speak = action.get("question") or "Quick question —"
                     ask_options = action.get("options") or []
@@ -271,6 +404,24 @@ class CortexCore:
                            if items else "no images found")
                     work_log.append(f"[image_search] {obs}")
                     messages.append({"role": "tool", "tool_call_id": _tcid, "content": obs})
+                    continue
+                if action.get("action") == "delegate":   # the model asked for helpers itself
+                    verdict = self.subagents.assess_tool_call(text, action.get("subtasks"))
+                    if not verdict["delegate"]:
+                        obs = verdict["reason"]
+                        yield {"type": "note", "text": f"Not splitting: {verdict['reason']}"}
+                    else:
+                        subs, results = verdict["subtasks"], None
+                        yield {"type": "note", "text": f"Splitting into {len(subs)} helpers"}
+                        for ev in self.subagents.run_stream(subs, text, source, verdict["parallel"]):
+                            if ev.get("type") == "_results":
+                                results = ev["results"]
+                            else:
+                                yield ev
+                        obs = self.subagents.format_findings(subs, results or [], text)
+                        for st, r in zip(subs, results or []):
+                            work_log.append(f"[helper: {st['title']}] {(r or {}).get('summary', '')}")
+                    messages.append({"role": "tool", "tool_call_id": _tcid, "content": obs[:6000]})
                     continue
                 yield {"type": "tool", "name": action.get("action", "?"),
                        "detail": self._tool_detail(action)}
@@ -313,11 +464,48 @@ class CortexCore:
         yield {"type": "answer", "text": final_speak}
         if asked:
             yield {"type": "ask", "options": ask_options}
-        else:
+        elif source == "gui" and self._want_followups(final_speak):
             fu = self._followups(text, final_speak)
             if fu:
                 yield {"type": "followups", "items": fu}
         yield {"type": "final", "action": last_action}
+
+    _YES_PREFIXES = ("yes", "yeah", "yep", "yup", "send it", "send", "go ahead",
+                     "confirm", "do it", "sure", "ok", "okay", "please send", "approved")
+    _NO_PREFIXES = ("no", "nope", "nah", "cancel", "don't", "dont", "stop",
+                    "wait", "never mind", "nevermind", "hold off", "not yet")
+
+    @classmethod
+    def _classify_confirmation(cls, text: str) -> str:
+        """
+        yes | no | unclear — a deterministic keyword check, not an LLM call.
+        Whether a drafted email actually sends must not depend on the model's
+        mood; it depends on what the user typed.
+        """
+        t = (text or "").strip().lower().strip(".!? ")
+        if any(t == p or t.startswith(p + " ") for p in cls._YES_PREFIXES):
+            return "yes"
+        if any(t == p or t.startswith(p + " ") for p in cls._NO_PREFIXES):
+            return "no"
+        return "unclear"
+
+    @staticmethod
+    def _want_followups(answer: str) -> bool:
+        """Follow-up chips cost a whole extra model call after EVERY reply. Skip it when the
+        user turned it off, the reply is a one-liner, or the machine is short on headroom."""
+        try:
+            import cortex.storage.settings_store as settings_store
+            import cortex.util.power as power
+            mode = settings_store.section("resources").get("followups", "auto")
+            if mode == "off":
+                return False
+            if mode == "always":
+                return True
+            if len(answer or "") < 60:
+                return False
+            return not power.is_constrained()[0]
+        except Exception:
+            return True
 
     def _followups(self, user_text: str, answer: str) -> list:
         """A few short follow-up prompt suggestions (Tab-to-fill in the UI)."""
@@ -356,8 +544,14 @@ class CortexCore:
             return f"to {action.get('email_to','')}"
         if kind == "email_check":
             return "unread across accounts"
+        if kind == "remember":
+            return action.get("remember_content", "")[:80]
+        if kind == "forget":
+            return action.get("forget_search") or f"#{action.get('forget_id')}"
         if kind == "mcp":
             return action.get("mcp_name", "").replace("mcp__", "").replace("__", " · ")
+        if kind == "workers":
+            return " ".join(x for x in (action.get("workers_op"), action.get("worker") or action.get("profile")) if x)
         if kind == "chart":
             return action.get("caption", "") or "plot"
         if kind == "image_search":
@@ -400,10 +594,16 @@ class CortexCore:
                 return self._email_search(action.get("email_query", ""))
             if kind == "email_send":
                 return self._email_send(action)
+            if kind == "remember":
+                return self._remember(action)
+            if kind == "forget":
+                return self._forget(action)
             if kind == "remind":
                 return self._handle_reminder(action.get("reminder") or {})
             if kind == "schedule_task":
                 return self._handle_schedule_task(action)
+            if kind == "workers":
+                return self._handle_workers(action)
             if kind == "credential_prompt":
                 return ("Needs a login I don't have stored. Ask the user for the "
                         f"{action.get('credential_prompt_site','site')} credentials next time you talk.")
@@ -526,6 +726,20 @@ class CortexCore:
                             action.get("email_subject", ""), action.get("email_body", ""))
         return f"sent to {action.get('email_to')} from {frm}" if ok else f"send failed: {err}"
 
+    # ── memory (explicit remember/forget — see cortex/core/memory.py) ──────
+    def _remember(self, action: dict) -> str:
+        content = (action.get("remember_content") or "").strip()
+        if not content:
+            return "nothing to remember — empty content"
+        mtype = action.get("remember_type") or "fact"
+        self.memory_mgr.store_fact(content, mem_type=mtype, source="conversation",
+                                   importance=5 if mtype == "rule" else 4)
+        return f"remembered ({mtype}): {content}"
+
+    def _forget(self, action: dict) -> str:
+        return self.memory_mgr.forget(memory_id=action.get("forget_id"),
+                                      search=action.get("forget_search"))
+
     def _handle_reminder(self, r: dict) -> str:
         op = r.get("op", "create")
         if op == "create":
@@ -547,6 +761,34 @@ class CortexCore:
         if op == "delete" and r.get("id"):
             return "deleted reminder" if self.db.delete_reminder(r["id"]) else "no such reminder"
         return "done"
+
+    def _handle_workers(self, a: dict) -> str:
+        """Chat control over Cortex's own background workers + the model's memory."""
+        import cortex.core.workers as workers
+        import cortex.core.resources as resources
+        op = a.get("workers_op") or "list"
+        if op == "list":
+            return workers.describe() + "\n" + resources.describe()
+        if op == "unload_model":
+            return resources.unload_models()
+        if op == "profile":
+            prof = a.get("profile")
+            r = workers.apply_profile(prof or "")
+            if not r.get("ok") and not r.get("profile"):
+                return f"couldn't switch profile: {r.get('error') or r.get('errors')}"
+            return (f"background profile is now '{r['profile']}'"
+                    + (f" (some issues: {'; '.join(r['errors'])})" if r.get("errors") else ""))
+        key = workers.resolve_key(a.get("worker") or "")
+        if not key:
+            return f"I couldn't tell which worker you mean by '{a.get('worker')}' — ask me to list them."
+        if op == "run":
+            r = workers.run_now(key)
+            return f"started {key} now" if r.get("ok") else f"couldn't start {key}: {r.get('error')}"
+        if op in ("enable", "disable"):
+            r = workers.set_enabled(key, op == "enable")
+            return (f"{key} is now {'ON' if r.get('on') else 'off'}" if r.get("ok")
+                    else f"couldn't change {key}: {r.get('error') or 'launchd refused'}")
+        return "Nothing to do for that step."
 
     def _handle_schedule_task(self, action: dict) -> str:
         import cortex.core.tasks as tasks
@@ -592,11 +834,8 @@ class CortexCore:
             return "Done — handled it."
 
     def _finish(self, session_id: str, user_text: str, action: dict) -> dict:
-        try:
-            self.db.save_conversation(session_id, "user", user_text)
-            self.db.save_conversation(session_id, "assistant", action.get("speak", ""))
-        except Exception:
-            pass
+        """Log the experience (learning signal). The chat rows themselves are written by
+        ask_stream — see _save_turn."""
         try:
             self.db.log_experience(session_id=session_id, user_text=user_text,
                                    action=action.get("action", "answer"),

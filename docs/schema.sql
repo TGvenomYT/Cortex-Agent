@@ -38,6 +38,19 @@ CREATE TABLE IF NOT EXISTS memory (
 CREATE INDEX IF NOT EXISTS idx_memory_type ON memory(type);
 CREATE INDEX IF NOT EXISTS idx_memory_importance ON memory(importance DESC);
 
+-- A draft action (e.g. an email) held for the user's explicit yes/no before it
+-- actually runs. One pending row per session_id — see safety.needs_confirmation
+-- and cortex_core.ask_stream's confirmation gate.
+CREATE TABLE IF NOT EXISTS pending_actions (
+    id SERIAL PRIMARY KEY,
+    session_id VARCHAR(200) NOT NULL,
+    kind VARCHAR(50) NOT NULL,
+    payload JSONB NOT NULL,
+    confirm_message TEXT,
+    created_at TIMESTAMP DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_pending_actions_session ON pending_actions(session_id);
+
 -- ═══ CONVERSATIONS ═══
 
 CREATE TABLE IF NOT EXISTS conversations (
@@ -47,8 +60,10 @@ CREATE TABLE IF NOT EXISTS conversations (
     content TEXT NOT NULL,
     tokens_used INTEGER,
     model_used VARCHAR(50),
-    timestamp TIMESTAMP DEFAULT NOW()
+    timestamp TIMESTAMP DEFAULT NOW(),
+    parts JSONB                             -- rich bits (charts/images/trace); local SQLite only is fine, never synced
 );
+-- Existing databases: ALTER TABLE conversations ADD COLUMN IF NOT EXISTS parts JSONB;
 
 CREATE INDEX IF NOT EXISTS idx_conv_session ON conversations(session_id);
 CREATE INDEX IF NOT EXISTS idx_conv_time ON conversations(timestamp DESC);

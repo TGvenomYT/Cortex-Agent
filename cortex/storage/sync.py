@@ -57,8 +57,14 @@ def _save_hwm(hwm: dict):
         json.dump(hwm, f)
 
 
+# Local-only columns the remote schema doesn't have (pushing them would make every
+# row of that table fail with "column does not exist").
+_LOCAL_ONLY_COLS = {"parts"}
+
+
 def _cols(slite, table) -> list[str]:
-    return [r[1] for r in slite.execute(f"PRAGMA table_info({table})").fetchall()]
+    return [r[1] for r in slite.execute(f"PRAGMA table_info({table})").fetchall()
+            if r[1] not in _LOCAL_ONLY_COLS]
 
 
 def _val_and_cast(col, v):

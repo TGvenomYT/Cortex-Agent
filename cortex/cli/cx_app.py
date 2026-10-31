@@ -346,6 +346,132 @@ def one_shot(text: str):
         sys.exit(1)
 
 
+def memory_cmd(argv: list[str]):
+    """
+    `cx memory [list [type] | add [rule|fact|preference|project_info] <text> | forget <id>]`
+
+    Direct read/write access to Cortex's long-term memory — no conversation,
+    no daemon, no dependence on it noticing or remembering to extract a fact.
+    `rule` entries are standing instructions Cortex always obeys (see
+    cortex/core/memory.py / safety.py) — use this to add or remove one
+    yourself instead of just hoping a correction "took" in chat.
+    """
+    from cortex.util.cortex_bootstrap import load_config, connect_db
+    db = connect_db(load_config())
+    if db is None:
+        console.print("\n  [red]Could not open Cortex's database.[/red]\n")
+        return
+
+    sub = (argv[0].lower() if argv else "list")
+
+    if sub == "list":
+        type_filter = argv[1] if len(argv) > 1 else None
+        mems = db.get_memories(type=type_filter, limit=200)
+        if not mems:
+            console.print("\n  [dim](no memories stored)[/dim]\n")
+            return
+        console.print()
+        for m in mems:
+            tag = "[bold yellow]RULE[/bold yellow]" if m["type"] == "rule" else f"[dim]{m['type']}[/dim]"
+            console.print(f"  #{m['id']:<4} {tag}  {m['content']}")
+        console.print()
+
+    elif sub == "add":
+        rest = argv[1:]
+        mtype = "fact"
+        if rest and rest[0].lower() in ("rule", "fact", "preference", "project_info"):
+            mtype, rest = rest[0].lower(), rest[1:]
+        content = " ".join(rest).strip()
+        if not content:
+            console.print("\n  usage: cx memory add [rule|fact|preference|project_info] <text>\n")
+            return
+        db.save_memory(type=mtype, content=content, source="cx-cli",
+                       importance=5 if mtype == "rule" else 4)
+        console.print(f"\n  [green]✓[/green] remembered ({mtype}): {content}\n")
+
+    elif sub == "forget":
+        if len(argv) < 2 or not argv[1].isdigit():
+            console.print("\n  usage: cx memory forget <id>   (see `cx memory list` for ids)\n")
+            return
+        mid = int(argv[1])
+        ok = db.delete_memory(mid)
+        if ok:
+            console.print(f"\n  [green]✓[/green] forgot #{mid}\n")
+        else:
+            console.print(f"\n  [yellow]no memory #{mid} found[/yellow]\n")
+
+    else:
+        console.print("\n  usage: cx memory [list [type] | add [type] <text> | forget <id>]\n")
+
+
+def workers_cmd(argv: list[str]):
+    """
+    `cx workers [list | on <name> | off <name> | run <name> | profile <off|essential|balanced|full>
+                 | pause | resume | free]`
+
+    Control Cortex's own background workers — the scheduled jobs that run when you're not
+    chatting — and the AI model's memory. `<name>` is a worker key or its name
+    (autonomy, reminders, "morning briefing", collector.system, task.<id> …).
+    """
+    import cortex.core.workers as workers
+    import cortex.core.resources as resources
+    sub = (argv[0].lower() if argv else "list")
+    arg = " ".join(argv[1:]).strip()
+
+    def show():
+        rows = workers.list_workers()
+        s = workers.summary(rows)
+        console.print(f"\n  [bold]Background:[/bold] profile [cyan]{s['profile']}[/cyan] · "
+                      f"{s['on']}/{s['total']} workers on · {s['ai_on']} AI job(s) on · "
+                      f"{s['tasks_on']}/{s['tasks_total']} tasks on")
+        for gid, gname, _ in workers.GROUPS:
+            grp = [r for r in rows if r["group"] == gid]
+            if not grp:
+                continue
+            console.print(f"\n  [dim]{gname}[/dim]")
+            for r in grp:
+                dot = "[green]●[/green]" if r["on"] else "[dim]○[/dim]"
+                cost = {"light": "[dim]light[/dim]", "medium": "[yellow]medium[/yellow]", "heavy": "[red]heavy[/red]"}[r["cost"]]
+                console.print(f"   {dot} {r['key']:<20} {r['name']:<22} {r['cadence']:<14} {cost}")
+        console.print(f"\n  [dim]{resources.describe()}[/dim]\n")
+
+    if sub in ("list", "ls", "status"):
+        show()
+    elif sub in ("on", "off", "enable", "disable", "run"):
+        if not arg:
+            console.print(f"\n  usage: cx workers {sub} <name>   (see `cx workers`)\n")
+            return
+        key = workers.resolve_key(arg)
+        if not key:
+            console.print(f"\n  [yellow]no worker matches '{arg}'[/yellow] — run `cx workers` to see them\n")
+            return
+        if sub == "run":
+            r = workers.run_now(key)
+        else:
+            r = workers.set_enabled(key, sub in ("on", "enable"))
+        mark = "[green]✓[/green]" if r.get("ok") else "[red]✗[/red]"
+        console.print(f"\n  {mark} {key}" + (f" — {r['error']}" if r.get("error") else "") + "\n")
+    elif sub == "profile":
+        if arg not in workers.PROFILES:
+            console.print(f"\n  usage: cx workers profile <{'|'.join(workers.PROFILES)}>\n")
+            return
+        r = workers.apply_profile(arg)
+        console.print(f"\n  profile → [cyan]{r.get('profile')}[/cyan]"
+                      + ("".join(f"\n  [yellow]{e}[/yellow]" for e in r.get("errors", []))) + "\n")
+    elif sub == "pause":
+        r = workers.apply_profile("off")
+        console.print(f"\n  [green]✓[/green] all background work paused (profile: {r.get('profile')})\n")
+    elif sub == "resume":
+        r = workers.apply_profile("essential")
+        console.print(f"\n  [green]✓[/green] resumed essentials — reminders + rules "
+                      f"(use `cx workers profile balanced|full` for more)\n")
+    elif sub in ("free", "unload"):
+        console.print(f"\n  {resources.unload_models()}\n")
+    else:
+        console.print("\n  usage: cx workers [list | on <name> | off <name> | run <name> | "
+                      "profile <name> | pause | resume | free]\n")
+
+
 def main():
     # Local-first: no daemon required. If the on-demand server is up we use it
     # (streaming); otherwise Cortex thinks in-process, fully offline.
@@ -363,6 +489,14 @@ def main():
     if len(sys.argv) > 1 and sys.argv[1].lower() in ("voice", "listen", "talk"):
         import cortex.voice.voice_mode as voice_mode
         voice_mode.run_voice_mode()
+        return
+
+    if len(sys.argv) > 1 and sys.argv[1].lower() == "memory":
+        memory_cmd(sys.argv[2:])
+        return
+
+    if len(sys.argv) > 1 and sys.argv[1].lower() in ("workers", "worker", "bg", "background"):
+        workers_cmd(sys.argv[2:])
         return
 
     # Warm first-run — only in interactive mode (not for one-shot `cx "..."`).

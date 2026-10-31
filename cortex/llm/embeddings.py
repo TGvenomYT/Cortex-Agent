@@ -13,6 +13,8 @@ Model: nomic-embed-text (768 dims, local, fast on Apple Silicon).
 
 import os
 import logging
+import threading
+from collections import OrderedDict
 
 import httpx
 
@@ -21,6 +23,14 @@ logger = logging.getLogger("cortex.embeddings")
 OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
 EMBED_MODEL = "nomic-embed-text"
 EMBED_DIMS = 768
+
+
+# One chat turn embeds the SAME user text up to three times (semantic context, similar
+# experiences, uploaded-file retrieval). Remember recent successes so that's one model
+# call, not three. Only successes are cached — a failure is retried next time.
+_CACHE: "OrderedDict[str, list]" = OrderedDict()
+_CACHE_MAX = 256
+_CACHE_LOCK = threading.Lock()
 
 
 def embed(text: str, api_key: str = None) -> list[float]:
@@ -32,6 +42,22 @@ def embed(text: str, api_key: str = None) -> list[float]:
     """
     if not text or not text.strip():
         return None
+    key = text[:8000]
+    with _CACHE_LOCK:
+        hit = _CACHE.get(key)
+        if hit is not None:
+            _CACHE.move_to_end(key)
+            return list(hit)
+    vec = _embed_uncached(key)
+    if vec is not None:
+        with _CACHE_LOCK:
+            _CACHE[key] = vec
+            while len(_CACHE) > _CACHE_MAX:
+                _CACHE.popitem(last=False)
+    return vec
+
+
+def _embed_uncached(text: str) -> list[float]:
     try:
         resp = httpx.post(
             f"{OLLAMA_BASE_URL}/api/embed",

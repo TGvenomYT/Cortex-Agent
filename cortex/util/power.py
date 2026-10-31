@@ -69,6 +69,43 @@ def thermal_pressure() -> str:
         return "unknown"
 
 
+def free_memory_pct() -> int | None:
+    """% of RAM macOS considers free/reclaimable (kern.memorystatus_level); None elsewhere."""
+    out = _run(["sysctl", "-n", "kern.memorystatus_level"]).strip()
+    try:
+        return int(out)
+    except ValueError:
+        return None
+
+
+def snapshot() -> dict:
+    """One-glance machine state used to decide how much work Cortex should take on."""
+    b = battery_state()
+    return {"on_ac": b["on_ac"], "battery": b["percent"], "thermal": thermal_pressure(),
+            "free_mem_pct": free_memory_pct()}
+
+
+def is_constrained(snap: dict | None = None) -> tuple[bool, str]:
+    """True when the Mac is short on power/thermal/memory headroom — the moment to
+    skip optional AI work (follow-up suggestions, parallel helpers)."""
+    snap = snap or snapshot()
+    if snap["thermal"] in ("serious", "critical"):
+        return True, f"thermal pressure {snap['thermal']}"
+    if not snap["on_ac"] and snap["battery"] is not None and snap["battery"] < 25:
+        return True, f"battery low ({snap['battery']}%)"
+    if snap["free_mem_pct"] is not None and snap["free_mem_pct"] < 15:
+        return True, f"memory tight ({snap['free_mem_pct']}% free)"
+    return False, "ok"
+
+
+def _ai_jobs_only_on_ac() -> bool:
+    try:
+        import cortex.storage.settings_store as settings_store
+        return bool(settings_store.section("resources").get("ai_jobs_only_on_ac", True))
+    except Exception:
+        return True
+
+
 def should_run(cost: str = "heavy", min_battery: int = 30) -> tuple[bool, str]:
     """
     Decide whether a job of the given cost should run this tick.
@@ -92,6 +129,8 @@ def should_run(cost: str = "heavy", min_battery: int = 30) -> tuple[bool, str]:
 
     if not batt["on_ac"]:
         pct = batt["percent"]
+        if _ai_jobs_only_on_ac():
+            return False, f"on battery ({pct}%) — AI jobs only run when plugged in (Settings → Background)"
         if pct is not None and pct < min_battery:
             return False, f"on battery and low ({pct}% < {min_battery}%)"
         return True, f"on battery but ok ({pct}%)"
