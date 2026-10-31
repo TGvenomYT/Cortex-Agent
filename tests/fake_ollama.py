@@ -1,6 +1,7 @@
 """A small stand-in for an Ollama server: real HTTP, scripted replies."""
 import json
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
@@ -10,6 +11,7 @@ class FakeOllama:
         self.reply = reply or (lambda body: {"content": "hello"})
         self.models = list(models)
         self.chat_status = 200
+        self.chunk_delay = 0.0
         outer = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -54,6 +56,7 @@ class FakeOllama:
                 for i in range(0, len(text), 8):
                     self.wfile.write((json.dumps({"message": {"content": text[i:i + 8]}, "done": False}) + "\n").encode())
                     self.wfile.flush()
+                    time.sleep(outer.chunk_delay)
                 final = {"message": {"content": "", "tool_calls": r.get("tool_calls") or []}, "done": True}
                 self.wfile.write((json.dumps(final) + "\n").encode())
 

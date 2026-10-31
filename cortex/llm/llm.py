@@ -662,7 +662,7 @@ def available_models(config: dict) -> list[dict]:
     groups, local = [], []
     try:
         data = httpx.get(_ollama_base(config) + "/api/tags", timeout=2).json()
-        local = sorted(m["name"] for m in data.get("models", []))
+        local = sorted(m["name"] for m in data.get("models", []) if "embed" not in m["name"])
     except Exception as e:
         logger.info(f"local Ollama not reachable ({e})")
     keys = configured_providers()

@@ -1133,7 +1133,7 @@ html:not([data-theme=light]) .bgwarn{color:#f28b82}
 .opt.go{background:var(--blue);color:var(--onblue);border-color:var(--blue)}
 .mh{font-size:11px;color:var(--dim);padding:8px 12px 4px;text-transform:uppercase;letter-spacing:.4px}
 .mi.locked{color:var(--dim)}
-.nitem pre{white-space:pre-wrap;word-break:break-word;font-size:12px}.nitem .opts{margin-top:8px}
+.nmd p{margin:0 0 6px}.nmd pre{white-space:pre-wrap;word-break:break-word;font:12px ui-monospace,Menlo,monospace;background:var(--code);border-radius:8px;padding:8px;margin:6px 0}.nitem .opts{margin-top:8px}
 </style></head><body>
 <nav id="side">
  <div class="shead"><div class="logo"><span class="spark">✦</span><span>Cortex</span></div></div>
@@ -1611,7 +1611,7 @@ async function loadNudges(){try{const d=await (await fetch('/nudges')).json();NU
   if($('nudgepanel').classList.contains('show'))renderNudges()}catch(_){}}
 function renderNudges(){const p=$('nudgepanel');
   const items=NUDGES.length?NUDGES.map(n=>`<div class="nitem ${n.read?'':'un'}"><div class="nt"><span class="ndot ${esc(n.kind)}"></span>${esc(n.title)}</div>${n.body?`<div class="nb">${esc(n.body)}</div>`:''}<div class="nw">${esc(n.when).slice(0,16).replace('T',' ')}</div></div>`).join(''):'<div class="nitem"><div class="nb">Nothing new — Cortex will nudge you here when it notices something.</div></div>';
-  const asks=APPROVALS.map(a=>`<div class="nitem un"><div class="nt"><span class="ndot warn"></span>Needs your OK</div><div class="ans nb">${md(a.text)}</div>${a.think?`<div class="nw">${esc(a.think)}</div>`:''}<div class="opts"><div class="opt go" data-click="resolveApproval(${Number(a.id)},true)">Approve</div><div class="opt" data-click="resolveApproval(${Number(a.id)},false)">Reject</div></div></div>`).join('');
+  const asks=APPROVALS.map(a=>`<div class="nitem un"><div class="nt"><span class="ndot warn"></span>Needs your OK</div><div class="nb nmd">${md(a.text)}</div>${a.think?`<div class="nw">${esc(a.think)}</div>`:''}<div class="opts"><div class="opt go" data-click="resolveApproval(${Number(a.id)},true)">Approve</div><div class="opt" data-click="resolveApproval(${Number(a.id)},false)">Reject</div></div></div>`).join('');
   p.innerHTML=`<div class="nhead"><b>Notifications</b>${NUDGES.length?'<span data-click="clearNudges()">Clear all</span>':''}</div>${asks}${items}`}
 async function resolveApproval(id,ok){const j=await postJ('/approvals/resolve',{id,approve:ok});
   APPROVALS=APPROVALS.filter(a=>a.id!==id);NUDGES=[{title:ok?'Approved':'Rejected',body:j.message||'',kind:'info',read:true,when:''},...NUDGES];renderNudges();loadNudges()}
