@@ -276,8 +276,8 @@ def compact_chat(db, llm, session_id: str, budget: ContextBudget) -> bool:
         if kept > room / 3:
             cut = i + 1
             break
-    while cut < len(rows) and rows[cut]["role"] != "user":
-        cut += 1
+    while cut > 0 and cut < len(rows) and rows[cut]["role"] != "user":
+        cut -= 1            # the kept part starts with a question, and never shrinks to nothing
     old = rows[:cut]
     if len(old) < 2:
         return False

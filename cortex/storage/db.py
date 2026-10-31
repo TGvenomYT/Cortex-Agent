@@ -1012,6 +1012,13 @@ class Database:
                 row = cur.fetchone()
         return row[0] if row else None
 
+    def last_undoable_any(self):
+        with self.get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT job_id FROM checkpoints WHERE status = 'active' ORDER BY id DESC LIMIT 1")
+                row = cur.fetchone()
+        return row[0] if row else None
+
     # ─── Watches (see cortex/core/watchers.py) ───
 
     def watch_add(self, watch_id, session_id, label, spec):

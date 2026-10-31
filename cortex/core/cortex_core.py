@@ -686,6 +686,9 @@ class CortexCore:
 
         if final_speak is None and not job.llm_failed and job.work_log:
             final_speak = self._closing_answer(messages, tools_list)
+        if final_speak is None and job.fails_in_a_row >= _MAX_FAILS_IN_A_ROW:
+            final_speak = (f"I couldn't get this working: the last {job.fails_in_a_row} attempts all failed.\n\n"
+                           f"```\n{job.work_log[-1][-600:]}\n```")
         yield from self._finish_turn(job, last_action, final_speak, asked, ask_options)
         return "failed" if job.llm_failed else "done"
 
@@ -1466,9 +1469,14 @@ class CortexCore:
             raw = self.llm.complete(
                 [{"role": "system", "content": prompt},
                  {"role": "user", "content": "Wrap it up for them."}], json_mode=True)
-            return json.loads(raw).get("speak") or "Done — handled it."
+            return json.loads(raw).get("speak") or self._unsummarised(work_log)
         except Exception:
-            return "Done — handled it."
+            return self._unsummarised(work_log)
+
+    @staticmethod
+    def _unsummarised(work_log: list[str]) -> str:
+        """Never claim success we can't vouch for: show what actually happened last."""
+        return f"I couldn't write up the result, but this is where it got to:\n\n```\n{work_log[-1][-600:]}\n```"
 
     def _finish(self, session_id: str, user_text: str, action: dict, exit_code: int = None,
                 learn: bool = False) -> dict:

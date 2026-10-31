@@ -491,7 +491,7 @@ def write_targets(command: str, cwd: str = None) -> tuple[list, bool]:
             if not argv:
                 continue
             prog, args = os.path.basename(argv[0]).lower(), argv[1:]
-            plain = [a for a in args if not a.startswith("-")]
+            plain = [a for a in args if a and not a.startswith("-")]
             if prog == "cd":
                 here = at(plain[0]) if plain else os.path.expanduser("~")
             elif _simple(prog, args, " ".join(argv), set(), 0)[0] == _SAFE:

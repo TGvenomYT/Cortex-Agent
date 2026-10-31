@@ -11,6 +11,9 @@ Usage:
 import sys
 import os
 import json
+import signal
+import threading
+import time
 try:
     import readline  # nicer line editing on macOS/Linux; absent on Windows
 except ImportError:
@@ -41,7 +44,15 @@ def follow(events) -> dict:
     status = console.status("[dim]thinking…[/dim]", spinner="dots") if console.is_terminal else None
     if status:
         status.start()
-    written, final = "", {}
+    written, final, undoable = "", {}, []
+
+    def stop(*_):       # Ctrl+C stops the job, not the app
+        console.print("\n  [yellow]stopping…[/yellow]")
+        core().stop(SESSION_ID)
+
+    previous = None
+    if threading.current_thread() is threading.main_thread():
+        previous = signal.signal(signal.SIGINT, stop)
 
     def pause_spinner():
         nonlocal status
@@ -69,10 +80,14 @@ def follow(events) -> dict:
             elif t == "image":
                 pause_spinner()
                 console.print(f"  [dim]chart saved in ~/.cortex/artifacts{ev.get('src', '').replace('/artifact', '')}[/dim]")
+            elif t == "undoable":
+                undoable.append(ev)
             elif t == "final":
                 final = ev.get("action") or {}
     finally:
         pause_spinner()
+        if previous is not None:
+            signal.signal(signal.SIGINT, previous)
 
     speak = final.get("speak") or ""
     if written and speak.startswith(written.strip()):
@@ -85,6 +100,8 @@ def follow(events) -> dict:
         print()
         console.print(Markdown(speak))
         console.print()
+    if undoable:
+        console.print("  [dim]`cx undo` puts those changes back.[/dim]\n")
     return final
 
 
@@ -112,6 +129,37 @@ def ask(text: str) -> dict:
     return answer_approvals(follow(core().ask_stream(text, session_id=SESSION_ID, source="cli")))
 
 
+def _offer_resume():
+    """Offer to carry on any job a crash cut off."""
+    for job in core().interrupted():
+        console.print(f"  [yellow]A job was cut off:[/yellow] {job['text'][:80]}")
+        try:
+            reply = console.input("  [bold]\\[r]esume[/bold] / [bold]\\[d]ismiss[/bold] / skip: ").strip().lower()
+        except (KeyboardInterrupt, EOFError):
+            return
+        if reply.startswith("r"):
+            answer_approvals(follow(core().resume_stream(job["id"], source="cli")))
+        elif reply.startswith("d"):
+            core().dismiss_job(job["id"])
+
+
+def _listen(waiting):
+    """Show what a watcher writes into this chat, without waiting to be asked."""
+    db = core().db
+    last = db.latest_message_id(SESSION_ID)
+    while True:
+        time.sleep(4)
+        if not waiting.is_set():
+            last = db.latest_message_id(SESSION_ID)
+            continue
+        for row in db.recent_messages(SESSION_ID, after_id=last, limit=10):
+            last = row["id"]
+            if row["role"] == "assistant":
+                console.print("\n  [dim]while you were away:[/dim]")
+                console.print(Markdown(row["content"]))
+                console.print()
+
+
 def interactive_mode():
     """Main interactive conversation loop."""
     console.print()
@@ -127,9 +175,15 @@ def interactive_mode():
     except (FileNotFoundError, PermissionError, OSError):
         pass
 
+    _offer_resume()
+    waiting = threading.Event()
+    threading.Thread(target=_listen, args=(waiting,), name="cx-updates", daemon=True).start()
+
     while True:
         try:
+            waiting.set()
             user_input = console.input("  [green]→[/green] ").strip()
+            waiting.clear()
         except (KeyboardInterrupt, EOFError):
             console.print("\n  [dim]bye.[/dim]\n")
             break
@@ -189,6 +243,54 @@ def model_cmd(argv: list[str]):
     if not groups:
         console.print("\n  [yellow]No models found. Start Ollama, or add a key with `cx key ollama`.[/yellow]")
     console.print()
+
+
+def usage_cmd(argv: list[str]):
+    """`cx usage` shows cloud use; `cx usage limit <name> <value>` and
+    `cx usage price <model> <in> <out>` (USD per 1M tokens) change what's enforced."""
+    from cortex.core import usage
+    import cortex.storage.settings_store as settings_store
+    core()      # binds the database
+    if len(argv) >= 3 and argv[0] == "limit":
+        settings_store.update_section("limits", {argv[1]: float(argv[2])})
+        console.print(f"\n  [green]✓[/green] {argv[1]} = {argv[2]} (0 means no limit)\n")
+        return
+    if len(argv) >= 4 and argv[0] == "price":
+        prices = dict(settings_store.section("limits").get("prices") or {})
+        prices[argv[1]] = [float(argv[2]), float(argv[3])]
+        settings_store.update_section("limits", {"prices": prices})
+        console.print(f"\n  [green]✓[/green] {argv[1]}: ${argv[2]} in, ${argv[3]} out per million tokens\n")
+        return
+    r = usage.report()
+    console.print(f"\n  [bold]Cloud use:[/bold] ${r['day']['usd']:.2f} today ({r['day']['tokens']:,} tokens), "
+                  f"${r['month']['usd']:.2f} this month ({r['month']['tokens']:,} tokens)")
+    console.print("  [dim]Limits (0 = none): " + ", ".join(f"{k}={v}" for k, v in r["limits"].items()) + "[/dim]")
+    for m in r["models"]:
+        cost = "free" if m["provider"] == "local" else ("not priced" if m["cost_usd"] is None else f"${m['cost_usd']:.2f}")
+        console.print(f"   {m['model']:<34} {m['calls']:>5} calls  "
+                      f"{(m['input_tokens'] or 0) + (m['output_tokens'] or 0):>11,} tokens  {cost}", highlight=False)
+    console.print()
+
+
+def undo_cmd(argv: list[str]):
+    """`cx undo` puts back what the last job changed, or `cx undo <job id>`."""
+    db = core().db
+    job = argv[0] if argv else db.last_undoable_any()
+    console.print(f"\n  {core().undo.undo_job(job)['message'] if job else 'There is nothing to undo.'}\n")
+
+
+def watches_cmd(argv: list[str]):
+    """`cx watches` lists what's being looked after; `cx watches stop <id>` ends one."""
+    import cortex.core.watchers as watchers
+    db = core().db
+    if len(argv) >= 2 and argv[0] == "stop":
+        console.print("\n  [green]✓[/green] stopped\n" if watchers.stop(db, argv[1]) else "\n  no such watch\n")
+        return
+    rows = watchers.active(db)
+    console.print()
+    for w in rows:
+        console.print(f"   {w['id']}  {w['label']}", highlight=False)
+    console.print("  [dim]nothing is being watched[/dim]\n" if not rows else "")
 
 
 def key_cmd(argv: list[str]):
@@ -361,6 +463,18 @@ def main():
 
     if len(sys.argv) > 1 and sys.argv[1].lower() == "key":
         key_cmd(sys.argv[2:])
+        return
+
+    if len(sys.argv) > 1 and sys.argv[1].lower() == "usage":
+        usage_cmd(sys.argv[2:])
+        return
+
+    if len(sys.argv) > 1 and sys.argv[1].lower() == "undo":
+        undo_cmd(sys.argv[2:])
+        return
+
+    if len(sys.argv) > 1 and sys.argv[1].lower() in ("watches", "watch"):
+        watches_cmd(sys.argv[2:])
         return
 
     if len(sys.argv) > 1 and sys.argv[1].lower() in ("workers", "worker", "bg", "background"):

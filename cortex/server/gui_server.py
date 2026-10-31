@@ -627,7 +627,7 @@ def nudges_list():
         logger.warning(f"/nudges: {e}")
         items, unread = [], 0
     return jsonify({"nudges": [{"id": n["id"], "title": n["title"], "body": n.get("body", ""),
-                               "kind": n.get("kind", "info"), "read": bool(n["read"]),
+                               "kind": n.get("kind", "info"), "read": bool(n["read"]), "source": n.get("source") or "",
                                "when": str(n["created_at"])} for n in items],
                     "unread": unread})
 
@@ -687,7 +687,14 @@ def history():
                        "after_outside_content": bool((resume.get("job") or {}).get("tainted"))}
     except Exception as e:
         logger.warning(f"/history pending: {e}")
-    return jsonify({"messages": out, "running": bool(job and not job.done), "pending": pending})
+    try:
+        cut_off = core().interrupted(session)
+        last_id = core().db.latest_message_id(session)
+    except Exception as e:
+        logger.warning(f"/history jobs: {e}")
+        cut_off, last_id = [], 0
+    return jsonify({"messages": out, "running": bool(job and not job.done), "pending": pending,
+                    "interrupted": cut_off, "last_id": last_id})
 
 
 @app.route("/files/upload", methods=["POST"])
@@ -830,6 +837,94 @@ def approve():
     if job is None:
         return jsonify({"ok": False, "error": "a reply is still being written"}), 409
     return jsonify({"ok": True})
+
+
+@app.route("/stop", methods=["POST"])
+def stop():
+    return jsonify({"ok": core().stop((request.get_json(silent=True) or {}).get("session", ""))})
+
+
+@app.route("/undo", methods=["POST"])
+def undo():
+    d = request.get_json(silent=True) or {}
+    result = core().undo.undo_job(d.get("job", ""))
+    if d.get("session"):
+        core().db.save_conversation(d["session"], "assistant", result["message"])
+    return jsonify(result)
+
+
+@app.route("/jobs/resume", methods=["POST"])
+def jobs_resume():
+    d = request.get_json(silent=True) or {}
+    session = d.get("session", "")
+    job = _start_job(session, lambda: core().resume_stream(d.get("id", ""), source="gui"))
+    return (jsonify({"ok": True}) if job else (jsonify({"ok": False}), 409))
+
+
+@app.route("/jobs/dismiss", methods=["POST"])
+def jobs_dismiss():
+    core().dismiss_job((request.get_json(silent=True) or {}).get("id", ""))
+    return jsonify({"ok": True})
+
+
+@app.route("/usage")
+def usage_report():
+    from cortex.core import usage
+    from cortex.core.context_manager import ContextBudget
+    out = usage.report()
+    try:
+        c = core()
+        b = ContextBudget(c.llm.primary, None, c.cloud_context_cap)
+        out["context"] = {"model": b.model, "window": b.window, "usable": b.limit, "source": b.source}
+    except Exception as e:
+        logger.info(f"/usage context: {e}")
+    return jsonify(out)
+
+
+@app.route("/limits/set", methods=["POST"])
+def limits_set():
+    import cortex.storage.settings_store as settings_store
+    d = request.get_json(silent=True) or {}
+    patch = {}
+    for k in ("daily_usd", "monthly_usd", "job_usd", "daily_tokens", "job_tokens"):
+        if k in d:
+            try:
+                patch[k] = max(0.0, float(d[k]))
+            except (TypeError, ValueError):
+                return jsonify({"ok": False, "error": f"{k} needs a number"}), 400
+    return jsonify(settings_store.update_section("limits", patch))
+
+
+@app.route("/watches")
+def watches_list():
+    import cortex.core.watchers as watchers
+    try:
+        return jsonify({"watches": [{"id": w["id"], "label": w["label"], "kind": w["spec"].get("kind")}
+                                    for w in watchers.active(core().db)]})
+    except Exception as e:
+        logger.warning(f"/watches: {e}")
+        return jsonify({"watches": []})
+
+
+@app.route("/watches/stop", methods=["POST"])
+def watches_stop():
+    import cortex.core.watchers as watchers
+    return jsonify({"ok": watchers.stop(core().db, (request.get_json(silent=True) or {}).get("id", ""))})
+
+
+@app.route("/updates")
+def updates():
+    """What arrived in this chat by itself since the page last looked (a watcher's report)."""
+    session, after = request.args.get("session", ""), request.args.get("after", type=int, default=0)
+    try:
+        db = core().db
+        rows = db.recent_messages(session, after_id=after, limit=20) if after else []
+        return jsonify({"last_id": db.latest_message_id(session),
+                        "messages": [{"role": r["role"], "content": r["content"]} for r in rows
+                                     if r["role"] == "assistant"]})
+    except Exception as e:
+        logger.warning(f"/updates: {e}")
+        return jsonify({"last_id": after, "messages": []})
 
 
 @app.route("/approvals")
@@ -1131,6 +1226,11 @@ html:not([data-theme=light]) .chip.medium{color:#fbbc04;border-color:#fbbc0455}h
 .bgsum .big{font-size:15px;color:var(--txt);font-weight:600}.bgwarn{color:#c5221f;font-size:12px;margin-top:4px}
 html:not([data-theme=light]) .bgwarn{color:#f28b82}
 @media (prefers-reduced-motion:reduce){*{animation:none!important}}
+#stopbtn{display:none}#stopbtn.show{display:flex}#stopbtn svg{fill:var(--txt);stroke:none}
+.watchtag{font-size:12px;color:var(--dim);margin-bottom:4px}
+.utab{width:100%;border-collapse:collapse;font-size:12px}.utab td,.utab th{padding:5px 6px;text-align:left;border-bottom:1px solid var(--line);color:var(--mut)}
+.utab td.n,.utab th.n{text-align:right}
+.ugrid{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:12px}
 .opt.go{background:var(--blue);color:var(--onblue);border-color:var(--blue)}
 .mh{font-size:11px;color:var(--dim);padding:8px 12px 4px;text-transform:uppercase;letter-spacing:.4px}
 .mi.locked{color:var(--dim)}
@@ -1158,9 +1258,10 @@ html:not([data-theme=light]) .bgwarn{color:#f28b82}
    <textarea id="q" rows="1" placeholder="Ask Cortex, or give it a job…"></textarea>
    <button type="button" class="rbtn" id="mic" title="Voice input (MLX)"><svg viewBox="0 0 24 24"><rect x="9" y="2.5" width="6" height="11" rx="3"/><path d="M5.5 11a6.5 6.5 0 0 0 13 0"/><path d="M12 17.5V21"/></svg></button>
    <button type="button" class="rbtn spk" id="spk" title="Read answers aloud (Kokoro-MLX)" data-click="toggleSpk()"><svg viewBox="0 0 24 24"><path d="M11 5 6 9H3v6h3l5 4z"/><path d="M15.5 8.5a5 5 0 0 1 0 7"/><path d="M18.5 6a9 9 0 0 1 0 12"/></svg></button>
+   <button type="button" class="rbtn" id="stopbtn" title="Stop" data-click="stopJob()"><svg viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="2"/></svg></button>
    <button class="rbtn" id="send" title="Send"><svg viewBox="0 0 24 24"><path d="M12 20V5"/><path d="m5 12 7-7 7 7"/></svg></button>
   </form>
-  <div class="foot">Cortex can make mistakes.</div>
+  <div class="foot"><span id="ctx"></span>Cortex can make mistakes.</div>
  </div>
 </div>
 <div id="ov"><div class="modal" id="modal"></div></div>
@@ -1211,7 +1312,7 @@ function shortModel(n){n=n.replace('ollama-cloud/','').split('/').pop();if(n.inc
 function toggleMenu(e){e.stopPropagation();const m=$('menu');m.classList.toggle('show');if(m.classList.contains('show'))loadModels()}
 document.addEventListener('click',e=>{if(!e.target.closest('#menu')&&e.target.id!=='modelbtn')$('menu').classList.remove('show');
   if(!e.target.closest('.bellwrap'))$('nudgepanel').classList.remove('show')});
-function newChat(){if(busy)return;sid='gui-'+Date.now();localStorage.setItem('cx-sid',sid);wrap.innerHTML='';hello.style.display='';renderChats()}
+function newChat(){if(busy)return;sid='gui-'+Date.now();localStorage.setItem('cx-sid',sid);lastId=0;$('ctx').textContent='';wrap.innerHTML='';hello.style.display='';renderChats()}
 q.addEventListener('input',()=>{q.style.height='auto';q.style.height=Math.min(q.scrollHeight,150)+'px';send.classList.toggle('show',q.value.trim().length>0)});
 q.addEventListener('keydown',e=>{
  if(e.key==='Tab'&&TABFILL&&!q.value.trim()){e.preventDefault();q.value=TABFILL;q.dispatchEvent(new Event('input'));return}
@@ -1260,6 +1361,7 @@ async function openChat(s){busy=false;sid=s;localStorage.setItem('cx-sid',s);wra
  hello.style.display=msgs.length?'none':'';
  msgs.forEach(m=>{if(m.role==='user')addUser(m.content);else addResp(m.content,m.parts)});
  $('scroll').scrollTop=$('scroll').scrollHeight;
+ lastId=d.last_id||0;(d.interrupted||[]).forEach(interruptedCard);
  if(d.pending&&!d.running){const last=[...wrap.querySelectorAll('.resp')].pop();if(last)approvalCard(last,d.pending)}
  if(d.running)attachRunning()}             // the reply is still being written — rejoin it
 function addUser(t){const turn=el('div','turn');const r=el('div','urow');
@@ -1293,9 +1395,31 @@ function addResp(t,parts){parts=parts||[];const resp=el('div','resp');
   const sum=el('summary','','<span class="jist">Show thinking</span>'+CHEV);det.appendChild(sum);
   const body=el('div','body');det.appendChild(body);const subs={};tr.events.forEach(e=>traceAdd(body,e,subs));
   live.appendChild(det);resp.appendChild(live)}
+ if(parts.some(p=>p.t==='watch')){const w=el('div','watchtag');w.textContent='✦ Cortex, without being asked';resp.appendChild(w)}
  const ans=el('div','ans');ans.innerHTML=md(t);resp.appendChild(ans);
- parts.forEach(p=>{if(p.t==='image')resp.appendChild(imageCard(p));else if(p.t==='images')resp.appendChild(imageGrid(p))});
+ parts.forEach(p=>{if(p.t==='image')resp.appendChild(imageCard(p));else if(p.t==='images')resp.appendChild(imageGrid(p));else if(p.t==='undoable')undoCard(resp,p)});
  wrap.appendChild(resp);return resp}
+function stopShown(on){$('stopbtn').classList.toggle('show',on);send.classList.toggle('show',!on&&q.value.trim().length>0)}
+function stopJob(){postJ('/stop',{session:sid})}
+function undoCard(resp,u){const o=el('div','opts'),b=el('div','opt');b.textContent=u.complete?'Undo these changes':'Undo what I can';
+ b.onclick=async()=>{b.remove();const j=await postJ('/undo',{job:u.job,session:sid});const n=el('div','note');n.textContent=j.message||'';o.appendChild(n);syncLast()};
+ o.appendChild(b);resp.appendChild(o)}
+// A job cut off by a crash: its last checkpoint is saved, so it can carry on from there.
+function interruptedCard(j){const r=el('div','resp'),n=el('div','note');n.textContent='This job was cut off when Cortex stopped: "'+j.text.slice(0,90)+'"';r.appendChild(n);
+ const o=el('div','opts'),go=el('div','opt go'),no=el('div','opt');go.textContent='Carry on';no.textContent='Dismiss';
+ go.onclick=()=>{if(busy)return;busy=true;r.remove();const turn=addUser('Carry on with that job');
+  fetch('/jobs/resume',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:j.id,session:sid})})
+   .then(x=>{if(x.ok)runTurn(turn,'/attach?session='+encodeURIComponent(sid));else busy=false}).catch(()=>{busy=false})};
+ no.onclick=()=>{r.remove();postJ('/jobs/dismiss',{id:j.id})};
+ o.appendChild(go);o.appendChild(no);r.appendChild(o);wrap.appendChild(r)}
+// What arrives by itself: a watcher reporting back into this chat without being asked.
+let lastId=0;
+async function syncLast(){try{lastId=(await (await fetch('/updates?session='+encodeURIComponent(sid))).json()).last_id||lastId}catch(_){}}
+async function pollUpdates(){if(busy||document.hidden)return;
+ try{const d=await (await fetch('/updates?session='+encodeURIComponent(sid)+'&after='+lastId)).json();if(busy)return;
+  if(lastId&&(d.messages||[]).length){hello.style.display='none';d.messages.forEach(m=>{addResp(m.content,[{t:'watch'}])});$('scroll').scrollTop=$('scroll').scrollHeight;loadNudges()}
+  lastId=d.last_id||lastId}catch(_){}}
+setInterval(pollUpdates,5000);
 // Approval buttons answer one specific held action by id. Nothing is parsed from text, so what
 // runs depends on which button was pressed, and the job carries on from where it paused.
 function approvalCard(resp,a){const o=el('div','opts');const wary=a.after_outside_content;
@@ -1314,7 +1438,7 @@ function submit(text){if(busy||!text)return;busy=true;send.classList.remove('sho
  runTurn(turn,'/stream?session='+encodeURIComponent(sid)+'&q='+encodeURIComponent(text))}
 function attachRunning(){const last=wrap.lastElementChild;if(!last)return;busy=true;
  runTurn(last,'/attach?session='+encodeURIComponent(sid))}
-function runTurn(turn,url){
+function runTurn(turn,url){stopShown(true);
  const resp=el('div','resp');
  const live=el('div','rlive active');
  const det=el('details','trace');          // collapsed by default → retractable; summary = live preview
@@ -1332,6 +1456,7 @@ function runTurn(turn,url){
  es.onmessage=e=>{let ev;try{ev=JSON.parse(e.data)}catch(_){return}
   const t=ev.type;
   if(t==='delta'){buf+=ev.text;if(!paintT)paintT=setTimeout(paint,80);return}
+  if(t==='context'){$('ctx').textContent='Context '+ev.percent+'% · ';return}
   if((t==='tool'||t==='answer')&&paintT){clearTimeout(paintT);paintT=0}
   if(t==='tool'&&buf){buf='';ans.innerHTML=''}     // that was the model talking on its way to a step
   if(t==='status'){preview(ev.text)}
@@ -1343,15 +1468,16 @@ function runTurn(turn,url){
   else if(t==='images'){resp.appendChild(imageGrid(ev))}
   else if(t==='answer'){live.classList.remove('active');jist.classList.remove('shimmer');jist._k=(jist._k||0)+1;jist.textContent='Show thinking';ans.innerHTML=md(ev.text);if(speakOn)ttsPlay(ev.text)}
   else if(t==='approval'){approvalCard(resp,ev)}
+  else if(t==='undoable'){undoCard(resp,ev)}
   else if(t==='ask'){const o=el('div','opts');(ev.options||[]).forEach(opt=>{const bt=el('div','opt',esc(opt));bt.onclick=()=>submit(opt);o.appendChild(bt)});resp.appendChild(o)}
   else if(t==='followups'){const f=el('div','followups');(ev.items||[]).forEach((it,i)=>{const bt=el('div','fu');bt.innerHTML=esc(it)+(i===0?'<span class="kbd">Tab</span>':'');bt.onclick=()=>submit(it);f.appendChild(bt)});resp.appendChild(f);
    TABFILL=(ev.items&&ev.items[0])||'';if(TABFILL)q.placeholder='⇥ '+TABFILL}
-  else if(t==='busy'){finished=true;es.close();live.classList.remove('active');ans.textContent='Still finishing your last message in this chat — give me a moment, then try again.';busy=false}
-  else if(t==='done'){finished=true;es.close();live.classList.remove('active');busy=false;jist._k=(jist._k||0)+1;if(!ans.innerHTML){jist.classList.remove('shimmer');jist.textContent='Show thinking'}loadChats();q.focus()}
+  else if(t==='busy'){finished=true;stopShown(false);es.close();live.classList.remove('active');ans.textContent='Still finishing your last message in this chat — give me a moment, then try again.';busy=false}
+  else if(t==='done'){finished=true;stopShown(false);syncLast();es.close();live.classList.remove('active');busy=false;jist._k=(jist._k||0)+1;if(!ans.innerHTML){jist.classList.remove('shimmer');jist.textContent='Show thinking'}loadChats();q.focus()}
   if(t==='answer'||t==='done'||det.open)sc.scrollTop=sc.scrollHeight};
  // Connection dropped mid-reply: the server keeps writing it, so reload the chat from the
  // database and rejoin the live turn instead of showing an error.
- es.onerror=()=>{es.close();if(!finished)setTimeout(()=>openChat(sid),1200)}}
+ es.onerror=()=>{es.close();stopShown(false);if(!finished)setTimeout(()=>openChat(sid),1200)}}
 form.addEventListener('submit',e=>{e.preventDefault();submit(q.value.trim())});
 // voice: mic -> MLX whisper ; answers -> MLX kokoro
 let rec=null,chunks=[],recording=false;
@@ -1396,7 +1522,8 @@ async function openSettings(){CUR=await (await fetch('/settings')).json();
    <div class="navitem" data-t="providers" data-click="sTab('providers')">AI Providers</div>
    <div class="navitem" data-t="email" data-click="sTab('email')">Email</div>
    <div class="navitem" data-t="mcp" data-click="sTab('mcp')">MCP</div>
-   <div class="navitem" data-t="bg" data-click="sTab('bg')">Background</div></div>
+   <div class="navitem" data-t="bg" data-click="sTab('bg')">Background</div>
+   <div class="navitem" data-t="usage" data-click="sTab('usage')">Usage</div></div>
    <div class="scontent" id="scontent"></div>`,'settings');
  sTab('profile')}
 function sTab(t){document.querySelectorAll('.navitem[data-t]').forEach(n=>n.classList.toggle('on',n.dataset.t===t));
@@ -1407,6 +1534,7 @@ function sTab(t){document.querySelectorAll('.navitem[data-t]').forEach(n=>n.clas
  else if(t==='providers')renderProviders(c);
  else if(t==='email')renderEmail(c);
  else if(t==='mcp')renderMcp(c);
+ else if(t==='usage')renderUsage(c);
  else renderBackground(c)}
 const PROV=[['ollama','Ollama Cloud','paste your Ollama key','ollama.com/settings/keys'],
             ['anthropic','Claude (Anthropic)','sk-ant-…','console.anthropic.com/settings/keys'],
@@ -1584,8 +1712,26 @@ async function runWorker(key){const r=await postJ('/workers/run',{key});bgNote(r
 async function unloadModel(){const r=await postJ('/model/unload');await loadBackground();bgNote(r.message||'')}
 async function setRes(k,v){await postJ('/resources/set',{[k]:v});loadBackground()}
 async function setAgents(k,v){await postJ('/agents/set',{[k]:v});loadBackground()}
+const LIMITS=[['daily_usd','Dollars a day'],['monthly_usd','Dollars a month'],['job_usd','Dollars per job'],['daily_tokens','Tokens a day'],['job_tokens','Tokens per job']];
+function renderUsage(c){c.innerHTML='<div id="ubody"><div class="dsub">loading…</div></div>';loadUsage()}
+const num=n=>Number(n||0).toLocaleString();
+async function loadUsage(){const L=$('ubody');if(!L)return;let d;try{d=await (await fetch('/usage')).json()}catch(_){L.innerHTML='<div class="dsub">could not load usage</div>';return}
+ const money=n=>'$'+Number(n||0).toFixed(2),cx=d.context,lim=d.limits||{};
+ L.innerHTML=`<div class="slabel">Cloud use</div>
+  <div class="ugrid"><div class="dev"><div><div class="dname">${money(d.day.usd)} today</div><div class="dsub">${num(d.day.tokens)} tokens</div></div></div>
+  <div class="dev"><div><div class="dname">${money(d.month.usd)} this month</div><div class="dsub">${num(d.month.tokens)} tokens</div></div></div></div>
+  <div class="dsub" style="line-height:1.5;margin-bottom:12px">Local models are free and never limited. Dollars are estimates from published prices. A cloud model with no known price, like Ollama Cloud, is held by the token limits.</div>
+  <div class="slabel">Limits (0 means none)</div>
+  ${LIMITS.map(([k,n])=>`<div class="field"><label>${n}</label><input class="inp" type="number" min="0" step="any" value="${esc(lim[k]??0)}" data-change="setLimit('${k}',this.value)"></div>`).join('')}
+  ${cx?`<div class="slabel" style="margin-top:18px">Current model</div><div class="dev"><div><div class="dname">${esc(cx.model)}</div><div class="dsub">Holds ${num(cx.window)} tokens (from ${esc(cx.source)}); Cortex uses up to ${num(cx.usable)} before compressing.</div></div></div>`:''}
+  ${(d.models||[]).length?`<div class="slabel" style="margin-top:18px">This month by model</div><table class="utab"><tr><th>Model</th><th class="n">Calls</th><th class="n">Tokens</th><th class="n">Cost</th></tr>${d.models.map(m=>`<tr><td>${esc(m.model)}</td><td class="n">${num(m.calls)}</td><td class="n">${num((m.input_tokens||0)+(m.output_tokens||0))}</td><td class="n">${m.provider==='local'?'free':(m.cost_usd==null?'not priced':money(m.cost_usd))}</td></tr>`).join('')}</table>`:''}`}
+async function setLimit(k,v){await postJ('/limits/set',{[k]:v})}
+async function stopWatch(id){await postJ('/watches/stop',{id});loadJobs()}
+function openFromNudge(s){$('nudgepanel').classList.remove('show');openChat(s)}
 async function loadJobs(){const L=$('joblist');if(!L)return;
  try{const d=await (await fetch('/jobs')).json();let h='';
+  const ws=(await (await fetch('/watches')).json()).watches||[];
+  if(ws.length){h+='<div class="slabel" style="margin-top:18px">Watching now</div>'+ws.map(w=>`<div class="dev"><div class="dico">${CLOCK}</div><div style="flex:1;min-width:0"><div class="dname">${esc(w.label)}</div><div class="dsub">Reports back to its chat by itself. Uses no AI while waiting.</div></div><div class="bars"><span class="xbtn" title="Stop watching" data-click="stopWatch('${arg(w.id)}')">${TRASH}</span></div></div>`).join('')}
   if((d.reminders||[]).length){h+='<div class="slabel" style="margin-top:18px">Scheduled reminders</div>'+d.reminders.map(r=>`<div class="dev"><div class="dico">${CLOCK}</div><div><div class="dname">${esc(r.text)}</div><div class="dsub">${esc(r.due)}</div></div></div>`).join('')}
   if((d.goals||[]).length){h+='<div class="slabel" style="margin-top:18px">Active goals</div>'+d.goals.map(g=>`<div class="dev" style="padding:11px 12px"><div class="dname" style="font-size:13px;line-height:1.45">• ${esc(g)}</div></div>`).join('')}
   L.innerHTML=h}catch(_){L.innerHTML=''}}
@@ -1611,7 +1757,7 @@ async function loadNudges(){try{const d=await (await fetch('/nudges')).json();NU
   const n=(d.unread||0)+APPROVALS.length,bg=$('nbadge');if(bg){if(n>0){bg.textContent=n>9?'9+':n;bg.classList.add('show')}else bg.classList.remove('show')}
   if($('nudgepanel').classList.contains('show'))renderNudges()}catch(_){}}
 function renderNudges(){const p=$('nudgepanel');
-  const items=NUDGES.length?NUDGES.map(n=>`<div class="nitem ${n.read?'':'un'}"><div class="nt"><span class="ndot ${esc(n.kind)}"></span>${esc(n.title)}</div>${n.body?`<div class="nb">${esc(n.body)}</div>`:''}<div class="nw">${esc(n.when).slice(0,16).replace('T',' ')}</div></div>`).join(''):'<div class="nitem"><div class="nb">Nothing new — Cortex will nudge you here when it notices something.</div></div>';
+  const items=NUDGES.length?NUDGES.map(n=>`<div class="nitem ${n.read?'':'un'}" ${(n.source||'').startsWith('chat:')?`style="cursor:pointer" data-click="openFromNudge('${arg(n.source.slice(5))}')"`:''}><div class="nt"><span class="ndot ${esc(n.kind)}"></span>${esc(n.title)}</div>${n.body?`<div class="nb">${esc(n.body)}</div>`:''}<div class="nw">${esc(n.when).slice(0,16).replace('T',' ')}</div></div>`).join(''):'<div class="nitem"><div class="nb">Nothing new — Cortex will nudge you here when it notices something.</div></div>';
   const asks=APPROVALS.map(a=>`<div class="nitem un"><div class="nt"><span class="ndot warn"></span>Needs your OK</div><div class="nb nmd">${md(a.text)}</div>${a.think?`<div class="nw">${esc(a.think)}</div>`:''}<div class="opts"><div class="opt go" data-click="resolveApproval(${Number(a.id)},true)">Approve</div><div class="opt" data-click="resolveApproval(${Number(a.id)},false)">Reject</div></div></div>`).join('');
   p.innerHTML=`<div class="nhead"><b>Notifications</b>${NUDGES.length?'<span data-click="clearNudges()">Clear all</span>':''}</div>${asks}${items}`}
 async function resolveApproval(id,ok){const j=await postJ('/approvals/resolve',{id,approve:ok});
@@ -1718,8 +1864,16 @@ def _stop_stale_gui(port):
     return stopped
 
 
+def _on_start():
+    """Mark jobs cut off by a crash, and restart watchers lost to a reboot."""
+    import cortex.core.watchers as watchers
+    try:
+        watchers.revive(core().db)
+    except Exception as e:
+        logger.warning(f"startup recovery: {e}")
+
+
 def main():
-    import threading
     port = int(os.environ.get("CORTEX_GUI_PORT", "7860"))
     url = f"http://127.0.0.1:{port}"
     # Only auto-open the browser when explicitly asked (the installer sets this on
@@ -1733,6 +1887,7 @@ def main():
             logger.info(f"Port {port} is in use by another program; Cortex GUI not started.")
             return
     logger.info(f"Cortex GUI running at {url}  (open it in your browser; Ctrl+C to stop)")
+    threading.Thread(target=_on_start, name="gui-startup", daemon=True).start()
     if auto_open:
         threading.Timer(1.0, lambda: _open_browser(url)).start()
     try:
