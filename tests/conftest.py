@@ -1,5 +1,6 @@
 """Every test runs against a throwaway home folder and never touches launchd or the Keychain."""
 import os
+import stat
 import sys
 
 import pytest
@@ -8,11 +9,32 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 
+# Stands in for launchctl, so no test can load a real job on this Mac.
+FAKE_LAUNCHCTL = """#!/bin/sh
+d="$HOME/.fake-launchd"; mkdir -p "$d"
+case "$1" in
+  load) [ -e "$HOME/.launchd-refuses" ] || touch "$d/$(basename "$2" .plist)" ;;
+  unload) rm -f "$d/$(basename "$2" .plist)" ;;
+  list) printf 'PID\\tStatus\\tLabel\\n'
+        for f in "$d"/*; do [ -e "$f" ] && printf -- '-\\t0\\t%s\\n' "$(basename "$f")"; done ;;
+esac
+exit 0
+"""
+
+
 @pytest.fixture(autouse=True)
 def isolated_home(tmp_path, monkeypatch):
     import cortex.storage.settings_store as ss
     import cortex.util.osutil as osutil
+    from cortex.core import scheduler
     monkeypatch.setenv("HOME", str(tmp_path))
+    bin_dir = tmp_path / "fake-bin"
+    bin_dir.mkdir()
+    fake = bin_dir / "launchctl"
+    fake.write_text(FAKE_LAUNCHCTL)
+    fake.chmod(fake.stat().st_mode | stat.S_IEXEC)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setattr(scheduler, "detach", lambda argv, name: None)
     monkeypatch.setattr(ss, "_DIR", str(tmp_path))
     monkeypatch.setattr(ss, "SETTINGS_FILE", str(tmp_path / "settings.json"))
     monkeypatch.setattr(ss, "OWNER_FILE", str(tmp_path / "owner.json"))

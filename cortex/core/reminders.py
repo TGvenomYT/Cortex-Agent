@@ -57,10 +57,12 @@ class ReminderManager:
             logger.error(f"Failed to fetch reminders: {e}")
             return
 
-        for reminder in pending:
+        for reminder in map(dict, pending):
             try:
-                self.fire_reminder(dict(reminder))
-                self.db.mark_reminder_fired(reminder["id"])
+                # Whoever marks it fired rings it, so the alarm and the tick can't both ring it.
+                if not self.db.mark_reminder_fired(reminder["id"]):
+                    continue
+                self.fire_reminder(reminder)
 
                 # Handle recurring reminders
                 repeat = reminder.get("repeat_rule")
@@ -69,6 +71,9 @@ class ReminderManager:
 
             except Exception as e:
                 logger.error(f"Failed to fire reminder {reminder['id']}: {e}")
+
+        from cortex.core import alarm
+        alarm.sync(self.db)
 
     def fire_reminder(self, reminder: dict):
         """Fire a reminder: macOS notification + natural TTS."""

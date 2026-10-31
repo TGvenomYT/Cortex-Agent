@@ -147,10 +147,11 @@ def _offer_resume():
 
 def _listen(waiting):
     """Show what a watcher writes into this chat, without waiting to be asked."""
+    import cortex.util.power as power
     db = core().db
     last = db.latest_message_id(SESSION_ID)
     while True:
-        time.sleep(4)
+        time.sleep(power.pace(4))
         if not waiting.is_set():
             last = db.latest_message_id(SESSION_ID)
             continue
@@ -402,8 +403,9 @@ def workers_cmd(argv: list[str]):
             for r in grp:
                 dot = "[green]●[/green]" if r["on"] else "[dim]○[/dim]"
                 cost = {"light": "[dim]light[/dim]", "medium": "[yellow]medium[/yellow]", "heavy": "[red]heavy[/red]"}[r["cost"]]
-                console.print(f"   {dot} {r['key']:<20} {r['name']:<22} {r['cadence']:<14} {cost}")
-        console.print(f"\n  [dim]{resources.describe()}[/dim]\n")
+                console.print(f"   {dot} {r['key']:<20} {r['name']:<22} {r['cadence']:<34} {cost}")
+        console.print(f"\n  [dim]{workers.power_info()['note']}[/dim]")
+        console.print(f"  [dim]{resources.describe()}[/dim]\n")
 
     if sub in ("list", "ls", "status"):
         show()
@@ -428,6 +430,9 @@ def workers_cmd(argv: list[str]):
         r = workers.apply_profile(arg)
         console.print(f"\n  profile → [cyan]{r.get('profile')}[/cyan]"
                       + ("".join(f"\n  [yellow]{e}[/yellow]" for e in r.get("errors", []))) + "\n")
+    elif sub == "machine":
+        r = workers.set_machine(arg)
+        console.print(f"\n  {r['note'] if r.get('ok') else 'usage: cx workers machine <auto|laptop|server>'}\n")
     elif sub == "pause":
         r = workers.apply_profile("off")
         console.print(f"\n  [green]✓[/green] all background work paused (profile: {r.get('profile')})\n")
@@ -496,6 +501,8 @@ def main():
         except Exception:
             pass
 
+    import cortex.core.workers as workers
+    workers.ensure()
     if len(sys.argv) > 1:
         one_shot(" ".join(sys.argv[1:]))
     else:

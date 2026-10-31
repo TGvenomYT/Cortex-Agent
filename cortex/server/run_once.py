@@ -2,10 +2,9 @@
 """
 run_once.py — scheduled (wake-run-exit) entry point for Cortex.
 
-Replaces the always-on KeepAlive Flask daemon for all background work. Each
-launchd job invokes one subcommand, which boots only what it needs, does one
-pass, and exits — so nothing runs on battery except the brief moment a job is
-actually doing work.
+Replaces the always-on KeepAlive Flask daemon for all background work. The tick
+(cortex/core/tick.py) invokes one subcommand when it's due, which boots only what
+it needs, does one pass, and exits. Recurring tasks have their own OS job.
 
   python3 run_once.py autonomy     # one multi-step autonomous session (heavy)
   python3 run_once.py reminders    # fire any due reminders (cheap)

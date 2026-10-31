@@ -541,6 +541,9 @@ class CortexCore:
         last_action, final_speak, held = {"action": "answer"}, None, None
         ask_options, asked = [], False
         retried_empty = False
+        if not job.background:
+            from cortex.core import tick
+            tick.refresh_context()
 
         if first:       # what the user just answered
             if first.get("cancelled"):

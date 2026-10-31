@@ -527,6 +527,7 @@ def workers_list():
         "summary": workers.summary(rows),
         "profiles": [{"id": k, "blurb": workers.PROFILE_BLURB[k]} for k in workers.PROFILES],
         "resources": resources.snapshot(),
+        "power": workers.power_info(),
         "keep_alive_choices": resources.KEEP_ALIVE_CHOICES,
         "agents": agents,
     })
@@ -586,6 +587,9 @@ def resources_set():
             patch["voice_idle_minutes"] = max(0, min(120, int(d["voice_idle_minutes"])))
         except (TypeError, ValueError):
             pass
+    if "machine" in d:
+        import cortex.core.workers as workers
+        workers.set_machine(d["machine"])
     return jsonify(settings_store.update_section("resources", patch))
 
 
@@ -1707,10 +1711,13 @@ function drawBackground(){const L=$('bgbody');if(!L||!BG)return;
  let h=`<div class="slabel">Background work</div><div class="bgsum">
    <div class="big">${S.on} of ${S.total} workers on · ${S.ai_on} AI job${S.ai_on===1?'':'s'}${S.tasks_total?` · ${S.tasks_on}/${S.tasks_total} tasks`:''}</div>
    <div class="dsub" style="margin-top:2px">${R.on_ac?'Plugged in':'On battery'}${R.battery!=null?' · '+R.battery+'%':''} · thermal ${esc(R.thermal)}${R.free_mem_pct!=null?' · '+R.free_mem_pct+'% memory free':''}</div>
+   <div class="dsub" style="margin-top:2px;line-height:1.4">${esc(BG.power.note)}</div>
    ${R.constrained?`<div class="bgwarn">Machine is under pressure (${esc(R.constrained_why)}) — optional AI work is paused.</div>`:''}
    <div class="dsub" id="bgstat" style="margin-top:4px;min-height:16px"></div></div>`;
  {h+=`<div class="seg">${BG.profiles.map(p=>`<button class="${S.profile===p.id?'on':''}" data-click="setProfile('${p.id}')">${cap(p.id)}</button>`).join('')}</div>
    <div class="dsub" style="line-height:1.45">${S.profile==='custom'?(S.on===0&&S.tasks_on?'Built-in workers are off, but your recurring tasks still run.':'Custom mix — you switched individual workers below.'):esc((prof||{}).blurb||'')} ${S.profile==='off'?'(Off also pauses your recurring tasks.)':''}</div>`}
+ h+=`<div class="field" style="margin-top:12px"><label>This computer is a</label><select class="inp" data-change="setRes('machine',this.value)">
+   ${[['auto','Detect it — '+BG.power.kind+' (recommended)'],['laptop','Laptop — run little, and almost nothing on battery'],['server','Server — always on, full schedule']].map(c=>`<option value="${c[0]}" ${BG.power.choice===c[0]?'selected':''}>${esc(c[1])}</option>`).join('')}</select></div>`;
  // AI model memory
  h+=`<div class="slabel" style="margin-top:18px">AI model memory</div>
   <div class="dev"><div class="dico">${CLOCK}</div><div style="min-width:0;flex:1"><div class="dname">${M.length?esc(M.map(m=>m.name+' · '+m.size_gb+' GB').join(', ')):'No AI model in memory'}</div>
@@ -1915,10 +1922,12 @@ def _stop_stale_gui(port):
 def _on_start():
     """Mark jobs cut off by a crash, and restart watchers lost to a reboot."""
     import cortex.core.watchers as watchers
+    import cortex.core.workers as workers
     try:
         watchers.revive(core().db)
     except Exception as e:
         logger.warning(f"startup recovery: {e}")
+    workers.ensure()
 
 
 def main():

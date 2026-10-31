@@ -77,15 +77,16 @@ def test_workers_exist_and_switch_on_linux(fake_crontab, monkeypatch):
     monkeypatch.setattr(workers.osutil, "IS_MAC", False)
     rows = {r["key"]: r for r in workers.list_workers()}
     assert rows["reminders"]["available"] and not rows["reminders"]["on"]
-    assert workers.set_enabled("reminders", True)["on"] and workers.is_on("reminders")
-    assert any("run_once.py" in l and "reminders" in l for l in fake_crontab)
+    r = workers.set_enabled("reminders", True)
+    assert r["on"] and workers.is_on("reminders"), r
+    assert [l for l in fake_crontab if l.endswith("-tick")] and any("run_once.py" in l and "tick" in l for l in fake_crontab)
     workers.set_enabled("reminders", False)
     assert not workers.is_on("reminders") and fake_crontab == []
 
 
-def test_every_worker_has_a_schedule_and_a_real_program():
+def test_every_worker_has_a_cadence_and_a_real_program():
     for w in workers.BUILTIN:
-        assert workers._schedule(w)["type"] in ("interval", "daily")
+        assert "daily" in w or (w["every"] and w["ac"] and "battery" in w), w["key"]
         assert os.path.exists(os.path.join(ROOT, w["run"][0])), w["run"][0]
 
 
@@ -96,12 +97,9 @@ def test_what_people_type_is_opt_in():
     assert "collector.shell" not in workers.PROFILES["balanced"] and "collector.owner" not in workers.PROFILES["balanced"]
 
 
-def test_choosing_turns_on_exactly_what_was_chosen(monkeypatch):
-    calls = {}
-    monkeypatch.setattr(workers, "set_enabled", lambda k, on: calls.__setitem__(k, on) or {"ok": True, "on": on})
+def test_choosing_turns_on_exactly_what_was_chosen():
     assert workers.choose_tracking(["essentials", "projects"])["ok"]
-    assert calls["reminders"] and calls["collector.git"]
-    assert not calls["collector.shell"] and not calls["collector.owner"] and not calls["collector.system"]
+    assert workers.enabled_keys() == {"reminders", "automation", "collector.git", "collector.project"}
 
 
 def test_nothing_ai_runs_without_being_asked():

@@ -24,6 +24,7 @@ _DEFAULTS = {
     "devices": [],              # extra devices the user added: [{label,host,user}]
     "emails": [],               # connected Gmail accounts: [{email,label}] (app pw in Keychain)
     "mcp_servers": [],          # MCP servers: [{name, command, env}]
+    # workers_on (the background workers switched on) is added on first use; see workers._ready.
     "tasks": [],                # user-scheduled recurring tasks: [{id,desc,prompt,schedule,deliver,enabled}]
     # Subagents: Cortex splitting a big job into focused helpers. mode = auto (decided per
     # task) | off | eager (consider splitting every non-trivial request). max_parallel 0 = auto (1 for a local model, up to 3 for cloud).
@@ -37,8 +38,9 @@ _DEFAULTS = {
                "daily_tokens": 2000000, "job_tokens": 500000, "prices": {}},
     # Resource controls. keep_alive = how long the AI model stays in memory after a reply
     # ("0" = free it right away, "-1" = never unload). followups = auto|off|always.
+    # machine = auto (a battery means laptop) | laptop | server: how often background work runs.
     "resources": {"keep_alive": "2m", "followups": "auto", "ai_jobs_only_on_ac": True,
-                  "voice_idle_minutes": 5},
+                  "voice_idle_minutes": 5, "machine": "auto"},
 }
 
 # Nested sections whose missing keys fall back to the defaults above.
@@ -83,11 +85,14 @@ def save(patch: dict) -> dict:
     s = load()
     for k, v in (patch or {}).items():
         if k in ("name", "theme", "voice", "onboarded", "server", "devices",
-                 "emails", "mcp_servers", "tasks", "agents", "resources", "llm", "limits"):
+                 "emails", "mcp_servers", "tasks", "agents", "resources", "llm", "limits",
+                 "workers_on", "workers_tick"):
             s[k] = v
     s.pop("has_avatar", None)
-    with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
+    tmp = f"{SETTINGS_FILE}.{os.getpid()}"      # background jobs read this all day, never half-written
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(s, f, indent=2)
+    os.replace(tmp, SETTINGS_FILE)
     # keep owner.json (persona) + the CLI onboarding flag in sync
     if s.get("name"):
         with open(OWNER_FILE, "w", encoding="utf-8") as f:

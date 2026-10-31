@@ -1,17 +1,19 @@
 """
-power.py — battery / thermal gating for scheduled Cortex jobs.
+power.py — battery / thermal gating for background Cortex work.
 
-In the scheduled (wake-run-exit) model, every launchd job calls should_run()
-at the top to decide whether this invocation is worth the energy. The goal is
-"100% battery friendly": heavy, skippable work (the autonomy LLM session,
-briefing generation) backs off or skips entirely when the Mac is on battery
-and low, asleep-ish, or thermally throttled. Cheap work (reminder checks) can
-pass a low `cost` and run almost always.
+The tick (cortex/core/tick.py) asks here how the machine is powered before it runs
+anything. Heavy, skippable work (the autonomy LLM session, briefing generation) backs
+off or skips entirely when the machine is on battery and low, or thermally throttled.
+Cheap work can pass a low `cost` and run almost always.
 
-Pure standard library + `pmset`/`sysctl`; no installs.
+Pure standard library + `pmset`/`sysctl`; no installs. The battery reading works on
+macOS, Linux and Windows; thermal and memory readings are macOS only.
 """
 from __future__ import annotations
 
+import os
+import sys
+import time
 import subprocess
 import logging
 
@@ -26,15 +28,23 @@ def _run(cmd: list[str], timeout: float = 4.0) -> str:
         return ""
 
 
+_NO_BATTERY = {"on_ac": True, "percent": None, "charging": False, "has_battery": False}
+_SYS_POWER = "/sys/class/power_supply"
+
+
 def battery_state() -> dict:
     """
-    Returns {"on_ac": bool, "percent": int|None, "charging": bool}.
-    Falls back to on_ac=True (desktop/unknown) so we never over-throttle a
-    machine that has no battery.
+    Returns {"on_ac": bool, "percent": int|None, "charging": bool, "has_battery": bool}.
+    Falls back to on_ac=True and no battery (desktop/unknown) so we never over-throttle
+    a machine that has no battery.
     """
+    if sys.platform.startswith("linux"):
+        return _linux_battery()
+    if os.name == "nt":
+        return _windows_battery()
     txt = _run(["pmset", "-g", "batt"])
     if not txt:
-        return {"on_ac": True, "percent": None, "charging": False}
+        return dict(_NO_BATTERY)
     low = txt.lower()
     on_ac = "ac power" in low
     charging = "charging" in low and "discharging" not in low
@@ -46,7 +56,66 @@ def battery_state() -> dict:
             except ValueError:
                 pass
             break
-    return {"on_ac": on_ac, "percent": percent, "charging": charging}
+    return {"on_ac": on_ac, "percent": percent, "charging": charging, "has_battery": "internalbattery" in low}
+
+
+def _read(path: str) -> str:
+    try:
+        with open(path, encoding="utf-8") as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+def _linux_battery() -> dict:
+    out = dict(_NO_BATTERY)
+    try:
+        names = sorted(os.listdir(_SYS_POWER))
+    except OSError:
+        return out
+    for name in names:
+        d = os.path.join(_SYS_POWER, name)
+        # scope=Device is a wireless mouse or headset, not what's powering this machine
+        if _read(f"{d}/type").lower() != "battery" or _read(f"{d}/scope").lower() == "device":
+            continue
+        status = _read(f"{d}/status").lower()
+        out["has_battery"] = True
+        out["on_ac"] = out["on_ac"] and status != "discharging"
+        out["charging"] = out["charging"] or status == "charging"
+        if out["percent"] is None and _read(f"{d}/capacity").isdigit():
+            out["percent"] = int(_read(f"{d}/capacity"))
+    return out
+
+
+def _windows_reading(ac: int, flag: int, percent: int) -> dict:
+    if flag & 128:      # 128 = no system battery, 255 = can't tell
+        return dict(_NO_BATTERY)
+    return {"on_ac": ac != 0, "percent": percent if percent <= 100 else None,
+            "charging": bool(flag & 8), "has_battery": True}
+
+
+def _windows_battery() -> dict:
+    import ctypes
+
+    class Status(ctypes.Structure):     # SYSTEM_POWER_STATUS
+        _fields_ = [("ac", ctypes.c_ubyte), ("flag", ctypes.c_ubyte), ("percent", ctypes.c_ubyte),
+                    ("saver", ctypes.c_ubyte), ("life", ctypes.c_ulong), ("full", ctypes.c_ulong)]
+    s = Status()
+    if not ctypes.windll.kernel32.GetSystemPowerStatus(ctypes.byref(s)):
+        return dict(_NO_BATTERY)
+    return _windows_reading(s.ac, s.flag, s.percent)
+
+
+_paced = {"checked": None, "battery": False}
+
+
+def pace(seconds: float, on_battery: float = 30) -> float:
+    """How long a waiting loop should sleep. Waking the CPU often is what stops it resting,
+    so on battery loops wait longer. The check itself runs at most every 5 minutes."""
+    now = time.monotonic()
+    if _paced["checked"] is None or now - _paced["checked"] > 300:
+        _paced.update(checked=now, battery=not battery_state()["on_ac"])
+    return max(seconds, on_battery) if _paced["battery"] else seconds
 
 
 def thermal_pressure() -> str:
@@ -98,7 +167,7 @@ def is_constrained(snap: dict | None = None) -> tuple[bool, str]:
     return False, "ok"
 
 
-def _ai_jobs_only_on_ac() -> bool:
+def ai_jobs_only_on_ac() -> bool:
     try:
         import cortex.storage.settings_store as settings_store
         return bool(settings_store.section("resources").get("ai_jobs_only_on_ac", True))
@@ -129,7 +198,7 @@ def should_run(cost: str = "heavy", min_battery: int = 30) -> tuple[bool, str]:
 
     if not batt["on_ac"]:
         pct = batt["percent"]
-        if _ai_jobs_only_on_ac():
+        if ai_jobs_only_on_ac():
             return False, f"on battery ({pct}%) — AI jobs only run when plugged in (Settings → Background)"
         if pct is not None and pct < min_battery:
             return False, f"on battery and low ({pct}% < {min_battery}%)"

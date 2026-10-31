@@ -510,6 +510,11 @@ class Database:
 
     # ─── Reminders ───
 
+    def _reminders_changed(self) -> None:
+        """Whatever changes a reminder has to tell the alarm, or it would ring late."""
+        from cortex.core import alarm
+        alarm.sync(self)
+
     def get_pending_reminders(self) -> list:
         """Get reminders that are due (compares against provided local time)."""
         now_local = datetime.now()
@@ -532,23 +537,28 @@ class Database:
                     VALUES (%s, %s, %s)
                     RETURNING id
                 """, (text, due_at, repeat_rule))
-                return cur.fetchone()[0]
+                rid = cur.fetchone()[0]
+        self._reminders_changed()
+        return rid
 
-    def mark_reminder_fired(self, reminder_id: int):
-        """Mark a reminder as fired."""
+    def mark_reminder_fired(self, reminder_id: int) -> bool:
+        """Mark a reminder as fired. False if something else already had."""
         with self.get_conn() as conn:
             with conn.cursor() as cur:
                 cur.execute("""
                     UPDATE reminders SET fired = TRUE, fired_at = NOW()
-                    WHERE id = %s
+                    WHERE id = %s AND fired = FALSE
                 """, (reminder_id,))
+                return cur.rowcount > 0
 
     def delete_reminder(self, reminder_id: int) -> bool:
         """Delete a reminder by ID. Returns True if deleted."""
         with self.get_conn() as conn:
             with conn.cursor() as cur:
                 cur.execute("DELETE FROM reminders WHERE id = %s", (reminder_id,))
-                return cur.rowcount > 0
+                deleted = cur.rowcount > 0
+        self._reminders_changed()
+        return deleted
 
     def update_reminder(self, reminder_id: int, text: str = None,
                         due_at=None, repeat_rule: str = None) -> bool:
@@ -570,7 +580,9 @@ class Database:
         with self.get_conn() as conn:
             with conn.cursor() as cur:
                 cur.execute(f"UPDATE reminders SET {', '.join(updates)} WHERE id = %s", params)
-                return cur.rowcount > 0
+                updated = cur.rowcount > 0
+        self._reminders_changed()
+        return updated
 
     def get_all_reminders(self, include_fired: bool = False) -> list:
         """Get all reminders, optionally including fired ones."""

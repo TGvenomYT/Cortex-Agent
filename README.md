@@ -138,7 +138,7 @@ between turns. The meter under the input shows how full the context is. Cloud mo
 ```
 Cortex Agent/
   run.py            one-command installer + launcher
-  run_once.py       thin shim for scheduled jobs (launchd/cron/schtasks call this)
+  run_once.py       thin shim for background jobs (the OS scheduler and the tick call this)
   uninstall.py      cross-platform uninstaller
   config.yaml       models, timeouts, feature toggles
   cortex/           the application package
@@ -174,6 +174,21 @@ computer's health and your projects are on by default; shell history and machine
 apps, Wi-Fi names, SSH key names) stay off unless you turn them on. Change it any time in Settings →
 Background or with `cx workers`. If you only use cloud models, these stay on your machine, but what's
 relevant to a question goes to that provider with it.
+
+**Background work and battery.** All of it shares one small job, so the machine isn't woken for
+each thing separately. It adapts to the machine, and with nothing switched on the job doesn't exist:
+
+| | Job runs | What runs |
+|---|---|---|
+| Laptop on battery | every 10 min | reminders and alerts only. Collectors, AI jobs and sync wait |
+| Laptop plugged in | every 10 min | collectors about every 30 min, AI jobs hourly |
+| Server or desktop | every minute | everything on its full schedule |
+
+Reminders ring on the second anyway: a small process sleeps until one is about 15 minutes away, and
+nothing runs for it before then. Collectors also catch up whenever you open Cortex or send a
+message, so answers stay current on battery. A morning briefing missed on battery runs once you plug
+in, up to six hours late. A machine with a battery counts as a laptop; to choose yourself, use
+Settings → Background or `cx workers machine <auto|laptop|server>`.
 
 **Your own settings** go in `~/.cortex/config.yaml`, which sits on top of the project's `config.yaml` and
 survives updates. Keep the project's copy free of anything personal, since everyone shares it.

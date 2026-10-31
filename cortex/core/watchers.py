@@ -293,6 +293,7 @@ def run(watch_id: str) -> int:
     """The watcher process itself."""
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s: %(message)s")
     from cortex.util.cortex_bootstrap import load_config, connect_db
+    import cortex.util.power as power
     db = connect_db(load_config())
     w = db.watch_get(watch_id) if db else None
     if not w:
@@ -328,7 +329,7 @@ def run(watch_id: str) -> int:
             if not current or current["status"] != "active":
                 return 0
             db.watch_update(watch_id)
-        time.sleep(interval)
+        time.sleep(power.pace(interval))
 
 
 if __name__ == "__main__":

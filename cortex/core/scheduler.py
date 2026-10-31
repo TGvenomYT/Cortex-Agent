@@ -7,7 +7,8 @@ scheduler.py — put a job in the operating system's own scheduler.
 
 A schedule is {"type":"interval","seconds":N}, {"type":"daily","hour":H,"minute":M} or
 {"type":"weekly","weekday":W,"hour":H,"minute":M} (W: 0 = Sunday). Each job runs one
-command and exits, so nothing stays in the background between runs.
+command and exits, so nothing stays in the background between runs. On macOS an
+interval can add "at_load":True to also run at login.
 """
 from __future__ import annotations
 
@@ -45,10 +46,13 @@ def write_plist(name: str, argv: list, schedule: dict) -> str:
     """Write the launchd job without loading it. -> its path."""
     job = {"Label": f"com.cortex.{name}", "ProgramArguments": argv, "WorkingDirectory": cortex.ROOT,
            "ProcessType": "Background", "LowPriorityIO": True, "Nice": 5,
+           "AbandonProcessGroup": True,     # what it detaches, like the alarm, has to outlive it
            "StandardOutPath": _log(name), "StandardErrorPath": _log(name),
            "EnvironmentVariables": {"PATH": PATH}}
     if schedule["type"] == "interval":
         job["StartInterval"] = schedule["seconds"]
+        if schedule.get("at_load"):
+            job["RunAtLoad"] = True
     else:
         when = {"Hour": schedule["hour"], "Minute": schedule["minute"]}
         if schedule["type"] == "weekly":
@@ -121,6 +125,13 @@ def schtasks_args(name: str, argv: list, schedule: dict) -> list:
     if schedule["type"] == "weekly":
         return base + ["/sc", "WEEKLY", "/d", _DAYS[schedule["weekday"]], "/st", clock]
     return base + ["/sc", "DAILY", "/st", clock]
+
+
+def detach(argv: list, name: str) -> None:
+    """Start something that outlives this process, and the job that started it."""
+    kwargs = {"start_new_session": True} if os.name != "nt" else {"creationflags": 0x00000208}
+    with open(_log(name), "ab") as log:
+        subprocess.Popen(argv, cwd=cortex.ROOT, stdin=subprocess.DEVNULL, stdout=log, stderr=log, **kwargs)
 
 
 # ── the same three operations everywhere ──────────────────────────────────

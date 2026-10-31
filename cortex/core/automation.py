@@ -10,6 +10,7 @@ Examples:
 """
 
 import os
+import shutil
 import threading
 import time
 import json
@@ -27,6 +28,21 @@ logger = logging.getLogger("cortex.automation")
 # model, where the in-memory _fired_recently dict would reset every run and
 # re-fire every rule each tick. Persist it to a small JSON file.
 _COOLDOWN_STATE = os.path.expanduser("~/.cortex/state/automation_cooldowns.json")
+
+
+def measure(metric: str) -> float | None:
+    """A percentage read straight from this machine. The metrics collector needs Prometheus,
+    which a laptop doesn't have, and may not have run lately; a disk alert can't wait on it."""
+    if metric == "host_disk":
+        du = shutil.disk_usage(os.path.expanduser("~"))
+        return (du.total - du.free) / du.total * 100     # du.used misses the data volume on macOS
+    if metric == "host_cpu" and hasattr(os, "getloadavg"):
+        return min(100.0, os.getloadavg()[0] / (os.cpu_count() or 1) * 100)
+    if metric == "host_memory":
+        import cortex.util.power as power
+        free = power.free_memory_pct()
+        return None if free is None else 100.0 - free
+    return None
 
 
 class AutomationEngine:
@@ -134,7 +150,8 @@ class AutomationEngine:
         operator = condition.get("operator", ">")
         threshold = float(condition.get("threshold", 0))
 
-        # Query from context_store
+        # Query from context_store, else measure it here
+        actual = None
         rows = self.db.get_context(categories=["metrics", "system"], max_age_minutes=5)
         for row in rows:
             if row["key"] == metric:
@@ -143,13 +160,18 @@ class AutomationEngine:
                     actual = float(value.get("usage_pct", value.get("pct", 0)))
                 else:
                     actual = float(value)
+                break
+        if actual is None:
+            actual = measure(metric)
+        if actual is None:
+            return False
 
-                if operator == ">" and actual > threshold:
-                    return True
-                elif operator == "<" and actual < threshold:
-                    return True
-                elif operator == ">=" and actual >= threshold:
-                    return True
+        if operator == ">" and actual > threshold:
+            return True
+        elif operator == "<" and actual < threshold:
+            return True
+        elif operator == ">=" and actual >= threshold:
+            return True
         return False
 
     def _check_container(self, condition: dict) -> bool:
