@@ -12,18 +12,31 @@ search, file edits, project runs, reminders — and the warm "brother" persona
 from context_reader. Runs fully offline (local SQLite + local Ollama), so it
 works with Tailscale off.
 
-Safety: whole-system-destructive commands (safety.is_catastrophic) are refused
-outright and surfaced to the user; everything else runs, because the user
-explicitly asked Cortex to complete the job.
+Safety: every action goes through safety.evaluate(). What can't just run is held. With a
+person present the job pauses on approval buttons and carries on from the same point once
+approved; with nobody there (scheduled tasks, agentkit) the action goes to the approvals
+inbox and the job continues without it. Anything read from outside is wrapped as
+untrusted data and marks the turn "tainted", which tightens the gate for the rest of it.
 """
 from __future__ import annotations
 
 import os
+import re
 import json
+import time
 import logging
 from datetime import datetime
 
+from cortex.core import safety
+
 logger = logging.getLogger("cortex.core")
+
+# Someone is at the keyboard to answer an approval prompt.
+HUMAN_SOURCES = {"gui", "cli", "voice", "siri"}
+# Tools whose results contain text written by someone else.
+OUTSIDE_TOOLS = {"search", "browse", "browser", "crawl", "email_check", "email_search", "mcp"}
+_FETCH_CMD = re.compile(r"\b(curl|wget|gh)\b")
+_TURN_BUDGET = 600      # seconds one job may spend in the agent loop
 
 _FINAL_SYNTH = (
     "You just worked on a task for {who}. Here's a log of what you did and found.\n"
@@ -32,6 +45,13 @@ _FINAL_SYNTH = (
     "you, say what and suggest the next move.\n\nWORK LOG:\n{log}\n\n"
     'Respond as JSON: {{"speak": "..."}}'
 )
+
+
+def untrusted(source: str, text: str) -> str:
+    """Mark text as data from outside. The system prompt tells the model never to take
+    instructions from inside these tags; a closing tag in the text can't break out."""
+    clean = (text or "").replace("</untrusted_content", "<\\/untrusted_content")
+    return f'<untrusted_content source="{source}">\n{clean}\n</untrusted_content>'
 
 
 class _TurnRecorder:
@@ -63,6 +83,28 @@ class _TurnRecorder:
         return out + self.media
 
 
+class _Job:
+    """What one job carries through the agent loop. Survives an approval pause (to_dict)."""
+    def __init__(self, text: str, session_id: str, source: str, tainted: bool = False,
+                 work_log: list = None, step: int = 0, chart_shown: bool = False):
+        self.text, self.session_id, self.source = text, session_id, source
+        self.tainted = tainted
+        self.work_log = work_log if work_log is not None else []
+        self.step = step
+        self.chart_shown = chart_shown
+        self.notices: list[str] = []
+        self.llm_failed = False
+        self.exit_code = None
+
+    @property
+    def background(self) -> bool:
+        return self.source not in HUMAN_SOURCES
+
+    def to_dict(self) -> dict:
+        return {"text": self.text, "tainted": self.tainted, "work_log": self.work_log[-20:],
+                "step": self.step, "chart_shown": self.chart_shown}
+
+
 class CortexCore:
     def __init__(self, config: dict = None):
         from cortex.util.cortex_bootstrap import load_config, load_secrets, build_for_autonomy
@@ -77,7 +119,11 @@ class CortexCore:
         self.context_reader = deps["context_reader"]
         self.memory_mgr = deps["memory_mgr"]
         self._owner = self.config.get("owner", {}).get("name", "you")
-        self.max_steps = self.config.get("agent", {}).get("max_steps", 6)
+        agent_cfg = self.config.get("agent", {})
+        self.max_steps = agent_cfg.get("max_steps", 12)
+        self.background_max_steps = agent_cfg.get("background_max_steps", 6)
+        self._grants: dict[str, set] = {}     # session_id -> what "allow in this chat" covers
+        self._last_experience: dict[str, int] = {}
         from cortex.core.subagents import SubagentManager
         self.subagents = SubagentManager(self)
         # MCP: connect to any configured MCP servers (lazy — loaded on first use)
@@ -95,16 +141,22 @@ class CortexCore:
             import cortex.storage.settings_store as settings_store
             s = settings_store.load().get("server", {})
             if s.get("host"):
+                hosts = (self.config.get("remote_hosts") or {}).values()
+                key = next((h.get("key") for h in hosts if h.get("ip") == s["host"] and h.get("key")), None)
+                opt = f"-i {key} " if key else ""
                 return (f"[CONFIGURED SERVER] '{s.get('label','server')}' — host {s['host']}, "
                         f"ssh user {s.get('user','')}. For 'my server'/'the server', use: "
-                        f"ssh -i ~/.ssh/id_ed25519_myserver {s.get('user','')}@{s['host']} \"<cmd>\".")
+                        f"ssh {opt}{s.get('user','')}@{s['host']} \"<cmd>\".")
         except Exception:
             pass
         return None
 
-    def _render_chart(self, code: str) -> str:
+    def _render_chart(self, code: str, approved: bool = False) -> str:
         import uuid
         import cortex.llm.viz as viz
+        if not approved and not viz.check_code(code)[0]:
+            logger.warning("chart code refused: it does more than plot")
+            return None
         art = os.path.expanduser("~/.cortex/artifacts")
         os.makedirs(art, exist_ok=True)
         fn = uuid.uuid4().hex[:12] + ".png"
@@ -139,16 +191,22 @@ class CortexCore:
                 why = f"the provider returned an error ({code})"
             return f"The model provider said no: {why}." + (f"\n\n> {detail}" if detail else "")
         if isinstance(e, (httpx.ConnectError, httpx.ConnectTimeout)):
-            return ("I can't reach a model. For the local engine, install & run Ollama "
-                    "(then `ollama pull gemma3:12b`); or add a cloud API key under "
-                    "**Settings → AI Providers** and pick that model from the selector top-left.")
+            return ("I can't reach a model. Either start Ollama on this computer, or add an "
+                    "**Ollama Cloud** key (or any other provider) under **Settings → AI Providers** "
+                    "and pick that model from the selector top-left.")
         return f"I hit an error talking to the model: {str(e)[:200]}"
 
-    _CHART_WORDS = ("graph", "plot", "chart", "draw", "visuali", "diagram", "curve", "histogram")
+    _CHART_ASK = re.compile(r"\b(plot|graph|chart|draw|sketch|visuali[sz]e|histogram|diagram)\b", re.I)
+    _NOT_CHART = re.compile(r"\b(the|this|that|movie|film|book|story|main|whole)\s+plot\b(?!\s+(for|showing))"
+                            r"|\bplot\s+(twist|summary|hole|line)s?\b|\bdraw\s+(on|from|up|attention|conclusions?)\b",
+                            re.I)
+    _CLAIMS_CHART = re.compile(r"\b(here'?s|here is|below is|see) (the|a|your) (graph|plot|chart|diagram)\b"
+                               r"|\b(graph|plot|chart) (below|above)\b|\bi('ve| have) (plotted|drawn|graphed|charted)\b",
+                               re.I)
 
     def _wants_chart(self, text: str) -> bool:
-        t = (text or "").lower()
-        return any(w in t for w in self._CHART_WORDS)
+        t = text or ""
+        return bool(self._CHART_ASK.search(t)) and not self._NOT_CHART.search(t)
 
     def _chart_code_for(self, text: str) -> str:
         """Ask the model for ONLY matplotlib code — the reliable fallback for when
@@ -164,7 +222,6 @@ class CortexCore:
         try:
             raw = (self.llm.complete([{"role": "user", "content": prompt}]) or "").strip()
             if "```" in raw:
-                import re
                 m = re.search(r"```(?:python)?\s*(.*?)```", raw, re.S)
                 if m:
                     raw = m.group(1).strip()
@@ -194,8 +251,8 @@ class CortexCore:
             hits = rag.retrieve(self.db, query, k=6)
             hits = [h for h in hits if (h.get("similarity") or 0) >= 0.4]
             if hits:
-                return ("[FROM THE USER'S UPLOADED FILES — use/cite when relevant]\n" +
-                        "\n---\n".join(f"({h['source']}) {h['chunk']}" for h in hits))
+                return ("[FROM THE USER'S UPLOADED FILES — use/cite when relevant]\n" + untrusted(
+                    "uploaded_files", "\n---\n".join(f"({h['source']}) {h['chunk']}" for h in hits)))
         except Exception as e:
             logger.info(f"rag retrieve: {e}")
         return None
@@ -213,10 +270,24 @@ class CortexCore:
             tools = [t for t in tools if (t.get("function") or {}).get("name") != "delegate"]
         return tools + extra
 
+    def _obs_limit(self) -> int:
+        """How much of a tool's output to show the model. A cloud model has room for far
+        more than a small local one, which starts dropping its instructions when flooded."""
+        local = getattr(self.llm, "is_local", lambda: True)()
+        return 3000 if local else 10000
+
     # ── public: non-streaming (consumes the stream) ────────────────────────
     def ask(self, text: str, session_id: str = "cli", source: str = "cli") -> dict:
         final = {"action": "answer", "speak": "All done.", "steps": 0}
         for ev in self.ask_stream(text, session_id=session_id, source=source):
+            if ev.get("type") == "final":
+                final = ev["action"]
+        return final
+
+    def resolve(self, session_id: str, pending_id: int, decision: str, source: str = "cli") -> dict:
+        """Answer an approval prompt without streaming (the terminal uses this)."""
+        final = {"action": "answer", "speak": "Nothing was waiting for an answer.", "steps": 0}
+        for ev in self.resolve_stream(session_id, pending_id, decision, source):
             if ev.get("type") == "final":
                 final = ev["action"]
         return final
@@ -231,19 +302,17 @@ class CortexCore:
                 return
             except Exception as e:
                 logger.warning(f"couldn't save {role} turn (attempt {attempt}): {e}")
-                import time as _t
-                _t.sleep(0.4)
+                time.sleep(0.4)
 
-    # ── public: streaming — yields live events so a UI/CLI can show thinking ─
-    def ask_stream(self, text: str, session_id: str = "cli", source: str = "cli"):
-        """Same event stream as _ask_stream, plus crash-proof persistence: the user's message
-        is stored the instant it arrives (a refresh or crash mid-reply can't lose it), and the
-        reply is stored — with its trace/charts — however the turn ends."""
-        self._save_turn(session_id, "user", text)
+    def _persisted(self, session_id: str, user_text: str, events):
+        """Same event stream as `events`, plus crash-proof persistence: the user's message
+        is stored the instant it arrives (a refresh or crash mid-reply can't lose it), and
+        the reply is stored — with its trace/charts — however the turn ends."""
+        self._save_turn(session_id, "user", user_text)
         rec = _TurnRecorder()
         failure = None
         try:
-            for ev in self._ask_stream(text, session_id, source):
+            for ev in events:
                 rec.feed(ev)
                 yield ev
         except GeneratorExit:
@@ -258,60 +327,70 @@ class CortexCore:
             elif failure is not None:
                 self._save_turn(session_id, "assistant", f"Something went wrong: {str(failure)[:200]}")
 
-    def _ask_stream(self, text: str, session_id: str = "cli", source: str = "cli"):
-        """
-        Generator of events as Cortex works:
+    # ── public: streaming — yields live events so a UI/CLI can show thinking ─
+    def ask_stream(self, text: str, session_id: str = "cli", source: str = "cli"):
+        """Generator of events as Cortex works:
           {"type":"thinking","text":...}      model reasoning before a step
+          {"type":"delta","text":...}         a piece of the reply as the model writes it
           {"type":"tool","name":...,"detail":...}  a tool is about to run
           {"type":"observation","text":...}   what the tool returned (short)
-          {"type":"answer","text":...}         the final plain-language reply
-          {"type":"final","action":{...}}      full action dict (for ask())
+          {"type":"answer","text":...}        the final plain-language reply
+          {"type":"approval","id":...,"text":...,"can_always":bool}  waiting for the user
+          {"type":"final","action":{...}}     full action dict (for ask())
         """
-        from cortex.llm.tools import tool_call_to_action_data
-        from cortex.core.safety import needs_confirmation
-        tools_list = self._tools()
+        return self._persisted(session_id, text, self._ask_stream(text, session_id, source))
 
-        # A previous turn left a draft (e.g. an email) awaiting this session's
-        # explicit yes/no. Resolve it in code — deterministically, not by
-        # handing it back to the LLM to re-decide — before anything else.
-        pending = None
-        try:
+    _DECISION_LABEL = {"approve": "Yes, do it", "approve_session": "Yes, and allow this for the rest of the chat",
+                       "reject": "No, cancel"}
+
+    def resolve_stream(self, session_id: str, pending_id: int, decision: str, source: str = "gui"):
+        """The user pressed an approval button. Matched by id, so it can only ever answer the
+        prompt it was shown on, and no typed text is involved."""
+        label = self._DECISION_LABEL.get(decision)
+        if not label:
+            raise ValueError(f"unknown decision {decision!r}")
+
+        def events():
             pending = self.db.get_pending_action(session_id)
-        except Exception as e:
-            logger.debug(f"pending-action lookup failed: {e}")
-        if pending:
-            verdict = self._classify_confirmation(text)
-            if verdict in ("yes", "no"):
-                self.db.clear_pending_action(session_id)
-                if verdict == "yes":
-                    yield {"type": "tool", "name": pending["kind"], "detail": "confirmed by you"}
-                    obs = self._execute_tool(pending["payload"], source)
-                    final_speak = obs
-                else:
-                    obs = "cancelled by the user before it ran"
-                    final_speak = "Okay — cancelled, didn't do that."
-                last_action = {**pending["payload"], "speak": final_speak, "steps": 1}
-                self._finish(session_id, text, last_action)
-                yield {"type": "observation", "text": obs[:400]}
-                yield {"type": "answer", "text": final_speak}
-                yield {"type": "final", "action": last_action}
+            if not pending or pending.get("id") != pending_id:
+                msg = "That request has already been handled or has expired — ask me again if you still want it."
+                yield {"type": "answer", "text": msg}
+                yield {"type": "final", "action": {"action": "answer", "speak": msg, "steps": 0}}
                 return
-            # anything else: the user moved on — drop the stale draft (it was
-            # never sent/run) and handle `text` as a normal new message below.
-            self.db.clear_pending_action(session_id)
+            yield from self._resume(pending, decision, session_id, source)
+        return self._persisted(session_id, label, events())
+
+    def _ask_stream(self, text: str, session_id: str = "cli", source: str = "cli"):
+        # A previous turn left something awaiting this session's yes/no. Typed answers are
+        # only honoured from a person: a scheduled prompt must never approve its own run.
+        if source in HUMAN_SOURCES:
+            pending = None
+            try:
+                pending = self.db.get_pending_action(session_id)
+            except Exception as e:
+                logger.debug(f"pending-action lookup failed: {e}")
+            if pending:
+                verdict = self._classify_confirmation(text)
+                if verdict in ("yes", "no"):
+                    decision = "approve" if verdict == "yes" else "reject"
+                    yield from self._resume(pending, decision, session_id, source)
+                    return
+                # anything else: the user moved on — drop the stale draft (it was never
+                # sent/run) and handle `text` as a normal new message below.
+                self.db.clear_pending_action(session_id)
 
         yield {"type": "status", "text": "thinking…"}
         try:
             memory_str = self.memory_mgr.format_for_prompt(limit=15)
         except Exception:
             memory_str = None
-        extra = "\n\n".join(x for x in [self._server_context(), self._rag_context(text)] if x) or None
+        rag = self._rag_context(text)
+        extra = "\n\n".join(x for x in [self._server_context(), rag] if x) or None
         messages = self.context_reader.build_messages(
             user_text=text, session_id=session_id, memory_str=memory_str, source=source,
             extra_context=extra,
         )
-
-        work_log: list[str] = []
+        job = _Job(text, session_id, source, tainted=bool(rag))
 
         # Should this job be split across helper agents? Decided per task — a cheap
         # signal check first, a planner call only if the task looks multi-part.
@@ -335,38 +414,71 @@ class CortexCore:
                     yield ev
             messages.append({"role": "user",
                              "content": self.subagents.format_findings(subs, results or [], text)})
-            for st, r in zip(subs, results or []):
-                work_log.append(f"[helper: {st['title']}] {(r or {}).get('summary', '')}")
+            self._absorb_helpers(job, subs, results)
 
-        last_action = {"action": "answer"}
-        final_speak = None
-        asked, ask_options = False, []
-        chart_shown = False
+        yield from self._agent_loop(messages, job)
 
-        for step in range(1, self.max_steps + 1):
+    @staticmethod
+    def _absorb_helpers(job: _Job, subs: list, results: list) -> None:
+        for st, r in zip(subs, results or []):
+            job.work_log.append(f"[helper: {st['title']}] {(r or {}).get('summary', '')}")
+            job.tainted = job.tainted or bool((r or {}).get("tainted"))
+
+    def _model_step(self, messages: list, tools: list):
+        """One model call as ('delta', text)* then ('done', result)."""
+        stream = getattr(self.llm, "stream_with_tools", None)
+        if stream is None:
+            yield "done", self.llm.complete_with_tools(messages, tools=tools)
+        else:
+            yield from stream(messages, tools)
+
+    def _agent_loop(self, messages: list, job: _Job):
+        from cortex.llm.tools import tool_call_to_action_data, rescue_tool_calls
+        tools_list = self._tools()
+        known = {(t.get("function") or {}).get("name") for t in tools_list}
+        limit = self.background_max_steps if job.background else self.max_steps
+        deadline = time.time() + _TURN_BUDGET
+        mode = safety.current_mode()
+        grants = self._grants.get(job.session_id, set())
+        last_action, final_speak, held = {"action": "answer"}, None, None
+        ask_options, asked = [], False
+        retried_empty = False
+
+        while job.step < limit and time.time() < deadline and not held and not asked:
+            job.step += 1
+            result = None
             try:
-                result = self.llm.complete_with_tools(messages, tools=tools_list)
+                for kind, payload in self._model_step(messages, tools_list):
+                    if kind == "delta":
+                        yield {"type": "delta", "text": payload}
+                    else:
+                        result = payload
             except Exception as e:
                 logger.error(f"LLM unavailable: {e}")
                 final_speak = self._llm_error_message(e)
+                job.llm_failed = True
                 break
 
+            result = rescue_tool_calls(result or {}, known)
             think = (result.get("thinking") or result.get("content") or "").strip()
             tool_calls = result.get("tool_calls") or []
 
             if not tool_calls:
-                final_speak = result.get("content") or "All done."
+                final_speak = (result.get("content") or "").strip()
+                if not final_speak and not retried_empty:     # some models stop on an empty turn
+                    retried_empty = True
+                    messages.append({"role": "user", "content": "Please continue — finish the job or answer me."})
+                    continue
+                final_speak = final_speak or None
                 break
 
             if think:
                 yield {"type": "thinking", "text": think[:600]}
 
-            messages.append({"role": "assistant",
-                             "content": result.get("content", "") or "",
+            messages.append({"role": "assistant", "content": result.get("content", "") or "",
                              "tool_calls": tool_calls})
 
-            stop = False
-            for tc in tool_calls:
+            for i, tc in enumerate(tool_calls):
                 _tcid = tc.get("id") or ""   # OpenAI/Anthropic need tool results to reference this
                 _nm = (tc.get("function") or {}).get("name", "")
                 if _nm.startswith("mcp__"):
@@ -375,118 +487,327 @@ class CortexCore:
                 else:
                     action = tool_call_to_action_data(tc)
                 last_action = action
-                need_confirm, confirm_msg = needs_confirmation(action)
-                if need_confirm:   # outward-facing/irreversible — hold for an explicit yes
-                    self.db.save_pending_action(session_id, action.get("action", ""), action, confirm_msg)
-                    final_speak = confirm_msg
-                    ask_options = ["Yes, do it", "No, cancel"]
-                    asked = stop = True
-                    break
+
+                def reply(content):
+                    messages.append({"role": "tool", "tool_call_id": _tcid, "tool_name": _nm, "content": content})
+
                 if action.get("action") == "ask":   # the model needs the user to decide
+                    if job.background:
+                        reply("Nobody is here to answer. Decide yourself or say what you need in your reply.")
+                        continue
                     final_speak = action.get("question") or "Quick question —"
                     ask_options = action.get("options") or []
-                    asked = stop = True
+                    asked = True
+                    reply("asked the user; their answer comes as the next message")
+                    for later in tool_calls[i + 1:]:
+                        messages.append({"role": "tool", "tool_call_id": later.get("id") or "",
+                                         "tool_name": (later.get("function") or {}).get("name", ""),
+                                         "content": "skipped — waiting for the user"})
                     break
-                if action.get("action") == "chart":  # render a plot inline
-                    src = self._render_chart(action.get("code", ""))
-                    if src:
-                        chart_shown = True
-                        yield {"type": "image", "src": src, "caption": action.get("caption", "")}
-                    obs = "chart rendered and shown to the user" if src else "chart render failed"
-                    work_log.append(f"[chart] {obs}")
-                    messages.append({"role": "tool", "tool_call_id": _tcid, "content": obs})
-                    continue
-                if action.get("action") == "image_search":  # web images inline
-                    items = self._image_search(action.get("query", ""))
-                    if items:
-                        yield {"type": "images", "items": items[:8], "query": action.get("query", "")}
-                    obs = (f"showed {len(items)} web images for '{action.get('query')}'"
-                           if items else "no images found")
-                    work_log.append(f"[image_search] {obs}")
-                    messages.append({"role": "tool", "tool_call_id": _tcid, "content": obs})
-                    continue
-                if action.get("action") == "delegate":   # the model asked for helpers itself
-                    verdict = self.subagents.assess_tool_call(text, action.get("subtasks"))
-                    if not verdict["delegate"]:
-                        obs = verdict["reason"]
-                        yield {"type": "note", "text": f"Not splitting: {verdict['reason']}"}
-                    else:
-                        subs, results = verdict["subtasks"], None
-                        yield {"type": "note", "text": f"Splitting into {len(subs)} helpers"}
-                        for ev in self.subagents.run_stream(subs, text, source, verdict["parallel"]):
-                            if ev.get("type") == "_results":
-                                results = ev["results"]
-                            else:
-                                yield ev
-                        obs = self.subagents.format_findings(subs, results or [], text)
-                        for st, r in zip(subs, results or []):
-                            work_log.append(f"[helper: {st['title']}] {(r or {}).get('summary', '')}")
-                    messages.append({"role": "tool", "tool_call_id": _tcid, "content": obs[:6000]})
-                    continue
-                yield {"type": "tool", "name": action.get("action", "?"),
-                       "detail": self._tool_detail(action)}
-                obs = self._execute_tool(action, source)
-                work_log.append(f"[{action.get('action')}] {obs}")
-                yield {"type": "observation", "text": obs[:400]}
-                messages.append({"role": "tool", "tool_call_id": _tcid, "content": obs[:3000]})
-            if stop:
-                break
-        else:
-            final_speak = None
 
+                verdict = safety.evaluate(action, tainted=job.tainted, background=job.background, grants=grants,
+                                          mode=mode, mcp_readonly=self._mcp_readonly(action))
+                if verdict.kind == safety.BLOCK:
+                    logger.warning(f"refused: {action.get('action')} {verdict.message}")
+                    yield {"type": "note", "text": verdict.message}
+                    job.work_log.append(f"[refused] {verdict.message}")
+                    reply(f"REFUSED — {verdict.message} Don't try to work around this; tell the user.")
+                    continue
+                if verdict.kind == safety.ASK:
+                    if job.background:
+                        pid = self._queue_for_approval(action, verdict.message, job)
+                        job.work_log.append(f"[held for approval #{pid}] {action.get('action')}")
+                        yield {"type": "note", "text": "Waiting for your OK in the approvals inbox."}
+                        reply("NOT RUN — this needs the user's approval and they aren't here. It's in their "
+                              "approvals inbox. Carry on without it and mention that it's waiting.")
+                        continue
+                    for later in tool_calls[i + 1:]:
+                        messages.append({"role": "tool", "tool_call_id": later.get("id") or "",
+                                         "tool_name": (later.get("function") or {}).get("name", ""),
+                                         "content": "skipped — an earlier step is waiting for the user's "
+                                                    "approval. Do this again if it's still needed."})
+                    held = (action, verdict, _tcid, _nm)
+                    final_speak = verdict.message
+                    break
+
+                obs = yield from self._perform(action, job)
+                reply(obs)
+
+        if held:
+            action, verdict, tcid, name = held
+            pid = self.db.save_pending_action(
+                job.session_id, action.get("action", ""),
+                {**action, "_resume": {"messages": messages, "tool_call_id": tcid, "tool_name": name,
+                                       "job": job.to_dict(), "grant": verdict.grant}},
+                final_speak)
+            approval = {"id": pid, "text": final_speak, "can_always": bool(verdict.grant),
+                        "scope": verdict.grant}
+            last_action = {**action, "speak": final_speak, "action": action.get("action", "answer"),
+                           "steps": len(job.work_log), "approval": approval}
+            self._finish(job.session_id, job.text, last_action)
+            yield {"type": "answer", "text": final_speak}
+            yield {"type": "approval", **approval}
+            yield {"type": "final", "action": last_action}
+            return
+
+        yield from self._finish_turn(job, last_action, final_speak, asked, ask_options)
+
+    def _finish_turn(self, job: _Job, last_action: dict, final_speak, asked: bool, ask_options: list):
         # Guaranteed-chart fallback: the user asked for a plot but the model never
         # produced one (it narrated "here's the graph" without calling make_chart —
         # common on weaker/cloud tool-callers). Generate the code directly and render
-        # it, and NEVER let the reply claim a graph that doesn't exist.
-        if not asked and self._wants_chart(text) and not chart_shown:
+        # it, and NEVER let the reply claim a graph that doesn't exist. A good answer
+        # that makes no such claim is left alone if the chart can't be made.
+        if not asked and not job.background and not job.llm_failed and not job.chart_shown \
+                and self._wants_chart(job.text):
             yield {"type": "status", "text": "rendering the chart…"}
-            code = self._chart_code_for(text)
+            code = self._chart_code_for(job.text)
             src = self._render_chart(code) if code else None
             if src:
-                chart_shown = True
+                job.chart_shown = True
                 yield {"type": "image", "src": src, "caption": ""}
-                if not final_speak or "graph" in (final_speak or "").lower() or \
-                        "plot" in (final_speak or "").lower() or "chart" in (final_speak or "").lower():
-                    final_speak = final_speak or "Here's the graph."
+                final_speak = final_speak or "Here's the graph."
                 last_action = {"action": "chart"}
-            else:
+            elif not final_speak or self._CLAIMS_CHART.search(final_speak):
                 final_speak = ("I couldn't render that plot — the code my model produced didn't "
                                "run. Tell me the exact equation or range and I'll try again.")
 
         if final_speak is None:
             yield {"type": "status", "text": "wrapping up…"}
-            final_speak = self._final_summary(work_log)
+            final_speak = self._final_summary(job.work_log)
+        if job.notices:
+            final_speak += "\n\n" + "\n\n".join(job.notices)
 
         last_action["speak"] = final_speak
         last_action.setdefault("action", "answer")
-        last_action["steps"] = len(work_log)
-        self._finish(session_id, text, last_action)
+        last_action["steps"] = len(job.work_log)
+        if job.llm_failed:
+            last_action["error"] = True
+        self._finish(job.session_id, job.text, last_action, exit_code=job.exit_code, learn=not job.background)
         yield {"type": "answer", "text": final_speak}
         if asked:
             yield {"type": "ask", "options": ask_options}
-        elif source == "gui" and self._want_followups(final_speak):
-            fu = self._followups(text, final_speak)
+        elif job.source == "gui" and not job.llm_failed and self._want_followups(final_speak):
+            fu = self._followups(job.text, final_speak)
             if fu:
                 yield {"type": "followups", "items": fu}
         yield {"type": "final", "action": last_action}
 
-    _YES_PREFIXES = ("yes", "yeah", "yep", "yup", "send it", "send", "go ahead",
-                     "confirm", "do it", "sure", "ok", "okay", "please send", "approved")
-    _NO_PREFIXES = ("no", "nope", "nah", "cancel", "don't", "dont", "stop",
-                    "wait", "never mind", "nevermind", "hold off", "not yet")
+    def _mcp_readonly(self, action: dict) -> bool:
+        if action.get("action") != "mcp" or not self.mcp:
+            return False
+        try:
+            return self.mcp.is_readonly(action.get("mcp_name", ""))
+        except Exception:
+            return False
+
+    def _perform(self, action: dict, job: _Job, approved: bool = False):
+        """Run one allowed action, yielding its live events; returns what the model sees."""
+        kind = action.get("action")
+        if kind == "chart":  # render a plot inline
+            src = self._render_chart(action.get("code", ""), approved=approved)
+            if src:
+                job.chart_shown = True
+                yield {"type": "image", "src": src, "caption": action.get("caption", "")}
+            obs = "chart rendered and shown to the user" if src else "chart render failed"
+            job.work_log.append(f"[chart] {obs}")
+            return obs
+        if kind == "image_search":  # web images inline
+            items = self._image_search(action.get("query", ""))
+            if items:
+                yield {"type": "images", "items": items[:8], "query": action.get("query", "")}
+            obs = (f"showed {len(items)} web images for '{action.get('query')}'"
+                   if items else "no images found")
+            job.work_log.append(f"[image_search] {obs}")
+            return obs
+        if kind == "delegate":   # the model asked for helpers itself
+            verdict = self.subagents.assess_tool_call(job.text, action.get("subtasks"))
+            if not verdict["delegate"]:
+                yield {"type": "note", "text": f"Not splitting: {verdict['reason']}"}
+                return verdict["reason"]
+            subs, results = verdict["subtasks"], None
+            yield {"type": "note", "text": f"Splitting into {len(subs)} helpers"}
+            for ev in self.subagents.run_stream(subs, job.text, job.source, verdict["parallel"]):
+                if ev.get("type") == "_results":
+                    results = ev["results"]
+                else:
+                    yield ev
+            self._absorb_helpers(job, subs, results)
+            return self.subagents.format_findings(subs, results or [], job.text)[:6000]
+
+        yield {"type": "tool", "name": kind or "?", "detail": self._tool_detail(action)}
+        obs, outside = self.observe(action, job.source)
+        job.tainted = job.tainted or outside
+        job.work_log.append(f"[{kind}] {obs}")
+        if kind in ("execute", "devops", "run_project"):
+            m = re.search(r"-> exit (-?\d+)", obs)
+            job.exit_code = int(m.group(1)) if m else job.exit_code
+        if kind == "remind" and (action.get("reminder") or {}).get("op", "create") == "create" \
+                and not self._reminders_running():
+            job.notices.append("Heads up: reminders are switched off in Settings → Background, so this "
+                               "one won't fire until you turn them on.")
+        yield {"type": "observation", "text": obs[:400]}
+        wire = obs[:self._obs_limit()]
+        return untrusted(kind, wire) if outside else wire
+
+    def observe(self, action: dict, source: str) -> tuple[str, bool]:
+        """Run a tool. -> (result, whether that result contains outside content)."""
+        kind = action.get("action")
+        obs = self._execute_tool(action, source)
+        outside = kind in OUTSIDE_TOOLS or (kind in ("execute", "devops")
+                                            and bool(_FETCH_CMD.search(action.get("command") or "")))
+        return obs, outside
+
+    @staticmethod
+    def _reminders_running() -> bool:
+        try:
+            import cortex.core.workers as workers
+            return workers.is_on("reminders")
+        except Exception:
+            return True
+
+    # ── approvals ─────────────────────────────────────────────────────────
+    def _resume(self, pending: dict, decision: str, session_id: str, source: str):
+        """The user answered a held action. Either way the job carries on from where it paused."""
+        payload = dict(pending["payload"])
+        resume = payload.pop("_resume", None) or {}
+        self.db.clear_pending_action(session_id)
+        approved = decision != "reject"
+        exp = self._last_experience.get(session_id)
+        if exp:
+            try:
+                self.db.update_experience_outcome(exp, was_confirmed=approved)
+            except Exception as e:
+                logger.debug(f"outcome not recorded: {e}")
+
+        saved = resume.get("job") or {}
+        job = _Job(saved.get("text", ""), session_id, source, tainted=saved.get("tainted", False),
+                   work_log=saved.get("work_log"), step=saved.get("step", 0),
+                   chart_shown=saved.get("chart_shown", False))
+        messages = resume.get("messages")
+
+        if approved and decision == "approve_session" and resume.get("grant"):
+            self._grants.setdefault(session_id, set()).add(resume["grant"])
+
+        if not approved:
+            obs = "cancelled by the user before it ran"
+            job.work_log.append(f"[{payload.get('action')}] {obs}")
+            if not messages:
+                final = "Okay — cancelled, didn't do that."
+                yield {"type": "answer", "text": final}
+                yield {"type": "final", "action": {**payload, "speak": final, "steps": 1}}
+                return
+        else:
+            # Approval never overrides a hard refusal, however the prompt got here.
+            verdict = safety.evaluate(payload, background=False, mode="balanced", grants=set())
+            if verdict.kind == safety.BLOCK:
+                yield {"type": "answer", "text": verdict.message}
+                yield {"type": "final", "action": {**payload, "speak": verdict.message, "steps": 0}}
+                return
+            yield {"type": "status", "text": "on it…"}
+            obs = yield from self._perform(payload, job, approved=True)
+
+        if not messages:    # an old draft with nothing to resume
+            yield {"type": "answer", "text": obs}
+            yield {"type": "final", "action": {**payload, "speak": obs, "steps": 1}}
+            return
+        messages.append({"role": "tool", "tool_call_id": resume.get("tool_call_id") or "",
+                         "tool_name": resume.get("tool_name") or "", "content": obs})
+        yield from self._agent_loop(messages, job)
+
+    def _queue_for_approval(self, action: dict, message: str, job: _Job) -> int:
+        """Nobody's here: put the action in the approvals inbox. An identical one already
+        waiting isn't queued twice, so a repeating job can't flood the inbox."""
+        existing = self.db.find_open_proposal(action)
+        if existing:
+            return existing
+        pid = self.db.log_autonomy_cycle(think=f"[{job.source}] {job.text[:200]}", decision="proposed",
+                                         action_payload=action, needs_confirmation=True)
+        try:
+            self.db.add_nudge("Needs your OK", (message or "")[:600], kind="warn", source="approval")
+        except Exception as e:
+            logger.debug(f"approval nudge skipped: {e}")
+        return pid
+
+    def list_approvals(self) -> list[dict]:
+        """What's waiting in the inbox (scheduled tasks + autonomy)."""
+        out = []
+        for p in self.db.get_open_proposals():
+            action = self._normalize_proposal(p.get("action_payload"))
+            if action is None:
+                continue
+            v = safety.evaluate(action)
+            out.append({"id": p["id"], "think": (p.get("think") or "")[:200], "when": str(p.get("cycle_at")),
+                        "text": v.message or f"Run {action.get('action')}?", "kind": action.get("action")})
+        return out
+
+    @staticmethod
+    def _normalize_proposal(payload) -> dict | None:
+        """Autonomy stores {kind: shell|tool, …}; tasks store a normal action."""
+        if isinstance(payload, str):
+            try:
+                payload = json.loads(payload)
+            except ValueError:
+                return None
+        if not isinstance(payload, dict):
+            return None
+        kind = payload.get("kind")
+        if kind == "shell":
+            return {"action": "execute", "command": payload.get("command", "")}
+        if kind == "tool":
+            return {"action": "agentkit", "tool": payload.get("tool"), "args": payload.get("args") or {}}
+        return payload if payload.get("action") else None
+
+    def resolve_approval(self, proposal_id: int, approve: bool) -> dict:
+        """Approve or reject one inbox item. -> {ok, message}"""
+        p = self.db.get_pending_proposal(proposal_id)
+        if not p:
+            return {"ok": False, "message": "That one was already handled."}
+        action = self._normalize_proposal(p.get("action_payload"))
+        if not approve or action is None:
+            self.db.resolve_proposal(proposal_id, False)
+            return {"ok": True, "message": "Okay, dropped it."}
+        if safety.evaluate(action).kind == safety.BLOCK:
+            self.db.resolve_proposal(proposal_id, False)
+            return {"ok": False, "message": safety.evaluate(action).message}
+        if action.get("action") == "agentkit":
+            from cortex.core.autonomy_session import _load_agentkit
+            registry, names = _load_agentkit()
+            if not registry or action.get("tool") not in names:
+                self.db.resolve_proposal(proposal_id, False)
+                return {"ok": False, "message": f"I can't reach the tool {action.get('tool')}."}
+            obs = json.dumps(registry.call(action["tool"], action.get("args") or {}), default=str)[:1500]
+        else:
+            obs = self._execute_tool(action, "approval")
+        self.db.resolve_proposal(proposal_id, True, exit_code=0)
+        return {"ok": True, "message": obs}
+
+    # Whole-message answers only. "ok what does that do?", "okay don't send it" and "send it
+    # to bob instead" are NOT approvals, and this is deliberately not a prefix match: what
+    # runs must not hinge on the first word of a sentence. The buttons don't go through here.
+    _YES_REPLIES = {"yes", "y", "yeah", "yep", "yup", "ya", "sure", "ok", "okay", "k", "go", "go ahead", "proceed",
+                    "confirm", "confirmed", "approve", "approved", "do it", "run", "run it", "send", "send it",
+                    "yes do it", "yes please", "yes go ahead", "yes run it", "yes send it", "ok do it",
+                    "okay do it", "ok go ahead", "okay go ahead", "ok send it", "ok run it", "please do",
+                    "please send", "please send it", "just do it", "just run it", "just send it", "sounds good",
+                    "go for it", "yes proceed"}
+    _NO_REPLIES = {"no", "n", "nope", "nah", "cancel", "stop", "dont", "do not", "wait", "no cancel",
+                   "no thanks", "no dont", "never mind", "nevermind", "hold off", "hold on", "not yet",
+                   "abort", "dont do it", "dont send it", "dont run it"}
 
     @classmethod
     def _classify_confirmation(cls, text: str) -> str:
         """
-        yes | no | unclear — a deterministic keyword check, not an LLM call.
-        Whether a drafted email actually sends must not depend on the model's
-        mood; it depends on what the user typed.
+        yes | no | unclear — a deterministic check, not an LLM call. Whether a drafted
+        email actually sends must not depend on the model's mood; it depends on what the
+        user typed, and only an unambiguous whole-message answer counts.
         """
-        t = (text or "").strip().lower().strip(".!? ")
-        if any(t == p or t.startswith(p + " ") for p in cls._YES_PREFIXES):
-            return "yes"
-        if any(t == p or t.startswith(p + " ") for p in cls._NO_PREFIXES):
+        t = re.sub(r"[^a-z0-9 ]+", "", (text or "").lower().replace(",", " "))
+        t = " ".join(t.split())
+        if t in cls._NO_REPLIES:
             return "no"
+        if t in cls._YES_REPLIES:
+            return "yes"
         return "unclear"
 
     @staticmethod
@@ -556,6 +877,8 @@ class CortexCore:
             return action.get("caption", "") or "plot"
         if kind == "image_search":
             return action.get("query", "")
+        if kind == "run_project":
+            return f"{action.get('run_project_command', '')} in {action.get('run_project_path', '')}"
         return ""
 
     # ── unified tool executor: every action -> one observation string ──────
@@ -583,9 +906,9 @@ class CortexCore:
             if kind == "edit":
                 return self._run_edit(action)
             if kind == "run_project":
-                return self._run_shell(
-                    f"cd {action.get('run_project_path','.')} && "
-                    f"{action.get('run_project_command','')}", source)
+                import cortex.core.projects as projects
+                return projects.run(action.get("run_project_path", "."),
+                                    action.get("run_project_command", ""), self.executor)
             if kind == "mcp":
                 return self.mcp.call(action.get("mcp_name", ""), action.get("mcp_args") or {}) if self.mcp else "MCP not available"
             if kind == "email_check":
@@ -612,19 +935,23 @@ class CortexCore:
             return f"that step hit an error: {e}"
 
     def _run_shell(self, command: str, source: str) -> str:
-        from cortex.core.safety import is_catastrophic
         if not command:
             return "no command given"
-        bad, why = is_catastrophic(command)
+        bad, why = safety.is_catastrophic(command)
         if bad:
             logger.warning(f"refused catastrophic command: {command}")
             return f"REFUSED — {why}"
-        res = self.executor.execute(command=command, source="cortex-core")
+        res = self.executor.execute(command=command, source="cortex-core", timeout=180)
         code = res.get("exit_code")
+        room = self._obs_limit()
         out = (res.get("output") or res.get("stdout") or "").strip()
         err = (res.get("stderr") or "").strip()
-        tail = out[-1500:] if out else (err[-800:] if err else "(no output)")
-        return f"ran `{command}` -> exit {code}; {tail}"
+        parts = []
+        if out:
+            parts.append(out[-room:])
+        if err:
+            parts.append("stderr: " + err[-(room // 3):])
+        return f"ran `{command}` -> exit {code}; " + ("\n".join(parts) or "(no output)")
 
     def _run_browse(self, action: dict) -> str:
         from cortex.web.webbrowser import open_in_browser, fetch_and_format as browse_and_format
@@ -799,7 +1126,7 @@ class CortexCore:
                 return "no recurring tasks scheduled"
             return "scheduled tasks: " + "; ".join(
                 f"[{t['id']}] {t['desc']} — {t.get('human', t['schedule'])} → {t.get('deliver','notify')}"
-                for t in ts)
+                f"{'' if t.get('enabled', True) else ' (paused)'}" for t in ts)
         if op == "remove":
             tid = action.get("task_id")
             if not tid:
@@ -833,16 +1160,28 @@ class CortexCore:
         except Exception:
             return "Done — handled it."
 
-    def _finish(self, session_id: str, user_text: str, action: dict) -> dict:
-        """Log the experience (learning signal). The chat rows themselves are written by
-        ask_stream — see _save_turn."""
+    def _finish(self, session_id: str, user_text: str, action: dict, exit_code: int = None,
+                learn: bool = False) -> dict:
+        """Log the experience (learning signal) and give memory its chance to learn. The chat
+        rows themselves are written by ask_stream — see _save_turn."""
         try:
-            self.db.log_experience(session_id=session_id, user_text=user_text,
-                                   action=action.get("action", "answer"),
-                                   action_payload={k: v for k, v in action.items() if k != "speak"},
-                                   speak=action.get("speak"))
-        except Exception:
-            pass
+            exp = self.db.log_experience(session_id=session_id, user_text=user_text,
+                                         action=action.get("action", "answer"),
+                                         action_payload={k: v for k, v in action.items()
+                                                         if k not in ("speak", "approval")},
+                                         speak=action.get("speak"))
+            if exp:
+                self._last_experience[session_id] = exp
+                if exit_code is not None:
+                    self.db.update_experience_outcome(exp, exit_code=exit_code)
+            self.db.compute_pending_rewards()
+        except Exception as e:
+            logger.debug(f"experience not logged: {e}")
+        if learn and not action.get("error"):
+            try:
+                self.memory_mgr.on_conversation_turn(session_id)
+            except Exception as e:
+                logger.debug(f"memory extraction skipped: {e}")
         return action
 
 
@@ -850,8 +1189,12 @@ class CortexCore:
 _CORE = None
 
 
-def ask(text: str, session_id: str = "mcp", source: str = "cli") -> str:
+def ask(text: str, session_id: str = "mcp", source: str = "agentkit") -> str:
+    return ask_full(text, session_id=session_id, source=source).get("speak", "")
+
+
+def ask_full(text: str, session_id: str = "mcp", source: str = "agentkit") -> dict:
     global _CORE
     if _CORE is None:
         _CORE = CortexCore()
-    return _CORE.ask(text, session_id=session_id, source=source).get("speak", "")
+    return _CORE.ask(text, session_id=session_id, source=source)

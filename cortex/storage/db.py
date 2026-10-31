@@ -889,6 +889,31 @@ class Database:
                 """, (proposal_id,))
                 return cur.fetchone()
 
+    def get_open_proposals(self, limit: int = 30, max_age_days: int = 7) -> list:
+        """The approvals inbox: proposals nobody has answered yet, newest first."""
+        from datetime import timezone
+        cutoff = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=max_age_days)
+        with self.get_conn() as conn:
+            with conn.cursor(cursor_factory=extras.RealDictCursor) as cur:
+                cur.execute("""
+                    SELECT id, cycle_at, think, action_payload
+                    FROM autonomy_log
+                    WHERE decision = 'proposed' AND confirmed IS NULL AND cycle_at > %s
+                    ORDER BY id DESC
+                    LIMIT %s
+                """, (cutoff, limit))
+                return [dict(r) for r in cur.fetchall()]
+
+    def find_open_proposal(self, action_payload: dict) -> int | None:
+        """The id of an identical proposal still waiting, so it isn't queued twice."""
+        want = json.dumps(action_payload, sort_keys=True, default=str)
+        for p in self.get_open_proposals(limit=100):
+            have = p.get("action_payload")
+            have = json.loads(have) if isinstance(have, str) else have
+            if json.dumps(have, sort_keys=True, default=str) == want:
+                return p["id"]
+        return None
+
     def resolve_proposal(self, proposal_id: int, confirmed: bool, exit_code: int = None):
         """Mark an autonomy proposal confirmed or denied by the user."""
         with self.get_conn() as conn:
@@ -1033,6 +1058,14 @@ class Database:
             with conn.cursor(cursor_factory=extras.RealDictCursor) as cur:
                 cur.execute(q, (limit,))
                 return [dict(r) for r in cur.fetchall()]
+
+    def count_session_turns(self, session_id: str) -> int:
+        """How many user messages this chat has had."""
+        with self.get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT COUNT(*) FROM conversations WHERE session_id = %s AND role = 'user'",
+                            (session_id,))
+                return cur.fetchone()[0]
 
     def count_unread_nudges(self) -> int:
         with self.get_conn() as conn:

@@ -14,6 +14,9 @@ response (action/command/edit_file/reminder/etc.) — that's what keeps every
 downstream consumer (safety.needs_confirmation, the per-action execution
 branches, experience logging, _pending_actions) unchanged.
 """
+import json
+import re
+import uuid
 
 TOOLS = [
     {
@@ -109,7 +112,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "edit_file",
-            "description": "Modify a file's contents. Always held for user confirmation before it actually runs.",
+            "description": "Modify a file's contents. The user approves it first; once they do, your job carries on from here.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -124,7 +127,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "run_project",
-            "description": "Detect a tracked project's type and run its dev/start/build/test/install command.",
+            "description": "Run a project's standard step. Works out how from the folder (npm, Python, Cargo, Go, Flutter, Make). dev/start run in the background and return a log path.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -250,7 +253,10 @@ TOOLS = [
                 "its result to the user (e.g. 'every morning at 8 email me a news briefing', "
                 "'every hour check if my server is healthy and notify me'). Different from "
                 "manage_reminder (a one-off nudge): this re-runs a full prompt through you on "
-                "a cadence. Use op='add' with desc, prompt, schedule; op='list'; op='remove' with id."
+                "a cadence, so each run wakes the AI model — keep it as infrequent as the job allows "
+                "(the minimum is every 5 min). A job with an end, like 'tell me when X is done', stops "
+                "itself once it's finished. Use op='add' with desc, prompt, schedule; op='list'; "
+                "op='remove' with id."
             ),
             "parameters": {
                 "type": "object",
@@ -259,7 +265,7 @@ TOOLS = [
                     "desc": {"type": ["string", "null"], "description": "short label for the task"},
                     "prompt": {"type": ["string", "null"], "description": "the instruction to run each time"},
                     "schedule": {"type": ["string", "null"],
-                                 "description": "natural schedule, e.g. 'daily 08:00', 'every 30 min', 'hourly', 'every evening'"},
+                                 "description": "e.g. 'daily 08:00', 'at 5pm', 'every 30 min', 'hourly', 'every friday at 9am', 'every 2 days'"},
                     "deliver": {"type": ["string", "null"], "enum": ["notify", "email", "both", None],
                                 "description": "how to deliver the result; default notify"},
                     "id": {"type": ["string", "null"], "description": "task id, when op=remove"},
@@ -375,6 +381,34 @@ TOOLS = [
         },
     },
 ]
+
+
+_INLINE_CALL = re.compile(r"\{.*\}", re.S)
+
+
+def rescue_tool_calls(result: dict, known: set) -> dict:
+    """Some models write a tool call as JSON in their reply instead of using the tool
+    channel, which would otherwise show the user raw JSON and do nothing. If the whole
+    reply is exactly one call to a tool we offer, treat it as that call."""
+    if result.get("tool_calls"):
+        return result
+    text = (result.get("content") or "").strip()
+    text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text).strip()
+    text = re.sub(r"^<tool_call>\s*|\s*</tool_call>$", "", text).strip()
+    if not _INLINE_CALL.fullmatch(text):
+        return result
+    try:
+        call = json.loads(text)
+    except ValueError:
+        return result
+    if isinstance(call, dict) and isinstance(call.get("function"), dict):
+        call = call["function"]
+    name = call.get("name") if isinstance(call, dict) else None
+    args = (call.get("arguments") or call.get("parameters") or {}) if isinstance(call, dict) else {}
+    if name not in known or not isinstance(args, dict):
+        return result
+    return {**result, "content": "", "tool_calls": [
+        {"id": "call_" + uuid.uuid4().hex[:8], "function": {"name": name, "arguments": args}}]}
 
 
 def tool_call_to_action_data(tool_call: dict) -> dict:

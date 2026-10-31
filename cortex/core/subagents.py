@@ -21,9 +21,10 @@ How the decision is made (cheapest check first, so simple chat pays nothing):
               model can't truly run helpers in parallel (one set of weights), so they run
               one after another; cloud models fan out (default up to 3 at once).
 
-Helpers get a safe tool subset (no email-send, file edits, reminders, memory writes,
-scheduling, or further helpers) and anything that needs the user's approval is reported
-back instead of run.
+Helpers get a narrower tool set (no email-send, file edits, reminders, memory writes,
+scheduling, or further helpers) and go through the same gate as everything else, as if
+nobody were watching: only read-only work runs, and anything that would need the user's
+approval is reported back instead of run.
 """
 from __future__ import annotations
 
@@ -39,7 +40,7 @@ logger = logging.getLogger("cortex.subagents")
 
 MODES = ("auto", "off", "eager")
 
-# Tools a helper may call. Deliberately excludes anything outward-facing or persistent.
+# Tools a helper may OFFER. What actually runs is still decided by safety.evaluate().
 HELPER_TOOLS = {"execute_shell", "web_search", "browse_url", "browser_automate", "crawl_site",
                 "make_chart", "image_search", "email_check", "email_search", "run_project"}
 
@@ -270,7 +271,8 @@ class SubagentManager:
 
     def _run_helper(self, idx: int, sub: dict, task_text: str, source: str, emit, deadline: float) -> dict:
         from cortex.llm.tools import tool_call_to_action_data
-        from cortex.core.safety import needs_confirmation
+        from cortex.core import safety
+        from cortex.core.cortex_core import untrusted
         core, cfg = self.core, self.settings()
         tools = self._helper_tools()
         allowed = {(t.get("function") or {}).get("name") for t in tools}
@@ -281,7 +283,7 @@ class SubagentManager:
             sys_prompt += "\n\n" + srv
         messages = [{"role": "system", "content": sys_prompt},
                     {"role": "user", "content": sub["prompt"]}]
-        summary, steps, asked_approval = "", 0, False
+        summary, steps, asked_approval, tainted = "", 0, False, False
 
         for _ in range(cfg["helper_steps"]):
             if time.time() > deadline:
@@ -300,17 +302,19 @@ class SubagentManager:
                 name, tcid = fn.get("name", ""), tc.get("id") or ""
                 if name not in allowed:
                     obs = f"tool '{name}' isn't available to helpers"
-                elif name.startswith("mcp__"):
-                    action = {"action": "mcp", "mcp_name": name, "mcp_args": fn.get("arguments") or {}}
-                    emit({"type": "subagent", "id": idx, "state": "step", "name": "mcp", "detail": name[5:].replace("__", " · ")})
-                    obs = core._execute_tool(action, source)
                 else:
-                    action = tool_call_to_action_data(tc)
-                    need, msg = needs_confirmation(action)
+                    if name.startswith("mcp__"):
+                        action = {"action": "mcp", "mcp_name": name, "mcp_args": fn.get("arguments") or {}}
+                    else:
+                        action = tool_call_to_action_data(tc)
+                    verdict = safety.evaluate(action, tainted=tainted, background=True,
+                                              mcp_readonly=core._mcp_readonly(action))
                     kind = action.get("action")
-                    if need:
+                    if verdict.kind == safety.BLOCK:
+                        obs = f"REFUSED — {verdict.message}"
+                    elif verdict.kind == safety.ASK:
                         asked_approval = True
-                        obs = f"NOT RUN — needs the user's approval first: {msg}"
+                        obs = f"NOT RUN — needs the user's approval first: {verdict.message}"
                     elif kind == "chart":
                         src = core._render_chart(action.get("code", ""))
                         if src:
@@ -324,7 +328,9 @@ class SubagentManager:
                     else:
                         emit({"type": "subagent", "id": idx, "state": "step",
                               "name": kind or "?", "detail": core._tool_detail(action)})
-                        obs = core._execute_tool(action, source)
+                        obs, outside = core.observe(action, source)
+                        tainted = tainted or outside
+                        obs = untrusted(kind, str(obs)[:2300]) if outside else obs
                 steps += 1
                 messages.append({"role": "tool", "tool_call_id": tcid, "content": str(obs)[:2500]})
         if not summary:   # ran out of steps/time mid-work — ask for what it has so far
@@ -335,8 +341,10 @@ class SubagentManager:
             except Exception:
                 summary = ""
         if not summary:
-            return {"ok": False, "summary": "I didn't get a result for this part.", "steps": steps}
-        return {"ok": True, "summary": summary, "steps": steps, "needs_approval": asked_approval}
+            return {"ok": False, "summary": "I didn't get a result for this part.", "steps": steps,
+                    "tainted": tainted}
+        return {"ok": True, "summary": summary, "steps": steps, "needs_approval": asked_approval,
+                "tainted": tainted}
 
     def run_stream(self, subtasks: list[dict], task_text: str, source: str, parallel: int):
         """Generator: yields live `subagent`/`image` events while helpers work, then a final

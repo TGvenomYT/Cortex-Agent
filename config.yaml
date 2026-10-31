@@ -20,7 +20,8 @@ database:
   password: ""                     # from macOS Keychain / ~/.cortex/cortex.env; never commit
 
 llm:
-  # 100% local via Ollama. No API keys are ever read for LLM calls.
+  # Local by default via Ollama. The model picked in the app is saved in settings and
+  # wins over this; cloud keys live in the OS keychain (Settings → AI Providers).
   # gemma4-agent:12b-mlx is the measured agentic winner: with the full system
   # prompt + tools it calls tools 3/3; gemma4:e4b scored 0/3 (it drowns in the
   # long prompt). The 12b MLX build is also SMALLER than e4b (7.7GB vs 9.6GB),
@@ -29,10 +30,15 @@ llm:
   ollama:
     base_url: "http://localhost:11434"
     model: "gemma4-agent:12b-mlx"  # agentic/tool-use tuned, 7.7GB, fits 24GB
-    timeout: 90                    # 12b local inference needs more headroom
+    timeout: 180                   # 12b local inference needs more headroom
+    num_ctx: 16384                 # how much the model can see at once; Ollama's default truncates
   ollama_fallback:
     base_url: "http://localhost:11434"
     model: "gemma4:12b-mlx"        # also 3/3 on tool-calling; same size
+
+agent:
+  max_steps: 12                    # tool steps per job when you're there
+  background_max_steps: 6          # ...and in a scheduled task
 
 context:
   max_age_minutes: 30              # context stays valid for 30 min
@@ -49,7 +55,7 @@ context:
 
 memory:
   max_facts: 100
-  summarize_every: 50              # summarize conversation every N messages
+  summarize_every: 8               # learn facts from a chat every N of your messages
   retention_days: 90
 
 reminders:

@@ -260,12 +260,22 @@ def list_workers() -> list[dict]:
     return rows
 
 
+def is_on(key: str) -> bool:
+    """Is this built-in worker actually scheduled right now? True where there's nothing to check."""
+    if not osutil.IS_MAC:
+        return True
+    w = _BY_KEY.get(key)
+    return bool(w) and w["label"] in _loaded() and w["label"] not in _disabled()
+
+
 def current_profile(rows: list[dict] | None = None) -> str:
     rows = rows if rows is not None else list_workers()
     on = {r["key"] for r in rows if r["group"] not in ("tasks", "services") and r["on"]}
+    tasks_on = any(r["on"] for r in rows if r["group"] == "tasks")
     for name, keys in PROFILES.items():
         if on == set(keys):
-            return name
+            # "off" means nothing runs, so it can't be the answer while a task is still on.
+            return "custom" if name == "off" and tasks_on else name
     return "custom"
 
 
@@ -395,6 +405,12 @@ def is_allowed(job: str, arg: str | None = None) -> tuple[bool, str]:
     """Guard for job entrypoints: should this scheduled invocation do anything?
     launchd is the real off-switch; this is a belt-and-braces check for the case where
     a job still fires (e.g. a stale plist) after the user switched it off."""
+    if job == "task":
+        import cortex.core.tasks as tasks_mod
+        task = tasks_mod.get_task(arg or "")
+        if task and not tasks_mod.is_enabled(task):
+            return False, f"task {arg} is paused"
+        return True, "task enabled"
     if not osutil.IS_MAC:
         return True, "not macOS"
     want = ["run_once.py", job] + ([arg] if arg else [])

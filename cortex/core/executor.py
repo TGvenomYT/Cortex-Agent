@@ -30,7 +30,8 @@ class CommandExecutor:
 
         try:
             # Ensure PATH includes common tool locations
-            env = os.environ.copy()
+            from cortex.llm.viz import clean_env
+            env = clean_env()   # commands never inherit Cortex's own passwords or API keys
             env["PATH"] = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:" + env.get("PATH", "")
 
             result = subprocess.run(

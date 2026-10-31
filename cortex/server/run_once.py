@@ -161,9 +161,48 @@ def _notify(title: str, msg: str):
     osutil.notify(title, msg)
 
 
+TASK_RULES = (
+    "\n\n[Scheduled background run — nobody is reading along.] If there's nothing the user needs "
+    "to hear right now, reply with exactly NOTHING_TO_REPORT. If this job has an end and it has now "
+    "been reached (the thing they were waiting for happened), start your reply with TASK_COMPLETE "
+    "and then say what happened. Otherwise reply with what they need to know."
+)
+TASK_MAX_FAILURES = 3
+
+
+def _deliver_task(task: dict, text: str, db=None):
+    """Put a task's result where the user will see it."""
+    if db is not None:      # the bell, so it's still there after the toast is gone
+        try:
+            db.add_nudge(task["desc"][:80], text[:600], kind="info", source="task")
+        except Exception as e:
+            logger.debug(f"task nudge write skipped: {e}")
+    deliver = task.get("deliver", "notify")
+    if deliver in ("notify", "both"):
+        _notify(f"Cortex · {task['desc'][:40]}", text)
+    if deliver in ("email", "both"):
+        try:
+            import cortex.integrations.mail as mail, cortex.integrations.mail_store as mail_store, cortex.storage.settings_store as settings_store
+            accts = settings_store.load().get("emails", [])
+            if accts:
+                frm = accts[0]["email"]
+                pw = mail_store.password(frm)
+                if pw:
+                    ok, err = mail.send(frm, pw, frm, f"Cortex: {task['desc'][:60]}", text)
+                    if not ok:
+                        logger.warning(f"task email failed: {err}")
+                else:
+                    logger.warning(f"task email skipped: no app password for {frm}")
+            else:
+                logger.warning("task email delivery skipped: no account configured")
+        except Exception as e:
+            logger.warning(f"task email delivery failed: {e}")
+
+
 def cmd_task(args) -> int:
-    """Run one user-scheduled recurring task: execute its prompt through Cortex
-    and deliver the answer (macOS notification and/or email)."""
+    """Run one user-scheduled recurring task through Cortex and deliver what it found.
+    A run with nothing to say stays silent, a finished job removes itself, and a task
+    that can't reach a model pauses itself after a few tries instead of nagging forever."""
     import cortex.core.tasks as tasks_mod
     task = tasks_mod.get_task(args.name)
     if not task:
@@ -178,35 +217,31 @@ def cmd_task(args) -> int:
         logger.info(f"dry-run: would run task '{task['desc']}'")
         return 0
     import cortex.core.cortex_core as cortex_core
-    answer = cortex_core.ask(task["prompt"], session_id=f"task:{task['id']}") or "(no output)"
+    result = cortex_core.ask_full(task["prompt"] + TASK_RULES, session_id=f"task:{task['id']}", source="task")
+    answer = (result.get("speak") or "").strip()
     logger.info(f"task {task['id']} -> {answer[:120]}")
-    # Persist a nudge so the result is waiting in the GUI bell, not just a toast.
-    try:
-        cortex_core._CORE.db.add_nudge(task["desc"][:80], answer[:600],
-                                       kind="info", source="task")
-    except Exception as e:
-        logger.debug(f"task nudge write skipped: {e}")
-    deliver = task.get("deliver", "notify")
-    if deliver in ("notify", "both"):
-        _notify(f"Cortex · {task['desc'][:40]}", answer)
-    if deliver in ("email", "both"):
-        try:
-            import cortex.integrations.mail as mail, cortex.integrations.mail_store as mail_store, cortex.storage.settings_store as settings_store
-            accts = settings_store.load().get("emails", [])
-            if accts:
-                frm = accts[0]["email"]
-                pw = mail_store.password(frm)
-                if pw:
-                    ok, err = mail.send(frm, pw, frm,
-                                        f"Cortex: {task['desc'][:60]}", answer)
-                    if not ok:
-                        logger.warning(f"task email failed: {err}")
-                else:
-                    logger.warning(f"task email skipped: no app password for {frm}")
-            else:
-                logger.warning("task email delivery skipped: no account configured")
-        except Exception as e:
-            logger.warning(f"task email delivery failed: {e}")
+    db = cortex_core._CORE.db if cortex_core._CORE else None
+
+    if result.get("error"):
+        fails = tasks_mod.record_failure(task["id"])
+        logger.warning(f"task {task['id']} couldn't reach a model ({fails}/{TASK_MAX_FAILURES})")
+        if fails >= TASK_MAX_FAILURES:
+            tasks_mod.set_task_enabled(task["id"], False)
+            _deliver_task({**task, "deliver": "notify"},
+                          f"I've paused this because I couldn't reach a model {fails} times in a row. "
+                          "Turn it back on in Settings → Background.", db)
+        return 0
+    tasks_mod.clear_failures(task["id"])
+
+    if "TASK_COMPLETE" in answer:
+        text = answer.replace("TASK_COMPLETE", "").strip(" :-—\n") or "All done."
+        tasks_mod.remove_task(task["id"])
+        _deliver_task(task, text, db)
+        logger.info(f"task {task['id']} finished and removed itself")
+        return 0
+    if not answer or "NOTHING_TO_REPORT" in answer:
+        return 0
+    _deliver_task(task, answer, db)
     return 0
 
 
@@ -247,7 +282,7 @@ def main() -> int:
         os.environ["CORTEX_BACKGROUND"] = "1"
     if not args.force:
         import cortex.core.workers as workers
-        allowed, why = workers.is_allowed(args.cmd, getattr(args, "name", None) if args.cmd == "report" else None)
+        allowed, why = workers.is_allowed(args.cmd, getattr(args, "name", None) if args.cmd in ("report", "task") else None)
         if not allowed:
             logger.info(f"{args.cmd} skipped ({why})")
             return 0
