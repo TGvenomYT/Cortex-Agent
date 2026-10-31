@@ -444,6 +444,56 @@ def _classify(command: str, known_hosts: set, depth: int = 0) -> tuple[int, str,
     return worst, worst_why, key
 
 
+# ── secrets in text ───────────────────────────────────────────────────────
+_NAMED_SECRET = re.compile(
+    r"\b(pass(?:word|wd|phrase|code|key)|pin|otp|secret(?:\s+key)?|api[ _-]?key|access[ _-]?key|auth[ _-]?token|"
+    r"token|private[ _-]?key|cvv|card\s+number|account\s+number|aadhaar(?:\s+number)?|ssn)\b"
+    r"(\s*(?:is|was|=|:|->)\s*[\"'`]?)([^\s\"'`,;]{3,})", re.I)
+_NOT_A_VALUE = {"required", "stored", "saved", "set", "wrong", "correct", "incorrect", "expired", "invalid", "the",
+                "in", "on", "at", "not", "too", "very", "being", "missing", "needed", "reset", "changed", "same"}
+_KEY_SHAPES = re.compile(
+    r"sk-[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_\w{20,}|AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{30,}"
+    r"|xox[abprs]-[A-Za-z0-9-]{10,}|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]+"
+    r"|-----BEGIN [A-Z ]*PRIVATE KEY-----")
+_CARD = re.compile(r"\b(?:\d[ -]?){13,19}\b")
+
+
+def _luhn(digits: str) -> bool:
+    total = 0
+    for i, c in enumerate(reversed(digits)):
+        n = int(c)
+        if i % 2:
+            n = n * 2 - 9 if n > 4 else n * 2
+        total += n
+    return total % 10 == 0
+
+
+def _spans(text: str) -> list:
+    """Where the secret values in `text` are."""
+    spans = [m.span() for m in _KEY_SHAPES.finditer(text)]
+    for m in _NAMED_SECRET.finditer(text):
+        if m.group(3).lower().rstrip(".!?") not in _NOT_A_VALUE:
+            spans.append(m.span(3))
+    for m in _CARD.finditer(text):
+        digits = re.sub(r"\D", "", m.group())
+        if 13 <= len(digits) <= 19 and _luhn(digits):
+            spans.append(m.span())
+    return spans
+
+
+def contains_secret(text: str) -> bool:
+    """True if `text` holds a password, key, or card number. Those are never kept in memory."""
+    return bool(_spans(text or ""))
+
+
+def redact(text: str) -> str:
+    """`text` with any secret values replaced, for what gets stored."""
+    text = text or ""
+    for start, end in sorted(_spans(text), reverse=True):
+        text = text[:start] + "[hidden]" + text[end:]
+    return text
+
+
 def _known_hosts() -> set:
     hosts = {"localhost", "127.0.0.1", "myserver"}
     try:

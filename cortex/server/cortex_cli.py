@@ -54,9 +54,10 @@ def main() -> int:
         if db is None:
             print(json.dumps({"error": "db_unavailable"}))
             return 3
-        db.save_memory(type=args.get("type", "fact"), content=args["content"],
-                       source="agentkit", importance=args.get("importance", 4))
-        print(json.dumps({"ok": True}))
+        from cortex.core.memory import MemoryManager
+        result = MemoryManager(db, None, {}).store_fact(args["content"], mem_type=args.get("type", "fact"),
+                                                        source="agentkit", importance=args.get("importance", 4))
+        print(json.dumps({"ok": result["status"] != "secret", "status": result["status"]}))
 
     elif cmd == "memory_search":
         db = _db()

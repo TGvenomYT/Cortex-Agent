@@ -47,7 +47,8 @@ _SUMMARY_PROMPT = (
 _CHAT_SUMMARY_PROMPT = (
     "Summarise this conversation so it can continue later without the original. Keep what the user "
     "wants, decisions made, facts about them and their work, exact names and paths, and anything "
-    "unfinished. Merge in the earlier summary if there is one. Plain, compact notes. No preamble."
+    "unfinished. Leave out passwords, keys and card numbers. Merge in the earlier summary if there "
+    "is one. Plain, compact notes. No preamble."
 )
 
 

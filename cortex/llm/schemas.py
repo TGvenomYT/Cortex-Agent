@@ -41,16 +41,18 @@ REMINDER_PARSE_SCHEMA = {
 }
 
 FACTS_SCHEMA = {
-    "type": "array",
-    "items": {
+    "type": "object",
+    "properties": {"facts": {"type": "array", "items": {
         "type": "object",
         "properties": {
             "content": {"type": "string"},
-            "type": {"type": "string", "enum": ["fact", "preference", "learned_command", "project_info"]},
+            "type": {"type": "string", "enum": ["fact", "preference", "learned_command", "project_info", "rule"]},
             "importance": {"type": "integer"},
+            "replaces": {"type": ["integer", "null"]},
         },
         "required": ["content", "type", "importance"],
-    },
+    }}},
+    "required": ["facts"],
 }
 
 DEVOPS_PLAN_SCHEMA = {

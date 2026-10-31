@@ -235,6 +235,7 @@ CREATE TABLE IF NOT EXISTS session_summaries (
     session_id TEXT PRIMARY KEY,
     summary TEXT,
     upto_id INTEGER DEFAULT 0,
+    learned_id INTEGER DEFAULT 0,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -396,6 +397,9 @@ def _migrate(conn: sqlite3.Connection) -> None:
     cols = {r[1] for r in conn.execute("PRAGMA table_info(conversations)").fetchall()}
     if "parts" not in cols:   # rich message parts: charts, image grids, thinking trace
         conn.execute("ALTER TABLE conversations ADD COLUMN parts JSON")
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(session_summaries)").fetchall()}
+    if "learned_id" not in cols:   # how far memory has read this chat
+        conn.execute("ALTER TABLE session_summaries ADD COLUMN learned_id INTEGER DEFAULT 0")
 
 
 def open_db(path: str, init: bool = True) -> sqlite3.Connection:

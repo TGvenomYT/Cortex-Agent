@@ -323,6 +323,7 @@ class CortexCore:
     def _save_turn(self, session_id: str, role: str, content: str, parts: list = None) -> None:
         """Write one chat row. Loud on failure (it used to be `except: pass`, so a lost turn
         left no trace) and retried once — a transient 'database is locked' shouldn't eat a message."""
+        content = safety.redact(content)    # what's stored gets replayed into later prompts
         for attempt in (1, 2):
             try:
                 self.db.save_conversation(session_id, role, content, parts=parts)
@@ -407,15 +408,12 @@ class CortexCore:
                 self.db.clear_pending_action(session_id)
 
         yield {"type": "status", "text": "thinking…"}
-        try:
-            memory_str = self.memory_mgr.format_for_prompt(limit=15)
-        except Exception:
-            memory_str = None
+        memory_str, recall = self._memory_for(text)
         rag = self._rag_context(text)
         extra = "\n\n".join(x for x in [self._server_context(), rag] if x) or None
         messages = self.context_reader.build_messages(
             user_text=text, session_id=session_id, memory_str=memory_str, source=source,
-            extra_context=extra, history_tokens=self._budget(self._tools()).history_tokens(),
+            extra_context=extra, history_tokens=self._budget(self._tools()).history_tokens(), recall=recall,
         )
         job = _Job(text, session_id, source, tainted=bool(rag))
 
@@ -444,6 +442,14 @@ class CortexCore:
             self._absorb_helpers(job, subs, results)
 
         yield from self._agent_loop(messages, job)
+
+    def _memory_for(self, text: str) -> tuple:
+        """(what goes in every prompt, what bears on this question)."""
+        try:
+            return self.memory_mgr.format_core(), self.memory_mgr.format_relevant(text)
+        except Exception as e:
+            logger.warning(f"memory unavailable: {e}")
+            return None, None
 
     @staticmethod
     def _absorb_helpers(job: _Job, subs: list, results: list) -> None:
@@ -736,7 +742,9 @@ class CortexCore:
         last_action["steps"] = len(job.work_log)
         if job.llm_failed:
             last_action["error"] = True
-        self._finish(job.session_id, job.text, last_action, exit_code=job.exit_code, learn=not job.background)
+        # In the app, wait for a pause in the chat; `cx` might exit right after this reply.
+        learn_after = None if job.background else (12 if job.source == "gui" else 0)
+        self._finish(job.session_id, job.text, last_action, exit_code=job.exit_code, learn_after=learn_after)
         yield {"type": "answer", "text": final_speak}
         yield from self._offer_undo(job)
         warning = usage.near_limit() if not job.background else None
@@ -960,13 +968,11 @@ class CortexCore:
     def report(self, session_id: str, text: str) -> str | None:
         """Speak up in a chat without being asked (a watcher's update). Runs as a background
         job, so it can look but not act. -> the reply, or None if a model couldn't be reached."""
-        try:
-            memory_str = self.memory_mgr.format_for_prompt(limit=15)
-        except Exception:
-            memory_str = None
+        memory_str, recall = self._memory_for(text)
         budget = self._budget(self._tools())
         messages = self.context_reader.build_messages(user_text=text, session_id=session_id, source="watch",
-                                                      memory_str=memory_str, history_tokens=budget.history_tokens())
+                                                      memory_str=memory_str, recall=recall,
+                                                      history_tokens=budget.history_tokens())
         final = {}
         for ev in self._agent_loop(messages, _Job(text, session_id, "watch")):
             if ev.get("type") == "final":
@@ -1375,9 +1381,12 @@ class CortexCore:
         if not content:
             return "nothing to remember — empty content"
         mtype = action.get("remember_type") or "fact"
-        self.memory_mgr.store_fact(content, mem_type=mtype, source="conversation",
-                                   importance=5 if mtype == "rule" else 4)
-        return f"remembered ({mtype}): {content}"
+        result = self.memory_mgr.store_fact(content, mem_type=mtype, source="conversation",
+                                            importance=5 if mtype == "rule" else 4)
+        if result["status"] == "secret":
+            return ("NOT SAVED: that looks like a password, key or card number, and Cortex never keeps those. "
+                    "Tell them so, and suggest a password manager.")
+        return f"already knew that: {content}" if result["status"] == "known" else f"remembered ({mtype}): {content}"
 
     def _forget(self, action: dict) -> str:
         return self.memory_mgr.forget(memory_id=action.get("forget_id"),
@@ -1482,15 +1491,15 @@ class CortexCore:
         return f"I couldn't write up the result, but this is where it got to:\n\n```\n{work_log[-1][-600:]}\n```"
 
     def _finish(self, session_id: str, user_text: str, action: dict, exit_code: int = None,
-                learn: bool = False) -> dict:
+                learn_after: float = None) -> dict:
         """Log the experience (learning signal) and give memory its chance to learn. The chat
         rows themselves are written by ask_stream — see _save_turn."""
         try:
-            exp = self.db.log_experience(session_id=session_id, user_text=user_text,
+            exp = self.db.log_experience(session_id=session_id, user_text=safety.redact(user_text),
                                          action=action.get("action", "answer"),
                                          action_payload={k: v for k, v in action.items()
                                                          if k not in ("speak", "approval")},
-                                         speak=action.get("speak"))
+                                         speak=safety.redact(action.get("speak") or ""))
             if exp:
                 self._last_experience[session_id] = exp
                 if exit_code is not None:
@@ -1498,9 +1507,9 @@ class CortexCore:
             self.db.compute_pending_rewards()
         except Exception as e:
             logger.debug(f"experience not logged: {e}")
-        if learn and not action.get("error"):
+        if learn_after is not None and not action.get("error"):
             try:
-                self.memory_mgr.on_conversation_turn(session_id)
+                self.memory_mgr.on_conversation_turn(session_id, delay=learn_after)
             except Exception as e:
                 logger.debug(f"memory extraction skipped: {e}")
         return action

@@ -351,9 +351,13 @@ def memory_cmd(argv: list[str]):
         if not content:
             console.print("\n  usage: cx memory add [rule|fact|preference|project_info] <text>\n")
             return
-        db.save_memory(type=mtype, content=content, source="cx-cli",
-                       importance=5 if mtype == "rule" else 4)
-        console.print(f"\n  [green]✓[/green] remembered ({mtype}): {content}\n")
+        from cortex.core.memory import MemoryManager
+        result = MemoryManager(db, None, {}).store_fact(content, mem_type=mtype, source="cx-cli",
+                                                        importance=5 if mtype == "rule" else 4)
+        if result["status"] == "secret":
+            console.print("\n  [yellow]That looks like a password or key, so I won't keep it.[/yellow]\n")
+        else:
+            console.print(f"\n  [green]✓[/green] remembered ({mtype}): {content}\n")
 
     elif sub == "forget":
         if len(argv) < 2 or not argv[1].isdigit():

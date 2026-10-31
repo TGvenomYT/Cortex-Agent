@@ -839,6 +839,19 @@ def approve():
     return jsonify({"ok": True})
 
 
+@app.route("/memory")
+def memory_list():
+    """Everything Cortex holds about its owner. It's theirs to see and correct."""
+    return jsonify({"memories": [{"id": m["id"], "type": m["type"], "content": m["content"]}
+                                 for m in core().db.get_memories(limit=500)]})
+
+
+@app.route("/memory/forget", methods=["POST"])
+def memory_forget():
+    mid = (request.get_json(silent=True) or {}).get("id")
+    return jsonify({"ok": isinstance(mid, int) and core().db.delete_memory(mid)})
+
+
 @app.route("/stop", methods=["POST"])
 def stop():
     return jsonify({"ok": core().stop((request.get_json(silent=True) or {}).get("session", ""))})
@@ -1523,6 +1536,7 @@ async function openSettings(){CUR=await (await fetch('/settings')).json();
    <div class="navitem" data-t="email" data-click="sTab('email')">Email</div>
    <div class="navitem" data-t="mcp" data-click="sTab('mcp')">MCP</div>
    <div class="navitem" data-t="bg" data-click="sTab('bg')">Background</div>
+   <div class="navitem" data-t="memory" data-click="sTab('memory')">Memory</div>
    <div class="navitem" data-t="usage" data-click="sTab('usage')">Usage</div></div>
    <div class="scontent" id="scontent"></div>`,'settings');
  sTab('profile')}
@@ -1535,6 +1549,7 @@ function sTab(t){document.querySelectorAll('.navitem[data-t]').forEach(n=>n.clas
  else if(t==='email')renderEmail(c);
  else if(t==='mcp')renderMcp(c);
  else if(t==='usage')renderUsage(c);
+ else if(t==='memory')renderMemory(c);
  else renderBackground(c)}
 const PROV=[['ollama','Ollama Cloud','paste your Ollama key','ollama.com/settings/keys'],
             ['anthropic','Claude (Anthropic)','sk-ant-…','console.anthropic.com/settings/keys'],
@@ -1712,6 +1727,13 @@ async function runWorker(key){const r=await postJ('/workers/run',{key});bgNote(r
 async function unloadModel(){const r=await postJ('/model/unload');await loadBackground();bgNote(r.message||'')}
 async function setRes(k,v){await postJ('/resources/set',{[k]:v});loadBackground()}
 async function setAgents(k,v){await postJ('/agents/set',{[k]:v});loadBackground()}
+function renderMemory(c){c.innerHTML=`<div class="slabel">What Cortex remembers about you</div>
+  <div class="dsub" style="line-height:1.5;margin-bottom:12px">Picked up from what you say, on this computer only. Passwords, keys and card numbers are never kept. Delete anything you'd rather it forgot.</div>
+  <div id="memlist"><div class="dsub">loading…</div></div>`;loadMemory()}
+async function loadMemory(){const L=$('memlist');if(!L)return;
+ const m=(await (await fetch('/memory')).json()).memories||[];
+ L.innerHTML=m.length?m.map(x=>`<div class="dev"><div style="flex:1;min-width:0"><div class="dname" style="line-height:1.4">${esc(x.content)}</div><div class="dsub">${esc(x.type==='rule'?'standing rule':x.type.replace('_',' '))}</div></div><div class="bars"><span class="xbtn" title="Forget this" data-click="forgetMemory(${Number(x.id)})">${TRASH}</span></div></div>`).join(''):'<div class="dsub">Nothing yet. It fills in as you talk.</div>'}
+async function forgetMemory(id){await postJ('/memory/forget',{id});loadMemory()}
 const LIMITS=[['daily_usd','Dollars a day'],['monthly_usd','Dollars a month'],['job_usd','Dollars per job'],['daily_tokens','Tokens a day'],['job_tokens','Tokens per job']];
 function renderUsage(c){c.innerHTML='<div id="ubody"><div class="dsub">loading…</div></div>';loadUsage()}
 const num=n=>Number(n||0).toLocaleString();

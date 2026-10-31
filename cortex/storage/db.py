@@ -373,14 +373,62 @@ class Database:
 
     # ─── Memory ───
 
-    def save_memory(self, type: str, content: str, source: str = None, importance: int = 3):
-        """Store a memory fact."""
+    def save_memory(self, type: str, content: str, source: str = None, importance: int = 3,
+                    embedding: str = None) -> int:
+        """Store a memory fact. Returns its id."""
         with self.get_conn() as conn:
             with conn.cursor() as cur:
                 cur.execute("""
-                    INSERT INTO memory (type, content, source, importance)
-                    VALUES (%s, %s, %s, %s)
-                """, (type, content, source, importance))
+                    INSERT INTO memory (type, content, source, importance, embedding)
+                    VALUES (%s, %s, %s, %s, %s)
+                    RETURNING id
+                """, (type, content, source, importance, embedding))
+                return cur.fetchone()[0]
+
+    def update_memory(self, memory_id: int, content: str, embedding: str = None) -> bool:
+        """Replace what a memory says: a correction, not a second opinion."""
+        with self.get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("UPDATE memory SET content = %s, embedding = %s WHERE id = %s",
+                            (content, embedding, memory_id))
+                return (cur.rowcount or 0) > 0
+
+    def search_memories(self, query_vec, limit: int = 8) -> list:
+        """Memories closest in meaning to a query embedding, with `similarity`."""
+        import cortex.storage.sqlite_backend as sqlite_backend
+        with self.get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT id, type, content, importance, embedding FROM memory WHERE embedding IS NOT NULL")
+                rows = [dict(r) for r in cur.fetchall()]
+        return [{**{k: r[k] for k in ("id", "type", "content", "importance")}, "similarity": float(r["_similarity"])}
+                for r in sqlite_backend.cosine_rank(query_vec, rows, "embedding", limit)]
+
+    def search_memories_keyword(self, query: str, limit: int = 8) -> list:
+        """Memories sharing words with a query; works with no embedding model."""
+        words = self._keywords(query)
+        if not words:
+            return []
+        scored = []
+        for m in self.get_memories(limit=2000):
+            share = len(words & self._keywords(m["content"])) / len(words)
+            if share > 0:
+                scored.append({**m, "similarity": share})
+        return sorted(scored, key=lambda m: -m["similarity"])[:limit]
+
+    def get_learned_upto(self, session_id) -> int:
+        with self.get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT learned_id FROM session_summaries WHERE session_id = %s", (session_id,))
+                row = cur.fetchone()
+        return (row[0] or 0) if row else 0
+
+    def set_learned_upto(self, session_id, message_id):
+        with self.get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO session_summaries (session_id, summary, learned_id) VALUES (%s, '', %s)
+                    ON CONFLICT (session_id) DO UPDATE SET learned_id = EXCLUDED.learned_id
+                """, (session_id, message_id))
 
     def get_memories(self, type: str = None, limit: int = 20) -> list:
         """Retrieve memories, ordered by importance."""

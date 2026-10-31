@@ -60,7 +60,6 @@ context:
 
 memory:
   max_facts: 100
-  summarize_every: 8               # learn facts from a chat every N of your messages
   retention_days: 90
 
 reminders:

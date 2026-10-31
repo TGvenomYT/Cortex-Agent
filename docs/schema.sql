@@ -321,5 +321,6 @@ CREATE TABLE IF NOT EXISTS session_summaries (
     session_id TEXT PRIMARY KEY,
     summary TEXT,
     upto_id INTEGER DEFAULT 0,
+    learned_id INTEGER DEFAULT 0,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );

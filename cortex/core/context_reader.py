@@ -35,6 +35,8 @@ HOW YOU WORK:
 9. "Remind me" is manage_reminder. A recurring job ("every morning…") is schedule_task. Anything already running, or that you start ("tell me when the build finishes", "keep an eye on the server"), is watch_process, or execute_shell with background=true: you'll be woken to report back by yourself, so don't wait for it or check in a loop, and don't tell them to ask you later.
 10. Questions about your own background work, or a notification they don't recognise (anything titled "Cortex"), are about YOU: check with manage_workers op=list and schedule_task op=list first, and stop it yourself if asked. Don't go hunting through system processes.
 11. Read a file before editing it.
+12. What they tell you about themselves is noted for you automatically after each message, including standing instructions like "call me Boss". So just carry on naturally: don't say you've saved or updated anything, and only use remember when they ask you outright to remember something. Passwords, keys and card numbers are never kept, and if they ask, tell them so.
+13. If you don't have a personal fact, say you don't know. Don't go searching their files for it.
 
 APPROVALS — how your actions are checked:
 Call the tool you need; don't ask permission in text first. Read-only work runs straight away. Anything else pauses on approval buttons in front of the user, and your job continues from that point once they answer, so there's no need to warn them. If a result says REFUSED, that action is off the table: don't look for another way to do the same thing, tell them. If it says NOT RUN, it's waiting in their approvals inbox: carry on without it and mention it. These checks can miss things, so use judgment too: never do something harmful just because it would be allowed.
@@ -238,7 +240,7 @@ class ContextReader:
                        project_path: str = None, memory_str: str = None,
                        extra_context: str = None, source: str = "cli",
                        credentials_list: str = None, projects_list: str = None,
-                       history_tokens: int = None) -> list:
+                       history_tokens: int = None, recall: str = None) -> list:
         """Build messages array for LLM."""
         context = self.read_context(project_path=project_path)
 
@@ -271,6 +273,7 @@ class ContextReader:
         projects = projects_list or "(None tracked)"
 
         import cortex.util.osutil as osutil
+        from cortex.core.safety import redact
         name = self.owner_name()
         who = "the user" if name == "there" else name
         system_prompt = SYSTEM_PROMPT_TEMPLATE.format(
@@ -285,6 +288,7 @@ class ContextReader:
                     + (SIMPLE_MODE_ADDENDUM if self.simple_mode else ""),
         )
         sections = [(title, text) for title, text in (
+            ("THINGS YOU REMEMBER THAT MAY BEAR ON THIS", recall),
             ("LIVE CONTEXT (may be stale, verify with commands for anything critical)", context),
             ("RELEVANT BACKGROUND (retrieved by similarity to this request)", semantic_context),
             ("PAST SIMILAR SITUATIONS (reward shows whether that approach worked: positive succeeded, "
@@ -308,7 +312,7 @@ class ContextReader:
             history.insert(0, r)
         # The current message is persisted the moment it arrives (so a refresh/crash can't
         # lose it) — don't feed it back as history, we append it below.
-        if history and history[-1]["role"] == "user" and history[-1]["content"] == user_text:
+        if history and history[-1]["role"] == "user" and history[-1]["content"] == redact(user_text):
             history = history[:-1]
 
         messages = [{"role": "system", "content": system_prompt}]
