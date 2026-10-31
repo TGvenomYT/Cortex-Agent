@@ -119,6 +119,8 @@ def connect_db(config: dict):
     if not db.connect():
         logger.error("DB connection failed")
         return None
+    from cortex.core import usage
+    usage.bind(db)
     return db
 
 

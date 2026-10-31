@@ -36,6 +36,8 @@ import itertools
 
 import httpx
 
+from cortex.core import usage
+
 logger = logging.getLogger("cortex.llm")
 
 
@@ -203,9 +205,9 @@ class LLMBackend:
     def complete_with_tools(self, messages: list[dict], tools: list[dict]) -> dict:
         raise NotImplementedError
 
-    def stream_with_tools(self, messages: list[dict], tools: list[dict]):
+    def stream_with_tools(self, messages: list[dict], tools: list[dict], on_open=None):
         """('delta', text)* then ('done', same dict as complete_with_tools). Backends that
-        can't stream just produce the 'done'."""
+        can't stream just produce the 'done'. on_open gets a function that cuts the call off."""
         yield "done", self.complete_with_tools(messages, tools)
 
 
@@ -258,7 +260,9 @@ class OllamaBackend(LLMBackend):
 
     @property
     def label(self) -> str:
-        return "ollama-cloud" if self.api_key else "local"
+        return "ollama-cloud" if self.api_key else usage.LOCAL
+
+    provider = label
 
     def _headers(self) -> dict:
         return {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
@@ -329,7 +333,9 @@ class OllamaBackend(LLMBackend):
                            timeout=self._httpx_timeout())
         r.raise_for_status()
         logger.info(f"Ollama [{self.model}] {int((time.time()-start)*1000)}ms ({self.label})")
-        return r.json()
+        data = r.json()
+        usage.record(self.provider, self.model, data.get("prompt_eval_count"), data.get("eval_count"))
+        return data
 
     def complete(self, messages: list[dict], json_mode: bool = False, schema: dict = None) -> str:
         payload = self._payload(messages)
@@ -357,12 +363,15 @@ class OllamaBackend(LLMBackend):
         data = self._post(self._payload(messages, tools=tools))
         msg = data.get("message", {})
         return {"content": msg.get("content", ""), "tool_calls": self._calls(msg.get("tool_calls") or []),
-                "thinking": msg.get("thinking", ""), "truncated": data.get("done_reason") == "length"}
+                "thinking": msg.get("thinking", ""), "truncated": data.get("done_reason") == "length",
+                "input_tokens": data.get("prompt_eval_count")}
 
-    def _lines(self, payload: dict):
+    def _lines(self, payload: dict, on_open=None):
         """The stream as parsed chunks. Raises with a readable body on an HTTP error."""
         with httpx.stream("POST", f"{self.base_url}/api/chat", json=payload, headers=self._headers(),
                           timeout=self._httpx_timeout()) as r:
+            if on_open:
+                on_open(r.close)
             if r.status_code >= 400:
                 r.read()
                 r.raise_for_status()
@@ -377,27 +386,30 @@ class OllamaBackend(LLMBackend):
                     raise RuntimeError(chunk["error"])
                 yield chunk
 
-    def _open(self, payload: dict):
+    def _open(self, payload: dict, on_open=None):
         """Start the stream and read its first chunk, so a rejected request surfaces here
         rather than midway through a reply. -> (rest_of_stream, first_chunk)"""
-        stream = self._lines(payload)
+        stream = self._lines(payload, on_open)
         return stream, next(stream, None)
 
-    def stream_with_tools(self, messages: list[dict], tools: list[dict]):
+    def stream_with_tools(self, messages: list[dict], tools: list[dict], on_open=None):
         content, thinking, calls, reason = "", "", [], None
+        input_tokens = output_tokens = None
         start = time.time()
         payload = self._payload(messages, stream=True, tools=tools)
         try:
-            stream, first = self._open(payload)
+            stream, first = self._open(payload, on_open)
         except httpx.HTTPStatusError as e:
             if e.response.status_code != 400 or "tools" not in payload or "tool" not in e.response.text.lower():
                 raise
             self._no_tools = True
             logger.info(f"{self.model} can't call tools; carrying on without them")
-            stream, first = self._open({k: v for k, v in payload.items() if k != "tools"})
+            stream, first = self._open({k: v for k, v in payload.items() if k != "tools"}, on_open)
         for chunk in itertools.chain([first] if first else [], stream):
             msg = chunk.get("message") or {}
             reason = chunk.get("done_reason") or reason
+            input_tokens = chunk.get("prompt_eval_count") or input_tokens
+            output_tokens = chunk.get("eval_count") or output_tokens
             thinking += msg.get("thinking") or ""
             calls.extend(msg.get("tool_calls") or [])
             piece = msg.get("content") or ""
@@ -405,8 +417,9 @@ class OllamaBackend(LLMBackend):
                 content += piece
                 yield "delta", piece
         logger.info(f"Ollama [{self.model}] {int((time.time()-start)*1000)}ms ({self.label}, stream)")
+        usage.record(self.provider, self.model, input_tokens, output_tokens)
         yield "done", {"content": content, "tool_calls": self._calls(calls), "thinking": thinking,
-                       "truncated": reason == "length"}
+                       "truncated": reason == "length", "input_tokens": input_tokens}
 
     def stream(self, messages: list[dict]):
         for c in self._lines(self._payload(messages, stream=True)):
@@ -429,6 +442,11 @@ class OpenAICompatBackend(LLMBackend):
 
     def _headers(self):
         return {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
+
+    def _count(self, data: dict) -> int | None:
+        u = data.get("usage") or {}
+        usage.record(self.label, self.model, u.get("prompt_tokens"), u.get("completion_tokens"))
+        return u.get("prompt_tokens")
 
     def _wire_messages(self, messages):
         out = []
@@ -460,6 +478,7 @@ class OpenAICompatBackend(LLMBackend):
                        json=payload, timeout=self.timeout)
         r.raise_for_status()
         logger.info(f"{self.label} [{self.model}] {int((time.time()-start)*1000)}ms")
+        self._count(r.json())
         return r.json()["choices"][0]["message"].get("content") or ""
 
     def complete_with_tools(self, messages: list[dict], tools: list[dict]) -> dict:
@@ -472,6 +491,7 @@ class OpenAICompatBackend(LLMBackend):
         r.raise_for_status()
         msg = r.json()["choices"][0]["message"]
         logger.info(f"{self.label} [{self.model}] {int((time.time()-start)*1000)}ms (tools)")
+        spent = self._count(r.json())
         tcs = []
         for tc in msg.get("tool_calls") or []:
             fn = tc.get("function", {})
@@ -481,12 +501,13 @@ class OpenAICompatBackend(LLMBackend):
                 args = {}
             tcs.append({"id": tc.get("id") or ("call_" + uuid.uuid4().hex[:8]),
                         "function": {"name": fn.get("name", ""), "arguments": args}})
-        return {"content": msg.get("content") or "", "tool_calls": tcs, "thinking": ""}
+        return {"content": msg.get("content") or "", "tool_calls": tcs, "thinking": "", "input_tokens": spent}
 
 
 # ── Anthropic (Claude) — native Messages API ─────────────────────────────────
 class AnthropicBackend(LLMBackend):
     """Claude via the Anthropic Messages API (POST /v1/messages)."""
+    label = "anthropic"
 
     def __init__(self, api_key: str, model: str = "claude-opus-5-5",
                  timeout: int = 120, max_tokens: int = 4096):
@@ -552,7 +573,10 @@ class AnthropicBackend(LLMBackend):
                        json=payload, timeout=self.timeout)
         r.raise_for_status()
         logger.info(f"anthropic [{self.model}] {int((time.time()-start)*1000)}ms")
-        return r.json()
+        data = r.json()
+        u = data.get("usage") or {}
+        usage.record(self.label, self.model, u.get("input_tokens"), u.get("output_tokens"))
+        return data
 
     def complete(self, messages: list[dict], json_mode: bool = False, schema: dict = None) -> str:
         system, conv = self._convert(messages)
@@ -578,7 +602,8 @@ class AnthropicBackend(LLMBackend):
             elif bt == "tool_use":
                 tcs.append({"id": b.get("id") or ("call_" + uuid.uuid4().hex[:8]),
                             "function": {"name": b.get("name", ""), "arguments": b.get("input") or {}}})
-        return {"content": content, "tool_calls": tcs, "thinking": thinking}
+        return {"content": content, "tool_calls": tcs, "thinking": thinking,
+                "input_tokens": (data.get("usage") or {}).get("input_tokens")}
 
 
 # ── router ───────────────────────────────────────────────────────────────────
@@ -604,12 +629,18 @@ class LLMRouter:
         stalled = isinstance(last_error, httpx.TimeoutException)
         return not (stalled and isinstance(backend, OllamaBackend) and not backend.api_key)
 
+    @staticmethod
+    def _charge_check(backend) -> None:
+        """No cloud call goes out past a spending limit. Raises usage.BudgetExceeded."""
+        usage.check(getattr(backend, "label", usage.LOCAL), getattr(backend, "model", ""))
+
     def _first_answer(self, call, what: str):
         first_error = last_error = None
         for backend in self._chain():
             if not self._worth_trying(backend, last_error):
                 continue
             try:
+                self._charge_check(backend)
                 return call(backend)
             except Exception as e:
                 logger.warning(f"{what} [{getattr(backend, 'model', '?')}] failed: {e}")
@@ -622,14 +653,15 @@ class LLMRouter:
     def complete_with_tools(self, messages, tools):
         return self._first_answer(lambda b: b.complete_with_tools(messages, tools), "LLM (tools)")
 
-    def stream_with_tools(self, messages, tools):
+    def stream_with_tools(self, messages, tools, on_open=None):
         first_error = last_error = None
         for backend in self._chain():
             if not self._worth_trying(backend, last_error):
                 continue
             started = False
             try:
-                for kind, payload in backend.stream_with_tools(messages, tools):
+                self._charge_check(backend)
+                for kind, payload in backend.stream_with_tools(messages, tools, on_open):
                     started = started or kind == "delta"
                     yield kind, payload
                 return

@@ -41,6 +41,9 @@ llm:
 agent:
   max_steps: 12                    # tool steps per job when you're there
   background_max_steps: 6          # ...and in a scheduled task
+  stall_seconds: 150               # a model silent this long is cut off and tried once more
+  max_context_tokens: 100000       # most a cloud model gets per request, however big its window;
+                                   # local models use what they're configured for
 
 context:
   max_age_minutes: 30              # context stays valid for 30 min

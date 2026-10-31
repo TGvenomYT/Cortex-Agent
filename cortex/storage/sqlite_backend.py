@@ -177,6 +177,67 @@ CREATE INDEX IF NOT EXISTS idx_memory_type ON memory(type);
 -- A draft action (e.g. an email) held for the user's explicit yes/no before it
 -- actually runs. One pending row per session_id — see safety.needs_confirmation
 -- and cortex_core.ask_stream's confirmation gate.
+CREATE TABLE IF NOT EXISTS jobs (
+    id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    source TEXT,
+    text TEXT,
+    status TEXT NOT NULL DEFAULT 'running',
+    step INTEGER DEFAULT 0,
+    pid INTEGER,
+    note TEXT,
+    state JSON,
+    started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    beat_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    ended_at TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
+CREATE INDEX IF NOT EXISTS idx_jobs_session ON jobs(session_id);
+
+CREATE TABLE IF NOT EXISTS usage_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    provider TEXT NOT NULL,
+    model TEXT NOT NULL,
+    input_tokens INTEGER DEFAULT 0,
+    output_tokens INTEGER DEFAULT 0,
+    cost_usd REAL,
+    job_id TEXT,
+    session_id TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_usage_at ON usage_log(at);
+
+CREATE TABLE IF NOT EXISTS checkpoints (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id TEXT NOT NULL,
+    session_id TEXT,
+    label TEXT,
+    items JSON,
+    complete INTEGER DEFAULT 1,
+    status TEXT DEFAULT 'active',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_checkpoints_job ON checkpoints(job_id);
+
+CREATE TABLE IF NOT EXISTS watches (
+    id TEXT PRIMARY KEY,
+    session_id TEXT,
+    label TEXT,
+    spec JSON,
+    status TEXT NOT NULL DEFAULT 'active',
+    pid INTEGER,
+    beat_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    ended_at TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS session_summaries (
+    session_id TEXT PRIMARY KEY,
+    summary TEXT,
+    upto_id INTEGER DEFAULT 0,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
 CREATE TABLE IF NOT EXISTS pending_actions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     session_id TEXT NOT NULL,

@@ -33,6 +33,10 @@ TOOLS = [
                 "type": "object",
                 "properties": {
                     "command": {"type": "string", "description": "the exact shell command to run"},
+                    "background": {"type": "boolean", "description": (
+                        "true for anything long-running (a server, a big build or install). It's started "
+                        "and watched for you, and you report back here automatically when it ends, so "
+                        "don't wait or poll. Anything still going after a minute moves there by itself.")},
                 },
                 "required": ["command"],
             },
@@ -277,6 +281,46 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "watch_process",
+            "description": (
+                "Look after something that's ALREADY running and come back to this chat by yourself the "
+                "moment something happens, without the user asking. Use for 'tell me when my build "
+                "finishes', 'keep an eye on this server', 'let me know if that crashes'. It costs nothing "
+                "while it waits. Give exactly one target: pid, process_name, port, file or check_command. "
+                "Prefer this to schedule_task for anything already running, and never poll in a loop. "
+                "op: add | list | stop."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "op": {"type": "string", "enum": ["add", "list", "stop"]},
+                    "label": {"type": ["string", "null"], "description": "short name for what's being watched"},
+                    "note": {"type": ["string", "null"], "description": "what the user wants to know"},
+                    "pid": {"type": ["integer", "null"]},
+                    "process_name": {"type": ["string", "null"], "description": "matched against running commands"},
+                    "port": {"type": ["integer", "null"]},
+                    "file": {"type": ["string", "null"], "description": "a file to wait for, or a log to read"},
+                    "pattern": {"type": ["string", "null"], "description": "with file: the text to look for"},
+                    "check_command": {"type": ["string", "null"], "description": "a read-only command to repeat"},
+                    "until": {"type": ["string", "null"], "description": (
+                        "port: open | closed. check_command: success | fail | changes | contains:<text> | gone:<text>")},
+                    "id": {"type": ["string", "null"], "description": "watch id, for op=stop"},
+                },
+                "required": ["op"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "undo_changes",
+            "description": "Undo what the last job in this chat changed on disk, when the user asks to undo or revert it.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "remember",
             "description": (
                 "Permanently store a fact, preference, or standing rule the moment it comes "
@@ -421,7 +465,7 @@ def tool_call_to_action_data(tool_call: dict) -> dict:
     args = fn.get("arguments") or {}
 
     if name == "execute_shell":
-        return {"action": "execute", "command": args.get("command")}
+        return {"action": "execute", "command": args.get("command"), "background": bool(args.get("background"))}
     if name == "web_search":
         return {"action": "search", "search_query": args.get("query")}
     if name == "browse_url":
@@ -471,6 +515,14 @@ def tool_call_to_action_data(tool_call: dict) -> dict:
     if name == "manage_workers":
         return {"action": "workers", "workers_op": args.get("op", "list"),
                 "worker": args.get("worker"), "profile": args.get("profile")}
+    if name == "watch_process":
+        return {"action": "watch", "watch_op": args.get("op", "add"), "watch_label": args.get("label"),
+                "watch_note": args.get("note"), "watch_pid": args.get("pid"), "watch_process": args.get("process_name"),
+                "watch_port": args.get("port"), "watch_file": args.get("file"), "watch_pattern": args.get("pattern"),
+                "watch_command": args.get("check_command"), "watch_until": args.get("until"),
+                "watch_id": args.get("id")}
+    if name == "undo_changes":
+        return {"action": "undo"}
     if name == "request_credentials":
         return {"action": "credential_prompt", "credential_prompt_site": args.get("site"), "credential_prompt_for": args.get("purpose")}
 

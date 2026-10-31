@@ -26,6 +26,7 @@ Modes (Settings → Background → Approvals):
 """
 from __future__ import annotations
 
+import glob
 import os
 import re
 import shlex
@@ -461,6 +462,68 @@ def classify_shell(command: str) -> tuple[str, str, str]:
     return ("safe", "unknown", "danger", "block")[level], why, key
 
 
+def write_targets(command: str, cwd: str = None) -> tuple[list, bool]:
+    """What a shell command will change on this machine, for keeping an undo copy.
+    -> (paths, complete). complete is False if it may also change things that can't be
+    told from its text: a script, an installer, anything on another machine."""
+    tokens = _tokens(command or "")
+    if tokens is None or _opaque(command or ""):
+        return [], False
+    pipelines, writes = _split(tokens)
+    here = cwd or os.getcwd()
+    paths, complete = [], True
+
+    def at(p):
+        return os.path.normpath(os.path.join(here, _expand(p)))
+
+    def add(p):
+        hits = glob.glob(at(p)) if any(c in p for c in "*?[") else []
+        paths.extend(hits or [at(p)])
+
+    for pipeline in pipelines:
+        for argv in pipeline:
+            i = 0
+            while i < len(argv) and re.match(r"^[A-Za-z_]\w*=", argv[i]):
+                i += 1
+            argv = argv[i:]
+            while argv and os.path.basename(argv[0]).lower() in _WRAPPERS:
+                argv = _after_flags(argv[1:])
+            if not argv:
+                continue
+            prog, args = os.path.basename(argv[0]).lower(), argv[1:]
+            plain = [a for a in args if not a.startswith("-")]
+            if prog == "cd":
+                here = at(plain[0]) if plain else os.path.expanduser("~")
+            elif _simple(prog, args, " ".join(argv), set(), 0)[0] == _SAFE:
+                continue
+            elif prog in ("rm", "unlink", "rmdir", "truncate", "shred", "touch", "mkdir", "tee"):
+                for p in plain:
+                    if not (prog == "truncate" and p.isdigit()):
+                        add(p)
+            elif prog == "mv" and len(plain) >= 2:
+                dest = at(plain[-1])
+                for src in plain[:-1]:
+                    add(src)
+                    paths.append(os.path.join(dest, os.path.basename(src)) if os.path.isdir(dest) else dest)
+            elif prog == "cp" and len(plain) >= 2:
+                dest = at(plain[-1])
+                for src in plain[:-1]:
+                    paths.append(os.path.join(dest, os.path.basename(src)) if os.path.isdir(dest) else dest)
+            elif prog == "ln" and plain:
+                add(plain[-1])
+            elif prog == "sed" and len(plain) >= 2:
+                for p in plain[1:]:
+                    add(p)
+            elif prog in ("chmod", "chown", "chgrp") and len(plain) >= 2:
+                for p in plain[1:]:
+                    add(p)
+            else:
+                complete = False
+    for path in writes:
+        add(path)
+    return paths, complete
+
+
 def is_catastrophic(command: str) -> tuple[bool, str]:
     """Commands refused outright, even with the user's approval."""
     level, why, _ = classify_shell(command)
@@ -593,6 +656,20 @@ def evaluate(action: dict, *, tainted: bool = False, background: bool = False,
     if kind == "forget":
         target = action.get("forget_search") or f"#{action.get('forget_id')}"
         return Verdict(ALLOW) if not tainted else Verdict(ASK, f"Forget {target}?")
+
+    if kind == "watch":
+        op = action.get("watch_op", "add")
+        if op == "list":
+            return Verdict(ALLOW)
+        if op == "stop":
+            return Verdict(ALLOW) if not tainted else Verdict(ASK, f"Stop watch {action.get('watch_id')}?")
+        cmd = action.get("watch_command")
+        if cmd and classify_shell(cmd)[0] != "safe":
+            return Verdict(ASK, f"I'd like to keep checking this:\n\n```\n{cmd}\n```\n\nIt isn't read-only, so OK?")
+        return Verdict(ALLOW) if not tainted else Verdict(ASK, f"Keep an eye on {action.get('watch_label')}?")
+
+    if kind == "undo":
+        return Verdict(ASK, "Undo the changes from my last job in this chat?")
 
     if kind == "mcp":
         name = action.get("mcp_name", "")

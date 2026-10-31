@@ -260,3 +260,66 @@ BEGIN
     RETURN deleted_count;
 END;
 $$ LANGUAGE plpgsql;
+
+-- Runtime tables. Local to each machine: jobs, usage, undo copies and watches aren't synced.
+
+CREATE TABLE IF NOT EXISTS jobs (
+    id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    source TEXT,
+    text TEXT,
+    status TEXT NOT NULL DEFAULT 'running',
+    step INTEGER DEFAULT 0,
+    pid INTEGER,
+    note TEXT,
+    state JSONB,
+    started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    beat_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    ended_at TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
+CREATE INDEX IF NOT EXISTS idx_jobs_session ON jobs(session_id);
+
+CREATE TABLE IF NOT EXISTS usage_log (
+    id SERIAL PRIMARY KEY,
+    at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    provider TEXT NOT NULL,
+    model TEXT NOT NULL,
+    input_tokens INTEGER DEFAULT 0,
+    output_tokens INTEGER DEFAULT 0,
+    cost_usd REAL,
+    job_id TEXT,
+    session_id TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_usage_at ON usage_log(at);
+
+CREATE TABLE IF NOT EXISTS checkpoints (
+    id SERIAL PRIMARY KEY,
+    job_id TEXT NOT NULL,
+    session_id TEXT,
+    label TEXT,
+    items JSONB,
+    complete INTEGER DEFAULT 1,
+    status TEXT DEFAULT 'active',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_checkpoints_job ON checkpoints(job_id);
+
+CREATE TABLE IF NOT EXISTS watches (
+    id TEXT PRIMARY KEY,
+    session_id TEXT,
+    label TEXT,
+    spec JSONB,
+    status TEXT NOT NULL DEFAULT 'active',
+    pid INTEGER,
+    beat_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    ended_at TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS session_summaries (
+    session_id TEXT PRIMARY KEY,
+    summary TEXT,
+    upto_id INTEGER DEFAULT 0,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);

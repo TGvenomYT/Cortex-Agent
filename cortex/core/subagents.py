@@ -346,7 +346,7 @@ class SubagentManager:
         return {"ok": True, "summary": summary, "steps": steps, "needs_approval": asked_approval,
                 "tainted": tainted}
 
-    def run_stream(self, subtasks: list[dict], task_text: str, source: str, parallel: int):
+    def run_stream(self, subtasks: list[dict], task_text: str, source: str, parallel: int, check=None):
         """Generator: yields live `subagent`/`image` events while helpers work, then a final
         {"type": "_results", "results": [...]} (internal; the caller consumes it)."""
         n = len(subtasks)
@@ -374,7 +374,12 @@ class SubagentManager:
                 pool.submit(work, i)
             finished = 0
             while finished < n:
-                ev = q.get()
+                try:
+                    ev = q.get(timeout=0.3)
+                except queue.Empty:
+                    if check:
+                        check()
+                    continue
                 if ev is _DONE:
                     finished += 1
                 else:

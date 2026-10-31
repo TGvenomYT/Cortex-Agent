@@ -890,6 +890,200 @@ class Database:
                 row = cur.fetchone()
                 return dict(row) if row else None
 
+    # ─── Jobs (see cortex/core/runtime.py) ───
+
+    def job_start(self, job_id, session_id, source, text, pid):
+        with self.get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO jobs (id, session_id, source, text, status, pid)
+                    VALUES (%s, %s, %s, %s, 'running', %s)
+                    ON CONFLICT (id) DO UPDATE SET status = 'running', pid = EXCLUDED.pid,
+                        beat_at = CURRENT_TIMESTAMP, ended_at = NULL
+                """, (job_id, session_id, source, text, pid))
+
+    def job_save(self, job_id, step, state: dict):
+        with self.get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("UPDATE jobs SET step = %s, state = %s, beat_at = CURRENT_TIMESTAMP WHERE id = %s",
+                            (step, json.dumps(state, default=str), job_id))
+
+    def job_beat(self, job_id):
+        with self.get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("UPDATE jobs SET beat_at = CURRENT_TIMESTAMP WHERE id = %s", (job_id,))
+
+    def job_end(self, job_id, status, note=""):
+        with self.get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("UPDATE jobs SET status = %s, note = %s, ended_at = CURRENT_TIMESTAMP WHERE id = %s",
+                            (status, note, job_id))
+
+    def get_job(self, job_id) -> dict | None:
+        with self.get_conn() as conn:
+            with conn.cursor(cursor_factory=extras.RealDictCursor) as cur:
+                cur.execute("SELECT * FROM jobs WHERE id = %s", (job_id,))
+                row = cur.fetchone()
+        if not row:
+            return None
+        job = dict(row)
+        if isinstance(job.get("state"), str):
+            job["state"] = json.loads(job["state"])
+        return job
+
+    def jobs_with_status(self, status, session_id=None, limit=50) -> list:
+        q = "SELECT id, session_id, source, text, step, pid, note, started_at FROM jobs WHERE status = %s"
+        params = [status]
+        if session_id:
+            q += " AND session_id = %s"
+            params.append(session_id)
+        with self.get_conn() as conn:
+            with conn.cursor(cursor_factory=extras.RealDictCursor) as cur:
+                cur.execute(q + " ORDER BY started_at DESC LIMIT %s", params + [limit])
+                return [dict(r) for r in cur.fetchall()]
+
+    # ─── Usage (see cortex/core/usage.py) ───
+
+    def add_usage(self, provider, model, input_tokens, output_tokens, cost, job_id=None, session_id=None):
+        with self.get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO usage_log (provider, model, input_tokens, output_tokens, cost_usd, job_id, session_id)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                """, (provider, model, input_tokens, output_tokens, cost, job_id, session_id))
+
+    def usage_totals(self, since) -> dict:
+        """Cloud use since a moment (naive UTC). Local models are free and don't count."""
+        with self.get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT COALESCE(SUM(cost_usd), 0), COALESCE(SUM(input_tokens + output_tokens), 0)
+                    FROM usage_log WHERE provider != 'local' AND at >= %s
+                """, (since,))
+                row = cur.fetchone()
+        return {"usd": float(row[0]), "tokens": int(row[1])}
+
+    def usage_by_model(self, since) -> list:
+        with self.get_conn() as conn:
+            with conn.cursor(cursor_factory=extras.RealDictCursor) as cur:
+                cur.execute("""
+                    SELECT provider, model, COUNT(*) AS calls, SUM(input_tokens) AS input_tokens,
+                           SUM(output_tokens) AS output_tokens, SUM(cost_usd) AS cost_usd
+                    FROM usage_log WHERE at >= %s
+                    GROUP BY provider, model ORDER BY SUM(input_tokens + output_tokens) DESC
+                """, (since,))
+                return [dict(r) for r in cur.fetchall()]
+
+    # ─── Undo (see cortex/core/checkpoints.py) ───
+
+    def checkpoint_add(self, job_id, session_id, label) -> int:
+        with self.get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("INSERT INTO checkpoints (job_id, session_id, label) VALUES (%s, %s, %s) RETURNING id",
+                            (job_id, session_id, label))
+                return cur.fetchone()[0]
+
+    def checkpoint_set(self, cp_id, items, complete):
+        with self.get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("UPDATE checkpoints SET items = %s, complete = %s WHERE id = %s",
+                            (json.dumps(items), 1 if complete else 0, cp_id))
+
+    def checkpoint_mark(self, cp_id, status):
+        with self.get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("UPDATE checkpoints SET status = %s WHERE id = %s", (status, cp_id))
+
+    def checkpoints_for_job(self, job_id) -> list:
+        with self.get_conn() as conn:
+            with conn.cursor(cursor_factory=extras.RealDictCursor) as cur:
+                cur.execute("SELECT id, label, items, complete FROM checkpoints "
+                            "WHERE job_id = %s AND status = 'active' ORDER BY id", (job_id,))
+                rows = [dict(r) for r in cur.fetchall()]
+        for r in rows:
+            r["items"] = json.loads(r["items"]) if isinstance(r["items"], str) else (r["items"] or [])
+        return rows
+
+    def last_undoable_job(self, session_id):
+        with self.get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT job_id FROM checkpoints WHERE session_id = %s AND status = 'active' "
+                            "ORDER BY id DESC LIMIT 1", (session_id,))
+                row = cur.fetchone()
+        return row[0] if row else None
+
+    # ─── Watches (see cortex/core/watchers.py) ───
+
+    def watch_add(self, watch_id, session_id, label, spec):
+        with self.get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("INSERT INTO watches (id, session_id, label, spec) VALUES (%s, %s, %s, %s)",
+                            (watch_id, session_id, label, json.dumps(spec)))
+
+    def watch_get(self, watch_id) -> dict | None:
+        rows = self.watches_where("id = %s", (watch_id,))
+        return rows[0] if rows else None
+
+    def watches_where(self, clause, params=()) -> list:
+        with self.get_conn() as conn:
+            with conn.cursor(cursor_factory=extras.RealDictCursor) as cur:
+                cur.execute(f"SELECT * FROM watches WHERE {clause} ORDER BY created_at DESC", params)
+                rows = [dict(r) for r in cur.fetchall()]
+        for r in rows:
+            r["spec"] = json.loads(r["spec"]) if isinstance(r["spec"], str) else (r["spec"] or {})
+        return rows
+
+    def watch_update(self, watch_id, status=None, pid=None, spec=None):
+        sets, params = ["beat_at = CURRENT_TIMESTAMP"], []
+        if status:
+            sets.append("status = %s")
+            params.append(status)
+            if status != "active":
+                sets.append("ended_at = CURRENT_TIMESTAMP")
+        if pid is not None:
+            sets.append("pid = %s")
+            params.append(pid)
+        if spec is not None:
+            sets.append("spec = %s")
+            params.append(json.dumps(spec))
+        with self.get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(f"UPDATE watches SET {', '.join(sets)} WHERE id = %s", params + [watch_id])
+
+    # ─── Conversation windowing (see cortex/core/context_manager.py) ───
+
+    def recent_messages(self, session_id, after_id=0, limit=400) -> list:
+        """A chat's newest messages after a row id, oldest first, each with its id."""
+        with self.get_conn() as conn:
+            with conn.cursor(cursor_factory=extras.RealDictCursor) as cur:
+                cur.execute("""
+                    SELECT id, role, content FROM conversations
+                    WHERE session_id = %s AND id > %s ORDER BY id DESC LIMIT %s
+                """, (session_id, after_id, limit))
+                return [dict(r) for r in reversed(cur.fetchall())]
+
+    def latest_message_id(self, session_id) -> int:
+        with self.get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT COALESCE(MAX(id), 0) FROM conversations WHERE session_id = %s", (session_id,))
+                return cur.fetchone()[0]
+
+    def get_session_summary(self, session_id) -> tuple:
+        with self.get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT summary, upto_id FROM session_summaries WHERE session_id = %s", (session_id,))
+                row = cur.fetchone()
+        return (row[0], row[1]) if row else ("", 0)
+
+    def set_session_summary(self, session_id, summary, upto_id):
+        with self.get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO session_summaries (session_id, summary, upto_id) VALUES (%s, %s, %s)
+                    ON CONFLICT (session_id) DO UPDATE SET summary = EXCLUDED.summary, upto_id = EXCLUDED.upto_id,
+                        updated_at = CURRENT_TIMESTAMP
+                """, (session_id, summary, upto_id))
+
     def get_open_proposals(self, limit: int = 30, max_age_days: int = 7) -> list:
         """The approvals inbox: proposals nobody has answered yet, newest first."""
         from datetime import timezone

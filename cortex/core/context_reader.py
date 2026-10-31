@@ -32,7 +32,7 @@ HOW YOU WORK:
 6. Commands run in {shell}. Use commands that exist there.
 7. "My server" means the configured server (see CONFIGURED SERVER below, if present). "Local" or "my computer" means run it directly.
 8. News, prices, or anything time-sensitive: web_search. Never answer those from memory.
-9. "Remind me" is manage_reminder. "Every morning…", "keep an eye on…", "tell me when X happens" is schedule_task.
+9. "Remind me" is manage_reminder. A recurring job ("every morning…") is schedule_task. Anything already running, or that you start ("tell me when the build finishes", "keep an eye on the server"), is watch_process, or execute_shell with background=true: you'll be woken to report back by yourself, so don't wait for it or check in a loop, and don't tell them to ask you later.
 10. Questions about your own background work, or a notification they don't recognise (anything titled "Cortex"), are about YOU: check with manage_workers op=list and schedule_task op=list first, and stop it yourself if asked. Don't go hunting through system processes.
 11. Read a file before editing it.
 
@@ -237,7 +237,8 @@ class ContextReader:
     def build_messages(self, user_text: str, session_id: str,
                        project_path: str = None, memory_str: str = None,
                        extra_context: str = None, source: str = "cli",
-                       credentials_list: str = None, projects_list: str = None) -> list:
+                       credentials_list: str = None, projects_list: str = None,
+                       history_tokens: int = None) -> list:
         """Build messages array for LLM."""
         context = self.read_context(project_path=project_path)
 
@@ -293,15 +294,27 @@ class ContextReader:
             owner_name=who, current_time=datetime.now().strftime("%A, %B %d %Y %H:%M"),
             sections="\n\n".join(f"{title}:\n{text}" for title, text in sections))
 
-        # A scheduled task only needs to know how its last run or two went.
-        history_limit = {"siri": 15, "task": 4}.get(source, self.history_limit)
-        history = self.db.get_conversations(session_id=session_id, limit=history_limit)
+        # A scheduled task only needs to know how its last run or two went. Everything else
+        # gets as much of the chat as fits this model (see context_manager.py).
+        summary, upto = self.db.get_session_summary(session_id)
+        rows = self.db.recent_messages(session_id, after_id=upto,
+                                       limit={"siri": 15, "task": 4}.get(source, 400))
+        room = int(history_tokens * 3.3) if history_tokens else None
+        history, used = [], 0
+        for r in reversed(rows):
+            used += len(r["content"] or "")
+            if (room and used > room) or (not room and len(history) >= self.history_limit):
+                break
+            history.insert(0, r)
         # The current message is persisted the moment it arrives (so a refresh/crash can't
         # lose it) — don't feed it back as history, we append it below.
         if history and history[-1]["role"] == "user" and history[-1]["content"] == user_text:
             history = history[:-1]
 
         messages = [{"role": "system", "content": system_prompt}]
+        if summary:     # stays put between compactions, so the prompt cache keeps working
+            messages.append({"role": "user", "content": f"[Summary of this chat so far]\n{summary}"})
+            messages.append({"role": "assistant", "content": "Got it, I have that context."})
 
         def add(role: str, content: str):
             # An interrupted turn leaves two user messages in a row; merge same-role

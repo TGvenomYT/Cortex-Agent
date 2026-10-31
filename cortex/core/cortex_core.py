@@ -24,10 +24,15 @@ import os
 import re
 import json
 import time
+import uuid
+import queue
 import logging
+import threading
+import contextvars
 from datetime import datetime
 
-from cortex.core import safety
+from cortex.core import safety, usage
+from cortex.core.runtime import Runtime, JobStopped, ModelStalled
 
 logger = logging.getLogger("cortex.core")
 
@@ -37,6 +42,9 @@ HUMAN_SOURCES = {"gui", "cli", "voice", "siri"}
 OUTSIDE_TOOLS = {"search", "browse", "browser", "crawl", "email_check", "email_search", "mcp"}
 _FETCH_CMD = re.compile(r"\b(curl|wget|gh)\b")
 _TURN_BUDGET = 600      # seconds one job may spend in the agent loop
+_MOVE_TO_BACKGROUND = 60    # a command still going after this keeps running under a watcher
+_TOOL_LIMIT = 180       # a tool that isn't a shell command gets this long
+_MAX_FAILS_IN_A_ROW = 5
 
 _FINAL_SYNTH = (
     "You just worked on a task for {who}. Here's a log of what you did and found.\n"
@@ -61,6 +69,7 @@ class _TurnRecorder:
     rich — the thinking/tool/helper trace, charts, image grids — and a reloaded chat looks
     like it did live (it used to come back as bare text)."""
     _TRACE = ("thinking", "tool", "observation", "subagent", "note")
+    _KEEP = ("undoable",)
     _MAX_EVENTS = 60
 
     def __init__(self):
@@ -75,6 +84,8 @@ class _TurnRecorder:
             self.media.append({"t": "image", "src": ev.get("src"), "caption": ev.get("caption", "")})
         elif t == "images":
             self.media.append({"t": "images", "items": ev.get("items", [])[:8], "query": ev.get("query", "")})
+        elif t in self._KEEP:
+            self.media.append({"t": t, **{k: v for k, v in ev.items() if k != "type"}})
         elif t == "answer":
             self.answer = ev.get("text") or ""
 
@@ -88,7 +99,8 @@ class _TurnRecorder:
 class _Job:
     """What one job carries through the agent loop. Survives an approval pause (to_dict)."""
     def __init__(self, text: str, session_id: str, source: str, tainted: bool = False,
-                 work_log: list = None, step: int = 0, chart_shown: bool = False):
+                 work_log: list = None, step: int = 0, chart_shown: bool = False, job_id: str = None):
+        self.id = job_id or uuid.uuid4().hex[:12]
         self.text, self.session_id, self.source = text, session_id, source
         self.tainted = tainted
         self.work_log = work_log if work_log is not None else []
@@ -97,6 +109,9 @@ class _Job:
         self.notices: list[str] = []
         self.done: set[str] = set()     # what this job already did, to catch a model going round in circles
         self.repeats = 0
+        self.fails_in_a_row = 0
+        self.stalls = 0
+        self.budget = None
         self.llm_failed = False
         self.exit_code = None
 
@@ -105,7 +120,7 @@ class _Job:
         return self.source not in HUMAN_SOURCES
 
     def to_dict(self) -> dict:
-        return {"text": self.text, "tainted": self.tainted, "work_log": self.work_log[-20:],
+        return {"id": self.id, "text": self.text, "tainted": self.tainted, "work_log": self.work_log[-20:],
                 "step": self.step, "chart_shown": self.chart_shown}
 
 
@@ -126,6 +141,12 @@ class CortexCore:
         agent_cfg = self.config.get("agent", {})
         self.max_steps = agent_cfg.get("max_steps", 12)
         self.background_max_steps = agent_cfg.get("background_max_steps", 6)
+        self.cloud_context_cap = agent_cfg.get("max_context_tokens", 100_000)
+        from cortex.core.checkpoints import Checkpoints
+        self.runtime = Runtime(self.db, agent_cfg)
+        self.undo = Checkpoints(self.db)
+        self.runtime.recover()
+        self.undo.prune()
         self._grants: dict[str, set] = {}     # session_id -> what "allow in this chat" covers
         self._last_experience: dict[str, int] = {}
         from cortex.core.subagents import SubagentManager
@@ -174,6 +195,8 @@ class CortexCore:
         """Turn an LLM failure into something the user can act on, naming the real cause
         (bad key, model not found, rate limit…) instead of a generic 'can't reach a model'."""
         import httpx
+        if isinstance(e, usage.BudgetExceeded):
+            return f"{e}, so I've stopped using cloud models. You can raise it in **Settings → Usage**."
         model = getattr(getattr(self.llm, "primary", None), "model", "the selected model")
         if isinstance(e, httpx.HTTPStatusError):
             code = e.response.status_code
@@ -274,11 +297,9 @@ class CortexCore:
             tools = [t for t in tools if (t.get("function") or {}).get("name") != "delegate"]
         return tools + extra
 
-    def _obs_limit(self) -> int:
-        """How much of a tool's output to show the model. A cloud model has room for far
-        more than a small local one, which starts dropping its instructions when flooded."""
-        local = getattr(self.llm, "is_local", lambda: True)()
-        return 3000 if local else 10000
+    def _budget(self, tools: list = None):
+        from cortex.core.context_manager import ContextBudget
+        return ContextBudget(getattr(self.llm, "primary", None), tools, self.cloud_context_cap)
 
     # ── public: non-streaming (consumes the stream) ────────────────────────
     def ask(self, text: str, session_id: str = "cli", source: str = "cli") -> dict:
@@ -392,7 +413,7 @@ class CortexCore:
         extra = "\n\n".join(x for x in [self._server_context(), rag] if x) or None
         messages = self.context_reader.build_messages(
             user_text=text, session_id=session_id, memory_str=memory_str, source=source,
-            extra_context=extra,
+            extra_context=extra, history_tokens=self._budget(self._tools()).history_tokens(),
         )
         job = _Job(text, session_id, source, tainted=bool(rag))
 
@@ -428,15 +449,79 @@ class CortexCore:
             job.work_log.append(f"[helper: {st['title']}] {(r or {}).get('summary', '')}")
             job.tainted = job.tainted or bool((r or {}).get("tainted"))
 
-    def _model_step(self, messages: list, tools: list):
-        """One model call as ('delta', text)* then ('done', result)."""
+    def _model_step(self, messages: list, tools: list, handle):
+        """One model call as ('delta', text)* then ('done', result). It runs on its own thread,
+        so the job can still be stopped, or cut off by the watchdog, while the model is silent."""
+        results: queue.Queue = queue.Queue()
         stream = getattr(self.llm, "stream_with_tools", None)
-        if stream is None:
-            yield "done", self.llm.complete_with_tools(messages, tools=tools)
-        else:
-            yield from stream(messages, tools)
 
-    def _agent_loop(self, messages: list, job: _Job):
+        def pump():
+            try:
+                if stream is None:
+                    results.put(("done", self.llm.complete_with_tools(messages, tools=tools)))
+                else:
+                    for item in stream(messages, tools, on_open=handle.add_closer):
+                        results.put(item)
+            except Exception as e:
+                results.put(("error", e))
+            results.put(("end", None))
+
+        threading.Thread(target=contextvars.copy_context().run, args=(pump,), name="model-call", daemon=True).start()
+        handle.touch("model")
+        told = 0
+        while True:
+            try:
+                kind, payload = results.get(timeout=0.25)
+            except queue.Empty:
+                handle.check()
+                waited = int(handle.idle())
+                if waited >= told + 15:
+                    told = waited
+                    yield "status", f"still working… {waited}s"
+                continue
+            if kind == "end":
+                return
+            if kind == "error":
+                handle.check()      # being cut off surfaces here as a broken connection
+                raise payload
+            handle.touch()
+            yield kind, payload
+
+    def _agent_loop(self, messages: list, job: _Job, first: dict = None):
+        """Run a job under the runtime: recorded, stoppable, watched. `first` is an action the
+        user just answered, picked up before the model is asked anything."""
+        handle = self.runtime.begin(job)
+        usage.current_job.set(handle)
+        try:
+            outcome = yield from self._run_job(messages, job, handle, first)
+            self.runtime.end(handle, outcome)
+        except JobStopped as e:
+            self.runtime.end(handle, "stopped", str(e))
+            yield from self._stopped(job, str(e))
+        except GeneratorExit:
+            self.runtime.end(handle, "interrupted", "the caller went away")
+            raise
+        except Exception as e:
+            self.runtime.end(handle, "failed", str(e)[:300])
+            raise
+        finally:
+            usage.current_job.set(None)
+
+    def _stopped(self, job: _Job, reason: str):
+        done = len(job.work_log)
+        speak = f"Stopped ({reason})." + (f" I'd done {done} step{'' if done == 1 else 's'} by then." if done else "")
+        action = {"action": "answer", "speak": speak, "steps": done, "stopped": True}
+        self._finish(job.session_id, job.text, action)
+        yield {"type": "answer", "text": speak}
+        yield from self._offer_undo(job)
+        yield {"type": "final", "action": action}
+
+    def _offer_undo(self, job: _Job):
+        summary = self.undo.summary(job.id)
+        if summary:
+            yield {"type": "undoable", **summary}
+
+    def _run_job(self, messages: list, job: _Job, handle, first: dict = None):
         from cortex.llm.tools import tool_call_to_action_data, rescue_tool_calls
         tools_list = self._tools()
         known = {(t.get("function") or {}).get("name") for t in tools_list}
@@ -444,21 +529,50 @@ class CortexCore:
         deadline = time.time() + _TURN_BUDGET
         mode = safety.current_mode()
         grants = self._grants.get(job.session_id, set())
+        job.budget = self._budget(tools_list)
         last_action, final_speak, held = {"action": "answer"}, None, None
         ask_options, asked = [], False
         retried_empty = False
 
+        if first:       # what the user just answered
+            if first.get("cancelled"):
+                obs = "cancelled by the user before it ran"
+                job.work_log.append(f"[{first['action'].get('action')}] {obs}")
+            else:
+                obs = yield from self._perform(first["action"], job, approved=True)
+            messages.append({"role": "tool", "tool_call_id": first.get("tool_call_id") or "",
+                             "tool_name": first.get("tool_name") or "", "content": obs})
+            self.runtime.save(handle, messages, job)
+
         while job.step < limit and time.time() < deadline and not held and not asked:
+            handle.check()
+            if job.repeats >= 2 or job.fails_in_a_row >= _MAX_FAILS_IN_A_ROW:
+                break               # it's going round in circles; ask for the answer instead
             job.step += 1
+            freed = job.budget.prepare(messages, self.llm, job.text)
+            if freed:
+                yield {"type": "note", "text": freed}
+            yield {"type": "context", "percent": job.budget.percent(messages), "limit": job.budget.limit}
             result = None
-            if job.repeats >= 2:    # it's going round in circles; ask for the answer instead
-                break
             try:
-                for kind, payload in self._model_step(messages, tools_list):
+                for kind, payload in self._model_step(messages, tools_list, handle):
                     if kind == "delta":
                         yield {"type": "delta", "text": payload}
+                    elif kind == "status":
+                        yield {"type": "status", "text": payload}
                     else:
                         result = payload
+            except ModelStalled:
+                job.stalls += 1
+                if job.stalls >= 2:
+                    final_speak = "The model has stopped responding, so I've ended this job. Try again, or pick another model."
+                    job.llm_failed = True
+                    break
+                yield {"type": "note", "text": "The model went quiet, so I'm trying that step again."}
+                job.step -= 1
+                continue
+            except JobStopped:
+                raise
             except Exception as e:
                 logger.error(f"LLM unavailable: {e}")
                 final_speak = self._llm_error_message(e)
@@ -466,6 +580,7 @@ class CortexCore:
                 break
 
             result = rescue_tool_calls(result or {}, known)
+            job.budget.calibrate(result.get("input_tokens"), messages)
             think = (result.get("thinking") or result.get("content") or "").strip()
             tool_calls = result.get("tool_calls") or []
 
@@ -499,6 +614,11 @@ class CortexCore:
                 def reply(content):
                     messages.append({"role": "tool", "tool_call_id": _tcid, "tool_name": _nm, "content": content})
 
+                def skip_the_rest(why):
+                    for later in tool_calls[i + 1:]:
+                        messages.append({"role": "tool", "tool_call_id": later.get("id") or "",
+                                         "tool_name": (later.get("function") or {}).get("name", ""), "content": why})
+
                 if action.get("action") == "ask":   # the model needs the user to decide
                     if job.background:
                         reply("Nobody is here to answer. Decide yourself or say what you need in your reply.")
@@ -507,10 +627,7 @@ class CortexCore:
                     ask_options = action.get("options") or []
                     asked = True
                     reply("asked the user; their answer comes as the next message")
-                    for later in tool_calls[i + 1:]:
-                        messages.append({"role": "tool", "tool_call_id": later.get("id") or "",
-                                         "tool_name": (later.get("function") or {}).get("name", ""),
-                                         "content": "skipped — waiting for the user"})
+                    skip_the_rest("skipped — waiting for the user")
                     break
 
                 signature = json.dumps(action, sort_keys=True, default=str)
@@ -537,11 +654,8 @@ class CortexCore:
                         reply("NOT RUN — this needs the user's approval and they aren't here. It's in their "
                               "approvals inbox. Carry on without it and mention that it's waiting.")
                         continue
-                    for later in tool_calls[i + 1:]:
-                        messages.append({"role": "tool", "tool_call_id": later.get("id") or "",
-                                         "tool_name": (later.get("function") or {}).get("name", ""),
-                                         "content": "skipped — an earlier step is waiting for the user's "
-                                                    "approval. Do this again if it's still needed."})
+                    skip_the_rest("skipped — an earlier step is waiting for the user's approval. "
+                                  "Do this again if it's still needed.")
                     held = (action, verdict, _tcid, _nm)
                     final_speak = verdict.message
                     break
@@ -549,8 +663,12 @@ class CortexCore:
                 obs = yield from self._perform(action, job)
                 reply(obs)
 
+            self.runtime.save(handle, messages, job)
+
         if held:
+            from cortex.core.checkpoints import undo_note
             action, verdict, tcid, name = held
+            final_speak += undo_note(action)
             pid = self.db.save_pending_action(
                 job.session_id, action.get("action", ""),
                 {**action, "_resume": {"messages": messages, "tool_call_id": tcid, "tool_name": name,
@@ -564,11 +682,12 @@ class CortexCore:
             yield {"type": "answer", "text": final_speak}
             yield {"type": "approval", **approval}
             yield {"type": "final", "action": last_action}
-            return
+            return "waiting_approval"
 
         if final_speak is None and not job.llm_failed and job.work_log:
             final_speak = self._closing_answer(messages, tools_list)
         yield from self._finish_turn(job, last_action, final_speak, asked, ask_options)
+        return "failed" if job.llm_failed else "done"
 
     def _closing_answer(self, messages: list, tools: list) -> str | None:
         """The job ran out of steps or stalled: have the model answer from everything it saw,
@@ -614,6 +733,12 @@ class CortexCore:
             last_action["error"] = True
         self._finish(job.session_id, job.text, last_action, exit_code=job.exit_code, learn=not job.background)
         yield {"type": "answer", "text": final_speak}
+        yield from self._offer_undo(job)
+        warning = usage.near_limit() if not job.background else None
+        if warning:
+            yield {"type": "note", "text": warning}
+        if not job.background and not job.llm_failed:
+            self._tidy_chat(job)
         if asked:
             yield {"type": "ask", "options": ask_options}
         elif job.source == "gui" and not job.llm_failed and self._want_followups(final_speak):
@@ -621,6 +746,14 @@ class CortexCore:
             if fu:
                 yield {"type": "followups", "items": fu}
         yield {"type": "final", "action": last_action}
+
+    def _tidy_chat(self, job: _Job) -> None:
+        """If this chat has outgrown the model, fold its old part into the summary, off to the side."""
+        from cortex.core.context_manager import compact_chat
+        try:
+            self.memory_mgr._executor.submit(compact_chat, self.db, self.llm, job.session_id, job.budget)
+        except Exception as e:
+            logger.debug(f"chat compaction not started: {e}")
 
     def _mcp_readonly(self, action: dict) -> bool:
         if action.get("action") != "mcp" or not self.mcp:
@@ -656,7 +789,9 @@ class CortexCore:
                 return verdict["reason"]
             subs, results = verdict["subtasks"], None
             yield {"type": "note", "text": f"Splitting into {len(subs)} helpers"}
-            for ev in self.subagents.run_stream(subs, job.text, job.source, verdict["parallel"]):
+            handle = self.runtime.running(job.session_id)
+            for ev in self.subagents.run_stream(subs, job.text, job.source, verdict["parallel"],
+                                                check=handle.check if handle else None):
                 if ev.get("type") == "_results":
                     results = ev["results"]
                 else:
@@ -665,24 +800,48 @@ class CortexCore:
             return self.subagents.format_findings(subs, results or [], job.text)[:6000]
 
         yield {"type": "tool", "name": kind or "?", "detail": self._tool_detail(action)}
-        obs, outside = self.observe(action, job.source)
+        handle = self.runtime.running(job.session_id)
+        if handle:
+            handle.touch("tool")
+        self.undo.before(action, job.id, job.session_id, self._tool_detail(action))
+        obs, outside = self._guarded(action, job, handle)
         job.tainted = job.tainted or outside
         job.work_log.append(f"[{kind}] {obs}")
         if kind in ("execute", "devops", "run_project"):
             m = re.search(r"-> exit (-?\d+)", obs)
             job.exit_code = int(m.group(1)) if m else job.exit_code
+            job.fails_in_a_row = job.fails_in_a_row + 1 if job.exit_code else 0
         if kind == "remind" and (action.get("reminder") or {}).get("op", "create") == "create" \
                 and not self._reminders_running():
             job.notices.append("Heads up: reminders are switched off in Settings → Background, so this "
                                "one won't fire until you turn them on.")
         yield {"type": "observation", "text": obs[:400]}
-        wire = obs[:self._obs_limit()]
+        room = job.budget.obs_chars() if job.budget else 3000
+        wire = obs if len(obs) <= room else f"{obs[:room // 2]}\n[…{len(obs) - room} characters cut…]\n{obs[-room // 2:]}"
         return untrusted(kind, wire) if outside else wire
 
-    def observe(self, action: dict, source: str) -> tuple[str, bool]:
+    def _guarded(self, action: dict, job: _Job, handle) -> tuple[str, bool]:
+        """Run a tool off to the side, so a stop works while it runs and a hung tool can't hang
+        the job. A shell command doesn't need the time limit: it moves to the background."""
+        if handle is None:
+            return self.observe(action, job.source)
+        done: queue.Queue = queue.Queue(1)
+        run = lambda: done.put(self.observe(action, job.source, handle))
+        threading.Thread(target=contextvars.copy_context().run, args=(run,), name="tool-call", daemon=True).start()
+        started = time.time()
+        shell = action.get("action") in ("execute", "devops", "run_project")
+        while True:
+            try:
+                return done.get(timeout=0.2)
+            except queue.Empty:
+                handle.check()
+                if not shell and time.time() - started > _TOOL_LIMIT:
+                    return f"that step ran for over {_TOOL_LIMIT}s, so I gave up on it", False
+
+    def observe(self, action: dict, source: str, handle=None) -> tuple[str, bool]:
         """Run a tool. -> (result, whether that result contains outside content)."""
         kind = action.get("action")
-        obs = self._execute_tool(action, source)
+        obs = self._execute_tool(action, source, handle)
         outside = kind in OUTSIDE_TOOLS or (kind in ("execute", "devops")
                                             and bool(_FETCH_CMD.search(action.get("command") or "")))
         return obs, outside
@@ -712,21 +871,13 @@ class CortexCore:
         saved = resume.get("job") or {}
         job = _Job(saved.get("text", ""), session_id, source, tainted=saved.get("tainted", False),
                    work_log=saved.get("work_log"), step=saved.get("step", 0),
-                   chart_shown=saved.get("chart_shown", False))
+                   chart_shown=saved.get("chart_shown", False), job_id=saved.get("id"))
         messages = resume.get("messages")
 
         if approved and decision == "approve_session" and resume.get("grant"):
             self._grants.setdefault(session_id, set()).add(resume["grant"])
 
-        if not approved:
-            obs = "cancelled by the user before it ran"
-            job.work_log.append(f"[{payload.get('action')}] {obs}")
-            if not messages:
-                final = "Okay — cancelled, didn't do that."
-                yield {"type": "answer", "text": final}
-                yield {"type": "final", "action": {**payload, "speak": final, "steps": 1}}
-                return
-        else:
+        if approved:
             # Approval never overrides a hard refusal, however the prompt got here.
             verdict = safety.evaluate(payload, background=False, mode="balanced", grants=set())
             if verdict.kind == safety.BLOCK:
@@ -734,15 +885,88 @@ class CortexCore:
                 yield {"type": "final", "action": {**payload, "speak": verdict.message, "steps": 0}}
                 return
             yield {"type": "status", "text": "on it…"}
-            obs = yield from self._perform(payload, job, approved=True)
 
-        if not messages:    # an old draft with nothing to resume
-            yield {"type": "answer", "text": obs}
-            yield {"type": "final", "action": {**payload, "speak": obs, "steps": 1}}
+        if messages:        # carry the job on from where it paused
+            yield from self._agent_loop(messages, job, first={
+                "action": payload, "cancelled": not approved,
+                "tool_call_id": resume.get("tool_call_id"), "tool_name": resume.get("tool_name")})
             return
-        messages.append({"role": "tool", "tool_call_id": resume.get("tool_call_id") or "",
-                         "tool_name": resume.get("tool_name") or "", "content": obs})
-        yield from self._agent_loop(messages, job)
+        if not approved:    # an old draft with nothing to resume
+            final = "Okay — cancelled, didn't do that."
+            yield {"type": "answer", "text": final}
+            yield {"type": "final", "action": {**payload, "speak": final, "steps": 1}}
+            return
+        obs = yield from self._perform(payload, job, approved=True)
+        yield {"type": "answer", "text": obs}
+        yield {"type": "final", "action": {**payload, "speak": obs, "steps": 1}}
+
+    # ── stopping, resuming, reporting back ────────────────────────────────
+    def stop(self, session_id: str, reason: str = "you stopped it") -> bool:
+        return self.runtime.stop(session_id, reason)
+
+    def interrupted(self, session_id: str = None) -> list[dict]:
+        """Jobs cut off by a crash that someone could pick up again."""
+        return [{"id": j["id"], "session_id": j["session_id"], "text": (j["text"] or "")[:200], "step": j["step"]}
+                for j in self.db.jobs_with_status("interrupted", session_id)
+                if j["source"] in HUMAN_SOURCES]
+
+    def dismiss_job(self, job_id: str) -> None:
+        self.db.job_end(job_id, "dismissed")
+
+    def resume_stream(self, job_id: str, source: str = "gui"):
+        """Pick a crashed job up from its last checkpoint."""
+        record = self.db.get_job(job_id)
+        session_id = (record or {}).get("session_id") or "gui"
+
+        def events():
+            if not record or record["status"] != "interrupted":
+                msg = "That job isn't waiting to be resumed any more."
+                yield {"type": "answer", "text": msg}
+                yield {"type": "final", "action": {"action": "answer", "speak": msg, "steps": 0}}
+                return
+            state = record.get("state")
+            if not state:       # cut off before its first step finished: just start it again
+                yield from self._ask_stream(record["text"], session_id, source)
+                return
+            saved = state.get("job") or {}
+            job = _Job(saved.get("text", record["text"]), session_id, source, tainted=saved.get("tainted", False),
+                       work_log=saved.get("work_log"), step=saved.get("step", 0),
+                       chart_shown=saved.get("chart_shown", False), job_id=job_id)
+            messages = state["messages"]
+            self._close_open_calls(messages)
+            messages.append({"role": "user", "content":
+                             "[Cortex restarted while you were working on this. The last step may or may not have "
+                             "finished, so check the state before repeating it, then carry on with the job.]"})
+            yield {"type": "note", "text": f"Picking up from step {record['step']}."}
+            yield from self._agent_loop(messages, job)
+        return self._persisted(session_id, "Carry on with that job", events())
+
+    @staticmethod
+    def _close_open_calls(messages: list) -> None:
+        """A crash can leave a tool call with no result, which providers reject."""
+        answered = {m.get("tool_call_id") for m in messages if m.get("role") == "tool"}
+        for m in messages:
+            for call in m.get("tool_calls") or []:
+                if call.get("id") not in answered:
+                    messages.append({"role": "tool", "tool_call_id": call.get("id") or "",
+                                     "tool_name": (call.get("function") or {}).get("name", ""),
+                                     "content": "Interrupted: this may or may not have finished."})
+
+    def report(self, session_id: str, text: str) -> str | None:
+        """Speak up in a chat without being asked (a watcher's update). Runs as a background
+        job, so it can look but not act. -> the reply, or None if a model couldn't be reached."""
+        try:
+            memory_str = self.memory_mgr.format_for_prompt(limit=15)
+        except Exception:
+            memory_str = None
+        budget = self._budget(self._tools())
+        messages = self.context_reader.build_messages(user_text=text, session_id=session_id, source="watch",
+                                                      memory_str=memory_str, history_tokens=budget.history_tokens())
+        final = {}
+        for ev in self._agent_loop(messages, _Job(text, session_id, "watch")):
+            if ev.get("type") == "final":
+                final = ev["action"]
+        return None if final.get("error") else (final.get("speak") or None)
 
     def _queue_for_approval(self, action: dict, message: str, job: _Job) -> int:
         """Nobody's here: put the action in the approvals inbox. An identical one already
@@ -908,14 +1132,20 @@ class CortexCore:
             return action.get("query", "")
         if kind == "run_project":
             return f"{action.get('run_project_command', '')} in {action.get('run_project_path', '')}"
+        if kind == "watch":
+            return action.get("watch_label") or action.get("watch_op", "")
         return ""
 
     # ── unified tool executor: every action -> one observation string ──────
-    def _execute_tool(self, action: dict, source: str) -> str:
+    def _execute_tool(self, action: dict, source: str, handle=None) -> str:
         kind = action.get("action", "answer")
         try:
             if kind in ("execute", "devops"):
-                return self._run_shell(action.get("command", ""), source)
+                return self._run_shell(action.get("command", ""), source, handle, action.get("background"))
+            if kind == "watch":
+                return self._handle_watch(action, handle.session_id if handle else "gui")
+            if kind == "undo":
+                return self.undo.undo_last(handle.session_id if handle else "gui")["message"]
             if kind == "search":
                 from cortex.web.websearch import search_and_format
                 return str(search_and_format(action.get("search_query", "")))[:2500]
@@ -963,24 +1193,75 @@ class CortexCore:
         except Exception as e:
             return f"that step hit an error: {e}"
 
-    def _run_shell(self, command: str, source: str) -> str:
+    def _run_shell(self, command: str, source: str, handle=None, background: bool = False) -> str:
         if not command:
             return "no command given"
         bad, why = safety.is_catastrophic(command)
         if bad:
             logger.warning(f"refused catastrophic command: {command}")
             return f"REFUSED — {why}"
-        res = self.executor.execute(command=command, source="cortex-core", timeout=180)
+        # With someone waiting, a long command moves to the background under a watcher rather
+        # than being killed at a time limit. Scheduled work has nobody to report back to.
+        hand_over = 0.5 if background else (_MOVE_TO_BACKGROUND if source in HUMAN_SOURCES else None)
+        res = self.executor.execute(command=command, source="cortex-core", timeout=180,
+                                    should_stop=handle.stop_flag.is_set if handle else None,
+                                    detach_after=hand_over if handle else None)
+        if res.get("stopped"):
+            return f"ran `{command}` -> stopped before it finished"
+        if res.get("detached"):
+            return self._watch_detached(command, res["detached"], handle.session_id)
         code = res.get("exit_code")
-        room = self._obs_limit()
         out = (res.get("output") or res.get("stdout") or "").strip()
         err = (res.get("stderr") or "").strip()
         parts = []
         if out:
-            parts.append(out[-room:])
+            parts.append(out[-30000:])
         if err:
-            parts.append("stderr: " + err[-(room // 3):])
+            parts.append("stderr: " + err[-6000:])
         return f"ran `{command}` -> exit {code}; " + ("\n".join(parts) or "(no output)")
+
+    def _watch_detached(self, command: str, d: dict, session_id: str) -> str:
+        """A command outlasted its turn: leave it running with something looking after it."""
+        import cortex.core.watchers as watchers
+        label = " ".join(command.split())[:60]
+        w = watchers.add(self.db, session_id, label, {"kind": "pid", "pid": d["pid"], "exit_file": d["exit_file"],
+                                                      "log": d["log"], "note": "tell me when it finishes"})
+        if w.get("error"):
+            return f"`{command}` was left running as process {d['pid']}, but I couldn't watch it: {w['error']}."
+        return (f"`{command}` is still running in the background (process {d['pid']}), with output going to "
+                f"{d['log']}. A watcher is looking after it and you'll be woken to report here when it finishes, "
+                "so finish your reply now. Don't wait for it or check on it.")
+
+    def _handle_watch(self, a: dict, session_id: str) -> str:
+        import cortex.core.watchers as watchers
+        op = a.get("watch_op", "add")
+        if op == "list":
+            rows = watchers.active(self.db)
+            return "; ".join(f"[{w['id']}] {w['label']}" for w in rows) or "nothing is being watched"
+        if op == "stop":
+            return f"stopped watching {a.get('watch_id')}" if watchers.stop(self.db, a.get("watch_id")) \
+                else "no active watch with that id"
+        spec = None
+        if a.get("watch_pid"):
+            spec = {"kind": "pid", "pid": int(a["watch_pid"])}
+        elif a.get("watch_process"):
+            spec = {"kind": "process", "pattern": a["watch_process"]}
+        elif a.get("watch_port"):
+            spec = {"kind": "port", "port": int(a["watch_port"]), "until": a.get("watch_until") or "closed"}
+        elif a.get("watch_file"):
+            path = os.path.expanduser(a["watch_file"])
+            spec = {"kind": "file", "path": path, "pattern": a.get("watch_pattern")}
+        elif a.get("watch_command"):
+            spec = {"kind": "check", "command": a["watch_command"], "until": a.get("watch_until") or "changes"}
+        if spec is None:
+            return "tell me what to watch: a pid, process_name, port, file or check_command"
+        spec["note"] = a.get("watch_note") or ""
+        label = a.get("watch_label") or a.get("watch_process") or a.get("watch_command") or a.get("watch_file") \
+            or f"process {a.get('watch_pid') or a.get('watch_port')}"
+        w = watchers.add(self.db, session_id, label[:80], spec)
+        if w.get("error"):
+            return f"couldn't watch that: {w['error']}"
+        return f"watching {w['label']} (id {w['id']}). You'll be woken to report here when something happens, so don't check on it."
 
     def _run_browse(self, action: dict) -> str:
         from cortex.web.webbrowser import open_in_browser, fetch_and_format as browse_and_format

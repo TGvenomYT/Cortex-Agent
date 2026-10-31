@@ -31,6 +31,10 @@ _DEFAULTS = {
     "agents": {"subagents": "auto", "max_parallel": 0, "max_helpers": 4, "helper_steps": 4,
                "approvals": "careful"},
     "llm": {"model": ""},       # the chosen model; empty = config.yaml's default
+    # Cloud spending limits; 0 = no limit. Local models are never limited. A model with no
+    # known price is held by the token limits. See cortex/core/usage.py.
+    "limits": {"daily_usd": 5.0, "monthly_usd": 30.0, "job_usd": 1.0,
+               "daily_tokens": 2000000, "job_tokens": 500000, "prices": {}},
     # Resource controls. keep_alive = how long the AI model stays in memory after a reply
     # ("0" = free it right away, "-1" = never unload). followups = auto|off|always.
     "resources": {"keep_alive": "2m", "followups": "auto", "ai_jobs_only_on_ac": True,
@@ -38,7 +42,7 @@ _DEFAULTS = {
 }
 
 # Nested sections whose missing keys fall back to the defaults above.
-_SECTIONS = ("agents", "resources", "llm")
+_SECTIONS = ("agents", "resources", "llm", "limits")
 
 
 def load() -> dict:
@@ -79,7 +83,7 @@ def save(patch: dict) -> dict:
     s = load()
     for k, v in (patch or {}).items():
         if k in ("name", "theme", "voice", "onboarded", "server", "devices",
-                 "emails", "mcp_servers", "tasks", "agents", "resources", "llm"):
+                 "emails", "mcp_servers", "tasks", "agents", "resources", "llm", "limits"):
             s[k] = v
     s.pop("has_avatar", None)
     with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
