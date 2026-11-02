@@ -124,3 +124,16 @@ def test_a_name_cannot_inject_html(gui, monkeypatch):
                         staticmethod(lambda: '<img src=x onerror=alert(1)>'))
     html = gui.app.test_client().get("/").get_data(as_text=True)
     assert "<img src=x" not in html
+
+
+def test_opening_a_chat_gives_that_chats_own_context_figure(gui, monkeypatch):
+    figures = {"a": 31, "b": 57}
+    monkeypatch.setattr(gui, "core", lambda: type("C", (), {"context_percent": lambda self, s: figures[s]})())
+    client = gui.app.test_client()
+    got = [client.get("/history", query_string={"session": s}, headers=headers(gui)).get_json()["context"] for s in "ab"]
+    assert got == [31, 57]
+
+
+def test_a_chat_still_opens_if_its_figure_cant_be_worked_out(gui):
+    r = gui.app.test_client().get("/history", query_string={"session": "a"}, headers=headers(gui))
+    assert r.status_code == 200 and r.get_json()["context"] is None

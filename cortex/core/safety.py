@@ -30,6 +30,7 @@ import glob
 import os
 import re
 import shlex
+import sys
 from dataclasses import dataclass
 
 ALLOW, ASK, BLOCK = "allow", "ask", "block"
@@ -54,7 +55,7 @@ _READ_ONLY = {
     "shasum", "sha256sum", "basename", "dirname", "realpath", "readlink", "jq", "column", "nl", "rev", "tac",
     # system state
     "whoami", "id", "groups", "date", "cal", "uptime", "uname", "hostname", "sw_vers", "ps", "pgrep",
-    "vm_stat", "iostat", "free", "lscpu", "lsblk", "system_profiler", "ioreg", "lsof", "netstat", "ss",
+    "vm_stat", "memory_pressure", "iostat", "free", "lscpu", "lsblk", "system_profiler", "ioreg", "lsof", "netstat", "ss",
     "ifconfig", "ip", "arp", "route", "ping", "dig", "nslookup", "host", "traceroute", "which", "whereis",
     "type", "echo", "printf", "true", "false", "test", "[", "sleep", "seq", "bc", "wait", "cd",
     # Windows (cmd.exe)
@@ -68,6 +69,7 @@ _READ_ONLY_SUB = {
     "docker": {"ps", "logs", "stats", "images", "inspect", "version", "info", "top", "port", "diff", "history"},
     "gh": {"repo", "pr", "issue", "run", "release", "status", "auth", "search"},
     "adb": {"devices", "version", "get-state", "get-serialno"},
+    "tailscale": {"status", "ip", "version", "netcheck", "ping", "whois"},
     "brew": {"list", "ls", "info", "outdated", "config", "search", "deps", "leaves", "doctor"},
     "pip": {"list", "show", "freeze", "check", "--version"},
     "pip3": {"list", "show", "freeze", "check", "--version"},
@@ -107,6 +109,7 @@ _DANGEROUS = {
     "service", "iptables", "ufw", "pfctl", "tccutil", "csrutil", "spctl", "defaults", "pmset", "tmutil",
     "diskutil", "kubectl", "git", "docker",
 }
+WORKER_OPS = ("list", "enable", "disable", "profile", "run", "unload_model")
 _SQL_CLIENTS = {"psql", "mysql", "mariadb", "sqlite3", "mongosh", "redis-cli"}
 _SQL_WRITE = re.compile(r"\b(drop|delete|truncate|update|alter|insert|grant|revoke)\b", re.I)
 _INTERPRETERS = {"sh", "bash", "zsh", "dash", "fish", "ksh", "cmd", "python", "python3", "python2",
@@ -200,16 +203,23 @@ def _expand(path: str) -> str:
     return p
 
 
-def _wide_target(path: str) -> bool:
-    """A delete target so broad it's refused outright: the disk, a home folder, a top-level
-    system folder, or a folder directly under home (~/Documents)."""
-    p = _expand(path)
-    if p in ("*", ".", "..", "./*", "../*", "./", "../"):
+def _folder_of(path: str) -> str:
+    return re.sub(r"/\*+$", "", _expand(path)).rstrip("/") or "/"
+
+
+def _everything(path: str) -> bool:
+    """The disk, a home folder, a top-level system folder, or wherever it happens to be standing."""
+    if _expand(path) in ("*", ".", "..", "./*", "../*", "./", "../"):
         return True
-    p = re.sub(r"/\*+$", "", p).rstrip("/") or "/"
-    home = os.path.expanduser("~").rstrip("/")
-    return p == "/" or p == home or os.path.dirname(p) == home or p in _SYSTEM_DIRS \
+    p = _folder_of(path)
+    return p == "/" or p == os.path.expanduser("~").rstrip("/") or p in _SYSTEM_DIRS \
         or os.path.dirname(p) in ("/Users", "/home")
+
+
+def _wide_target(path: str) -> bool:
+    """A delete target so broad it's refused outright: all of the above, or a folder directly
+    under home (~/Documents)."""
+    return _everything(path) or os.path.dirname(_folder_of(path)) == os.path.expanduser("~").rstrip("/")
 
 
 def _risky_write(path: str) -> bool:
@@ -228,7 +238,8 @@ def _rm_verdict(args: list[str], sudo: bool) -> tuple[int, str]:
     if sudo:
         return _BLOCKED, "it deletes files with administrator rights"
     if recursive and (not targets or any(_wide_target(t) for t in targets)):
-        return _BLOCKED, "it would delete a whole folder tree there's no getting back"
+        hint = ", but `trash` puts things in the Trash instead" if sys.platform == "darwin" else ""
+        return _BLOCKED, f"it would delete a whole folder tree there's no getting back{hint}"
     return _DANGER, "it deletes files"
 
 
@@ -277,6 +288,13 @@ def _simple(prog: str, args: list[str], raw: str, known_hosts: set, depth: int,
     if name == "rm" or name == "del" or name == "rd":
         lvl, why = _rm_verdict(args, sudo)
         return lvl, why, ""
+    if name == "trash":
+        paths = [a for a in args if not a.startswith("-")]
+        if sudo or not paths or any(_everything(p) for p in paths):
+            return _BLOCKED, "it would put everything you have in the Trash", ""
+        return _DANGER, "it moves these to the Trash, where you can still get them back", ""
+    if name == "osascript" and re.search(r"\bto (restart|shut down|log out)\b", raw, re.I):
+        return _DANGER, "it will restart or shut down this Mac, so anything unsaved could be lost", ""
     if name.startswith("mkfs") or name == "fdisk":
         return _BLOCKED, "it would erase a disk", ""
     if name in ("shutdown", "reboot", "halt", "poweroff"):
@@ -486,6 +504,20 @@ def contains_secret(text: str) -> bool:
     return bool(_spans(text or ""))
 
 
+_PLACEHOLDER = re.compile(
+    r"<(?:[A-Z][A-Z0-9_ -]+|(?i:(?:your|my|the)[_ -][\w -]*|(?:cmd|command|ip|host|hostname|server|user|username"
+    r"|password|token|domain|port|url)(?:[_ -][\w -]*)?))>|\bYOUR_[A-Z][A-Z0-9_]*\b")
+
+
+def placeholder_in(action: dict) -> str:
+    """A fill-in-the-blank left in a command, like <IP_OF_YOUR_SERVER>, or "" if there's none.
+    Nobody should be asked to approve a command that can't work."""
+    if action.get("action") not in ("execute", "devops"):
+        return ""
+    found = _PLACEHOLDER.search(action.get("command") or "")
+    return found.group(0) if found else ""
+
+
 def redact(text: str) -> str:
     """`text` with any secret values replaced, for what gets stored."""
     text = text or ""
@@ -546,7 +578,7 @@ def write_targets(command: str, cwd: str = None) -> tuple[list, bool]:
                 here = at(plain[0]) if plain else os.path.expanduser("~")
             elif _simple(prog, args, " ".join(argv), set(), 0)[0] == _SAFE:
                 continue
-            elif prog in ("rm", "unlink", "rmdir", "truncate", "shred", "touch", "mkdir", "tee"):
+            elif prog in ("rm", "trash", "unlink", "rmdir", "truncate", "shred", "touch", "mkdir", "tee"):
                 for p in plain:
                     if not (prog == "truncate" and p.isdigit()):
                         add(p)
@@ -664,10 +696,9 @@ def evaluate(action: dict, *, tainted: bool = False, background: bool = False,
 
     if kind == "remind":
         r = action.get("reminder") or {}
-        if r.get("op") == "delete":
-            return Verdict(ASK, f"Delete reminder #{r.get('id')}?")
         if r.get("op") != "list" and tainted:
-            return Verdict(ASK, f"Set a reminder: {r.get('text')}?")
+            return Verdict(ASK, f"Delete reminder #{r.get('id')}?" if r.get("op") == "delete"
+                           else f"Set a reminder: {r.get('text')}?")
         return Verdict(ALLOW)
 
     if kind == "schedule_task":
@@ -682,7 +713,7 @@ def evaluate(action: dict, *, tainted: bool = False, background: bool = False,
 
     if kind == "workers":
         op, w, prof = action.get("workers_op"), action.get("worker"), action.get("profile")
-        if op in ("list", "unload_model"):
+        if op in ("list", "unload_model") or op not in WORKER_OPS:      # an unknown op does nothing, and says so
             return Verdict(ALLOW)
         if op == "disable" or (op == "profile" and prof in ("off", "essential")):
             # Switching work off is cheap, but outside text must not get to do it silently.

@@ -67,6 +67,10 @@ def follow(events) -> dict:
                 pause_spinner()
                 written += ev["text"]
                 print(ev["text"], end="", flush=True)
+            elif t == "delta_reset":
+                if written:
+                    print()
+                    written = ""
             elif t == "tool":
                 if written:             # the model talking on its way to a step
                     print()

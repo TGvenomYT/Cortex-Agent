@@ -162,6 +162,24 @@ def test_linux_memory_is_read_from_proc():
     assert total == pytest.approx(16000) and free == pytest.approx(8000)
 
 
+def test_mac_disk_is_read_from_the_volume_your_files_are_on():
+    disks = collector().parse_df("""Filesystem        Size    Used   Avail Capacity  Mounted on
+/dev/disk3s1s1   926Gi    12Gi   166Gi     7%    /
+/dev/disk3s6     926Gi   5.0Gi   166Gi     3%    /System/Volumes/VM
+/dev/disk3s5     926Gi   733Gi   166Gi    82%    /System/Volumes/Data
+map auto_home      0Bi     0Bi     0Bi   100%    /System/Volumes/Data/home
+/dev/disk5s1      17Gi    16Gi   444Mi    98%    /Library/Developer/CoreSimulator/Volumes/iOS_23F77
+/dev/disk9s1      64Gi     1Gi    63Gi     2%    /Volumes/My USB
+""")
+    assert [(d["use_pct"], d["mount"]) for d in disks] == [("82%", "/System/Volumes/Data"), ("2%", "/Volumes/My USB")]
+
+
+def test_linux_disk_rows_are_untouched():
+    disks = collector().parse_df("Filesystem Size Used Avail Use% Mounted on\n/dev/sda1 100G 40G 60G 40% /\n")
+    assert disks == [{"filesystem": "/dev/sda1", "size": "100G", "used": "40G", "available": "60G",
+                      "use_pct": "40%", "mount": "/"}]
+
+
 def test_the_collector_reports_no_public_ip_to_anyone():
     assert "ipify" not in open(os.path.join(ROOT, "collectors", "system_collector.py"), encoding="utf-8").read()
 
@@ -175,3 +193,12 @@ def test_liveness_never_uses_signal_zero_on_windows(monkeypatch):
         stdout = "python.exe  4242 Console"
     monkeypatch.setattr(subprocess, "run", lambda *a, **k: Done())
     assert runtime._alive(4242) and watchers._pid_alive(4242) and not runtime._alive(99)
+
+
+def test_old_jobs_are_retired_even_after_the_first_move(monkeypatch):
+    left, removed = {"reminders", "collector.git"}, []
+    monkeypatch.setattr(workers.scheduler, "installed", lambda key: key in left)
+    monkeypatch.setattr(workers.scheduler, "remove", removed.append)
+    workers._retire_old_jobs()
+    assert sorted(removed) == ["collector.git", "reminders"]
+

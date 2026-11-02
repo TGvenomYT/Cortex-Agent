@@ -213,3 +213,73 @@ def test_a_rejected_key_gives_a_readable_error(fake, monkeypatch, make_core):
     with pytest.raises(httpx.HTTPStatusError) as e:
         list(b.stream_with_tools([{"role": "user", "content": "x"}], []))
     assert "API key was rejected" in make_core()._llm_error_message(e.value)
+
+
+def _route(fake, text):
+    fake.reply = lambda body: {"content": text}
+    out = list(llm.LLMRouter(llm.OllamaBackend(fake.url, "m:1")).stream_with_tools([{"role": "user", "content": "x"}], []))
+    return "".join(p for k, p in out if k == "delta"), out[-1][1]["content"]
+
+
+@pytest.mark.parametrize("leak", ["thought\n<channel|>", "<|channel>thought\nThe user wants this.<channel|>"])
+def test_the_models_reasoning_never_reaches_the_reply(fake, leak):
+    assert _route(fake, leak + "Done, all checked.") == ("Done, all checked.", "Done, all checked.")
+
+
+def test_a_reply_that_merely_starts_like_reasoning_is_kept(fake):
+    assert _route(fake, "thought so too, honestly") == ("thought so too, honestly", "thought so too, honestly")
+
+
+def test_an_ordinary_reply_still_comes_in_pieces(fake):
+    fake.reply = lambda body: {"content": "a reply that comes in pieces"}
+    out = list(llm.LLMRouter(llm.OllamaBackend(fake.url, "m:1")).stream_with_tools([{"role": "user", "content": "x"}], []))
+    assert len([p for k, p in out if k == "delta"]) > 1
+
+
+def test_a_reply_written_in_one_go_loses_the_reasoning_too(fake):
+    fake.reply = lambda body: {"content": "thought\n<channel|>Hello."}
+    router = llm.LLMRouter(llm.OllamaBackend(fake.url, "m:1"))
+    assert router.complete([{"role": "user", "content": "x"}]) == "Hello."
+    assert router.complete_with_tools([{"role": "user", "content": "x"}], [])["content"] == "Hello."
+
+
+@pytest.fixture
+def limit():
+    token = llm.quiet_limit.set(0.3)
+    yield
+    llm.quiet_limit.reset(token)
+
+
+ASK = [{"role": "user", "content": "x"}]
+
+
+def test_a_model_showing_nothing_in_time_is_dropped(fake, limit):
+    fake.hold, fake.reply = 1, lambda body: {"content": "too late"}
+    with pytest.raises(llm.WentQuiet):
+        list(llm.LLMRouter(llm.OllamaBackend(fake.url, "m:1")).stream_with_tools(ASK, []))
+
+
+def test_going_quiet_doesnt_wake_a_second_model(fake, limit):
+    fake.hold, fake.reply = 1, lambda body: {"content": "too late"}
+    router = llm.LLMRouter(llm.OllamaBackend(fake.url, "a:1"), llm.OllamaBackend(fake.url, "b:1"))
+    with pytest.raises(llm.WentQuiet):
+        list(router.stream_with_tools(ASK, []))
+    assert [r["model"] for r in fake.requests] == ["a:1"]
+
+
+def test_a_slow_reply_already_under_way_is_left_alone(fake, limit):
+    fake.chunk_delay, fake.reply = 0.5, lambda body: {"content": "slow but it gets there"}
+    out = list(llm.LLMRouter(llm.OllamaBackend(fake.url, "m:1")).stream_with_tools(ASK, []))
+    assert out[-1][1]["content"] == "slow but it gets there"
+
+
+def test_without_a_limit_a_slow_start_is_fine(fake):
+    fake.hold, fake.reply = 0.5, lambda body: {"content": "in my own time"}
+    assert list(llm.OllamaBackend(fake.url, "m:1").stream_with_tools(ASK, []))[-1][1]["content"] == "in my own time"
+
+
+def test_a_cloud_model_has_no_limit(fake, limit):
+    fake.hold, fake.reply = 0.5, lambda body: {"content": "from far away"}
+    backend = llm.OllamaBackend(fake.url, "m:1", api_key="k")
+    assert list(backend.stream_with_tools(ASK, []))[-1][1]["content"] == "from far away"
+

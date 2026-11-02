@@ -234,13 +234,15 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "manage_reminder",
-            "description": "Create, list, delete, or edit a reminder.",
+            "description": "Create, list, delete, or edit a one-off reminder. Delete and edit take its id, shown as "
+                           "#n. Anything that repeats, called a task, is schedule_task, not this.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "op": {"type": "string", "enum": ["create", "list", "delete", "edit"]},
                     "text": {"type": ["string", "null"]},
-                    "due": {"type": ["string", "null"], "description": "ISO 8601 timestamp, when op=create or edit"},
+                    "due": {"type": ["string", "null"],
+                            "description": "Local time as ISO 8601. op=create must have it, worked out from their words"},
                     "repeat": {"type": ["string", "null"], "description": "null, or one of: daily, weekly, weekdays"},
                     "id": {"type": ["integer", "null"], "description": "reminder id, when op=delete or edit"},
                 },
@@ -260,7 +262,7 @@ TOOLS = [
                 "a cadence, so each run wakes the AI model — keep it as infrequent as the job allows "
                 "(the minimum is every 5 min). A job with an end, like 'tell me when X is done', stops "
                 "itself once it's finished. Use op='add' with desc, prompt, schedule; op='list'; "
-                "op='remove' with id."
+                "op='remove' with id, shown as [n]. This is where a task lives, not manage_reminder."
             ),
             "parameters": {
                 "type": "object",
@@ -392,7 +394,8 @@ TOOLS = [
                 "isn't chatting (reminders, system collectors, AI autonomy, daily briefings, sync, and "
                 "recurring tasks) — and the AI model's memory use. Use for 'what's running in the "
                 "background', 'stop/pause the background workers', 'turn off autonomy', 'free up "
-                "memory'. op: list | enable | disable | profile | run | unload_model."
+                "memory'. 'Stop tracking my shell history' means disabling the worker collector.shell, not "
+                "editing .zshrc. op: list | enable | disable | profile | run | unload_model."
             ),
             "parameters": {
                 "type": "object",

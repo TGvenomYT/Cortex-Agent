@@ -18,7 +18,6 @@ from __future__ import annotations
 import os
 import re
 import sys
-import uuid
 
 from cortex.core import scheduler
 import cortex.storage.settings_store as settings_store
@@ -108,7 +107,9 @@ def _uninstall(tid: str):
 
 
 def add_task(desc: str, prompt: str, schedule: str, deliver: str = "notify") -> dict:
-    tid = uuid.uuid4().hex[:8]
+    # A plain number, because the model has to copy this. It garbles hex ids, and Ollama
+    # silently drops a tool call holding one like 9764941c, so nothing happens at all.
+    tid = str(max((int(t["id"]) for t in list_tasks() if str(t["id"]).isdigit()), default=0) + 1)
     _, human = parse_schedule(schedule)
     task = {"id": tid, "desc": desc or prompt[:50], "prompt": prompt,
             "schedule": schedule, "human": human, "deliver": deliver}
@@ -119,9 +120,12 @@ def add_task(desc: str, prompt: str, schedule: str, deliver: str = "notify") -> 
     return task
 
 
-def remove_task(tid: str):
-    settings_store.save({"tasks": [t for t in list_tasks() if t["id"] != tid]})
+def remove_task(tid: str) -> bool:
+    tasks = list_tasks()
+    kept = [t for t in tasks if t["id"] != tid]
+    settings_store.save({"tasks": kept})
     _uninstall(tid)
+    return len(kept) < len(tasks)
 
 
 def _update(tid: str, **fields) -> None:

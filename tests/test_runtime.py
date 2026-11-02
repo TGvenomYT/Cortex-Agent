@@ -686,3 +686,11 @@ def test_watch_needs_approval_if_its_check_is_not_read_only():
 
 def test_undo_is_always_asked():
     assert safety.evaluate({"action": "undo"}).kind == safety.ASK
+
+
+def test_watch_ids_are_numbers_the_model_can_copy(make_core, monkeypatch):
+    core = make_core()
+    monkeypatch.setattr(watchers, "spawn", lambda db, wid: 1)
+    spec = {"kind": "port", "port": 1}
+    assert [watchers.add(core.db, "s1", n, spec)["id"] for n in ("one", "two")] == ["1", "2"]
+

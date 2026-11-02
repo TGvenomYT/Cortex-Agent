@@ -24,7 +24,6 @@ import socket
 import subprocess
 import sys
 import time
-import uuid
 
 logger = logging.getLogger("cortex.watchers")
 
@@ -213,7 +212,8 @@ def add(db, session_id: str, label: str, spec: dict) -> dict:
     problem = Probe(spec).problem()
     if problem:
         return {"error": problem}
-    watch_id = uuid.uuid4().hex[:8]
+    # A plain number, for the same reason as a task's: the model has to copy it back.
+    watch_id = str(max((int(w["id"]) for w in db.watches_where("1 = 1") if str(w["id"]).isdigit()), default=0) + 1)
     db.watch_add(watch_id, session_id, label, spec)
     spawn(db, watch_id)
     return {"id": watch_id, "label": label, "spec": spec}

@@ -783,7 +783,7 @@ class Database:
         return updated
 
     def get_similar_experiences(self, query_text: str, limit: int = 5,
-                                min_reward: float = 0.0) -> list:
+                                min_reward: float = 0.0, session_id: str = None) -> list:
         """
         Retrieve past high-reward experiences similar to the current query.
         This is the practical substitute for BIG BRAIN's fast-weight adaptation:
@@ -809,7 +809,8 @@ class Database:
                         SELECT user_text, action, action_payload, speak, reward, embedding
                         FROM experiences
                         WHERE embedding IS NOT NULL AND reward IS NOT NULL AND reward >= %s
-                    """, (min_reward,))
+                          AND (%s IS NULL OR session_id = %s)
+                    """, (min_reward, session_id, session_id))
                     rows = [dict(r) for r in cur.fetchall()]
             ranked = sqlite_backend.cosine_rank(query_vec, rows, "embedding", limit)
             return [{"user_text": r["user_text"], "action": r["action"],
@@ -826,9 +827,10 @@ class Database:
                     WHERE embedding IS NOT NULL
                       AND reward IS NOT NULL
                       AND reward >= %s
+                      AND (%s::text IS NULL OR session_id = %s)
                     ORDER BY embedding <=> %s::vector
                     LIMIT %s
-                """, (vec_literal, min_reward, vec_literal, limit))
+                """, (vec_literal, min_reward, session_id, session_id, vec_literal, limit))
                 rows = cur.fetchall()
 
         return [{"user_text": r["user_text"], "action": r["action"],

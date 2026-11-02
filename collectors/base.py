@@ -81,5 +81,6 @@ def run_cmd(cmd: str, cwd: str = None, timeout: int = 10) -> tuple[str, str, int
 
 
 def get_tracked_projects(conn) -> list[dict]:
-    """Fetch all tracked projects via the dual-backend Database."""
-    return [dict(r) for r in conn.get_tracked_projects()]
+    """Fetch all tracked projects via the dual-backend Database, plus any in config.yaml."""
+    from cortex.core.projects import tracked
+    return tracked(conn.get_tracked_projects(), load_config())

@@ -452,12 +452,21 @@ def _ready() -> None:
     settings_store.save({"workers_on": sorted(keys)})
 
 
+def _retire_old_jobs() -> None:
+    """Jobs from before the single tick can outlive the first move: they'd run everything twice,
+    and on a Mac their plists hold plaintext copies of the database password."""
+    for w in BUILTIN:
+        if scheduler.installed(w["key"]):
+            scheduler.remove(w["key"])
+
+
 def ensure() -> None:
     """When Cortex starts: finish any move off the old jobs, make sure the tick matches
     what's on, and catch up on anything out of date."""
     from cortex.core import tick
     try:
         _ready()
+        _retire_old_jobs()
         _sync_tick(enabled_keys())
         tick.refresh_context()
     except Exception as e:

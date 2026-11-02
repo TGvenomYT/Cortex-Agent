@@ -31,9 +31,11 @@ import threading
 import contextvars
 from datetime import datetime
 
+from cortex.core.context_reader import ABOUT_THE_MACHINE
 from cortex.core import safety, usage
 from cortex.core.executor import prune_runs
 from cortex.core.runtime import Runtime, JobStopped, ModelStalled
+from cortex.llm.llm import WentQuiet, quiet_limit as llm_quiet_limit
 
 logger = logging.getLogger("cortex.core")
 
@@ -46,6 +48,10 @@ _TURN_BUDGET = 600      # seconds one job may spend in the agent loop
 _MOVE_TO_BACKGROUND = 60    # a command still going after this keeps running under a watcher
 _TOOL_LIMIT = 180       # a tool that isn't a shell command gets this long
 _MAX_FAILS_IN_A_ROW = 5
+# Measured with nomic-embed-text on a 600-chunk book: "hi" and "turn on tailscale" score 0.44-0.53, real
+# questions about it 0.57+. Below this a file is noise, and it wrongly marks the turn as outside content.
+_RAG_MIN_SIMILARITY = 0.55
+_QUIET_LIMIT = 25       # seconds a local model can show nothing before that attempt is dropped
 
 _FINAL_SYNTH = (
     "You just worked on a task for {who}. Here's a log of what you did and found.\n"
@@ -112,6 +118,7 @@ class _Job:
         self.repeats = 0
         self.fails_in_a_row = 0
         self.stalls = 0
+        self.refused = False            # the last change it tried didn't happen, so it can't claim it did
         self.budget = None
         self.llm_failed = False
         self.exit_code = None
@@ -162,18 +169,69 @@ class CortexCore:
         except Exception as e:
             logger.info(f"MCP unavailable: {e}")
 
+    def context_percent(self, session_id: str) -> int:
+        """How full one chat's context is, for the label in the app. Costs a couple of ms: no model."""
+        budget = self._budget(self._tools())
+        return budget.percent(self.context_reader.build_messages(
+            user_text="", session_id=session_id, source="gui", memory_str=self._memory_for("")[0],
+            history_tokens=budget.history_tokens(), projects_list=self._projects_list()))
+
+    def _self_context(self) -> str:
+        """What it's running on and what it does in the background, so it never has to guess."""
+        try:
+            from cortex.core import workers
+            on = workers.enabled_keys()
+            names = [w["name"] for w in workers.BUILTIN if w["key"] in on]
+            work = (f"{len(names)} of {len(workers.BUILTIN)} background jobs are on, running in short turns every few "
+                    f"minutes: {', '.join(names)}." if names else
+                    "All your background jobs are off, so reminders won't fire until they're turned on.")
+            work += " Those are yours, and manage_workers turns them on or off."
+            model = getattr(getattr(self.llm, "primary", None), "model", None)
+            from cortex.core import tasks as tasks_mod
+            files = [os.path.basename(d["source"]) for d in self.db.list_documents()]
+            uploads = ", ".join(files) or "none"
+            reminders = "; ".join(f"#{r['id']} {r['text']} ({r['due_at']})"
+                                  for r in self.db.get_all_reminders(include_fired=False)[:8]) or "none"
+            jobs = "; ".join(f"[{t['id']}] {t.get('desc')} ({t.get('schedule')})"
+                             for t in tasks_mod.list_tasks()) or "none"
+            return (f"[ABOUT YOU] {f'You are running on the model {model}. ' if model else ''}{work} Reminders set: "
+                    f"{reminders}. Recurring tasks: {jobs}. Files they've uploaded to you: {uploads}.")
+        except Exception:
+            return None
+
+    def _projects_list(self) -> str:
+        """The folders it follows, from the database and config.yaml."""
+        try:
+            from cortex.core.projects import tracked
+            rows = tracked(self.db.get_tracked_projects(), self.config)
+            return "\n".join(f"- {p['name']}: {p['path']}" for p in rows) or None
+        except Exception:
+            return None
+
     def _server_context(self) -> str:
-        """Inject the user's configured server so the agent uses it (not a hardcoded IP)."""
+        """Tell the agent where the user's server is: Settings if filled in, else config.yaml."""
         try:
             import cortex.storage.settings_store as settings_store
-            s = settings_store.load().get("server", {})
-            if s.get("host"):
-                hosts = (self.config.get("remote_hosts") or {}).values()
-                key = next((h.get("key") for h in hosts if h.get("ip") == s["host"] and h.get("key")), None)
-                opt = f"-i {key} " if key else ""
-                return (f"[CONFIGURED SERVER] '{s.get('label','server')}' — host {s['host']}, "
-                        f"ssh user {s.get('user','')}. For 'my server'/'the server', use: "
-                        f"ssh {opt}{s.get('user','')}@{s['host']} \"<cmd>\".")
+            s = settings_store.load().get("server") or {}
+            hosts = self.config.get("remote_hosts") or {}
+            name, entry = next(iter(hosts.items()), ("server", {}))
+            host = s.get("host") or entry.get("ip")
+            if not host:
+                return None
+            user = s.get("user") or entry.get("user") or ""
+            key = next((h.get("key") for h in hosts.values() if h.get("ip") == host and h.get("key")), None)
+            opt = f"-i {key} " if key else ""
+            label = s.get("label") or name
+            text = (f"[THEIR SERVER] Name: {label}. Address: {host}. SSH user: {user or 'unknown'}. It's a separate "
+                    f"computer, NOT the one you run on, so commands here tell you nothing about it. When they mention "
+                    f"{label}, 'my server' or 'the server', answer their address questions from this note, and run "
+                    f"everything else on it over ssh: ssh -o ConnectTimeout=8 {opt}{user + '@' if user else ''}{host} "
+                    f"\"<cmd>\".")
+            if self._TAILSCALE_ADDRESS.match(host):
+                text += (" That's a private Tailscale address, so it only answers while Tailscale is connected. If "
+                         "it can't be reached, run `tailscale status` before saying the server is down. If Tailscale "
+                         "is stopped, say so and offer to run `tailscale up`.")
+            return text
         except Exception:
             pass
         return None
@@ -232,6 +290,33 @@ class CortexCore:
     _CLAIMS_CHART = re.compile(r"\b(here'?s|here is|below is|see) (the|a|your) (graph|plot|chart|diagram)\b"
                                r"|\b(graph|plot|chart) (below|above)\b|\bi('ve| have) (plotted|drawn|graphed|charted)\b",
                                re.I)
+    _DID = (r"started|restarted|rebooted|stopped|paused|resumed|killed|connected|disconnected|ran|executed|installed"
+            r"|uninstalled|fixed|updated|changed|sent|emailed|deleted|removed|cleared|wiped|emptied|cleaned|freed"
+            r"|cancell?ed|created|made|wrote|written|saved|moved|renamed|copied|backed up|uploaded|downloaded|pushed"
+            r"|committed|merged|scheduled|set|added|enabled|disabled|launched|opened|closed|checked|tested|pinged"
+            r"|restored|reset|turned (?:on|off)")
+    # The last line is a reply copying an approval card out of the chat, with no real card behind it.
+    _CLAIMS_ACTION = re.compile(rf"\bI(?:['’]ve| have)\s+(?:just\s+|already\s+)?(?:{_DID}|run)\b"
+                                rf"|\bI\s+(?:just\s+|already\s+)?(?:{_DID})\b"
+                                r"|\bI['’]d like to (?:run|schedule) this\b|\bI['’]ll set (?:that|this|it) up\b", re.I)
+    _LEFT_NOW = re.compile(r"\b(?:tasks?|reminders?)\b.*\b(?:left|now|remaining|still)\b", re.I)
+    _TAILSCALE_ADDRESS = re.compile(r"100\.(?:6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.\d{1,3}\.\d{1,3}$")
+    _ON_DISK = re.compile(r"\b(folders?|director(?:y|ies)|files?|downloads?|desktop|documents|photos?|screenshots?)\b", re.I)
+
+    def _clean_sentences(self, draft: str) -> int:
+        """How much of a draft can be shown: whole sentences, stopping before any claim of an action."""
+        end = 0
+        for sentence in re.finditer(r"[.!?:](?:\s|$)|\n", draft):
+            if self._CLAIMS_ACTION.search(draft[:sentence.end()]):
+                break
+            end = sentence.end()
+        return end
+
+    def _must_look(self, text: str) -> bool:
+        """What's in a folder can't be known without looking, and what's left after a change gets
+        answered from the chat instead of the notes. Anything else is in its notes, and a second
+        pass there only costs time."""
+        return (bool(self._ON_DISK.search(text)) and "upload" not in text.lower()) or bool(self._LEFT_NOW.search(text))
 
     def _wants_chart(self, text: str) -> bool:
         t = text or ""
@@ -278,7 +363,7 @@ class CortexCore:
         try:
             import cortex.storage.rag as rag
             hits = rag.retrieve(self.db, query, k=6)
-            hits = [h for h in hits if (h.get("similarity") or 0) >= 0.4]
+            hits = [h for h in hits if (h.get("similarity") or 0) >= _RAG_MIN_SIMILARITY]
             if hits:
                 return ("[FROM THE USER'S UPLOADED FILES — use/cite when relevant]\n" + untrusted(
                     "uploaded_files", "\n---\n".join(f"({h['source']}) {h['chunk']}" for h in hits)))
@@ -410,10 +495,11 @@ class CortexCore:
         yield {"type": "status", "text": "thinking…"}
         memory_str, recall = self._memory_for(text)
         rag = self._rag_context(text)
-        extra = "\n\n".join(x for x in [self._server_context(), rag] if x) or None
+        extra = "\n\n".join(x for x in [self._self_context(), self._server_context(), rag] if x) or None
         messages = self.context_reader.build_messages(
             user_text=text, session_id=session_id, memory_str=memory_str, source=source,
             extra_context=extra, history_tokens=self._budget(self._tools()).history_tokens(), recall=recall,
+            projects_list=self._projects_list(),
         )
         job = _Job(text, session_id, source, tainted=bool(rag))
 
@@ -457,7 +543,7 @@ class CortexCore:
             job.work_log.append(f"[helper: {st['title']}] {(r or {}).get('summary', '')}")
             job.tainted = job.tainted or bool((r or {}).get("tainted"))
 
-    def _model_step(self, messages: list, tools: list, handle):
+    def _model_step(self, messages: list, tools: list, handle, quiet: float = None):
         """One model call as ('delta', text)* then ('done', result). It runs on its own thread,
         so the job can still be stopped, or cut off by the watchdog, while the model is silent."""
         results: queue.Queue = queue.Queue()
@@ -474,7 +560,9 @@ class CortexCore:
                 results.put(("error", e))
             results.put(("end", None))
 
-        threading.Thread(target=contextvars.copy_context().run, args=(pump,), name="model-call", daemon=True).start()
+        context = contextvars.copy_context()
+        context.run(llm_quiet_limit.set, quiet)
+        threading.Thread(target=context.run, args=(pump,), name="model-call", daemon=True).start()
         handle.touch("model")
         told = 0
         while True:
@@ -539,8 +627,9 @@ class CortexCore:
         grants = self._grants.get(job.session_id, set())
         job.budget = self._budget(tools_list)
         last_action, final_speak, held = {"action": "answer"}, None, None
+        quiet = _QUIET_LIMIT
         ask_options, asked = [], False
-        retried_empty = False
+        retried_empty = retried_check = False
         if not job.background:
             from cortex.core import tick
             tick.refresh_context()
@@ -564,15 +653,29 @@ class CortexCore:
             if freed:
                 yield {"type": "note", "text": freed}
             yield {"type": "context", "percent": job.budget.percent(messages), "limit": job.budget.limit}
-            result = None
+            result, draft, shown = None, "", 0
             try:
-                for kind, payload in self._model_step(messages, tools_list, handle):
+                for kind, payload in self._model_step(messages, tools_list, handle, quiet):
                     if kind == "delta":
-                        yield {"type": "delta", "text": payload}
+                        if (job.done or job.work_log) and not job.refused:
+                            yield {"type": "delta", "text": payload}
+                            continue
+                        draft += payload        # nothing has run yet, so check it before it's on screen
+                        cut = 0 if self._must_look(job.text or "") else self._clean_sentences(draft)
+                        if cut > shown:
+                            yield {"type": "delta", "text": draft[shown:cut]}
+                            shown = cut
                     elif kind == "status":
                         yield {"type": "status", "text": payload}
                     else:
                         result = payload
+            except WentQuiet:
+                # Rare and random, and the same prompt nearly always works straight after. No limit
+                # this time, because a long command also shows nothing until it's fully written.
+                logger.warning(f"the model showed nothing for {quiet} s, so that step is starting again")
+                quiet = None
+                job.step -= 1
+                continue
             except ModelStalled:
                 job.stalls += 1
                 if job.stalls >= 2:
@@ -592,16 +695,40 @@ class CortexCore:
 
             result = rescue_tool_calls(result or {}, known)
             job.budget.calibrate(result.get("input_tokens"), messages)
+            went_quiet, quiet = quiet is None, _QUIET_LIMIT
             think = (result.get("thinking") or result.get("content") or "").strip()
             tool_calls = result.get("tool_calls") or []
 
             if not tool_calls:
                 final_speak = (result.get("content") or "").strip()
-                if not final_speak and not retried_empty:     # some models stop on an empty turn
+                if not final_speak and retried_check:         # it thought itself out of an answer
+                    final_speak = ("I couldn't check that just now and I don't want to guess. Please ask me again."
+                                   if self._must_look(job.text or "") else
+                                   "That didn't go through, so nothing has changed. Please ask me again.")
+                    break
+                if not final_speak and not retried_empty and not went_quiet:     # some models stop on an empty turn
                     retried_empty = True
                     messages.append({"role": "user", "content": "Please continue — finish the job or answer me."})
                     continue
                 final_speak = final_speak or None
+                nothing_ran = not job.done and not job.work_log
+                if final_speak and (nothing_ran or job.refused):     # it has no grounds for saying it acted
+                    claimed = bool(self._CLAIMS_ACTION.search(final_speak))
+                    if not retried_check and (claimed or (nothing_ran and self._must_look(job.text or ""))):
+                        retried_check = True
+                        if shown:
+                            yield {"type": "delta_reset"}
+                        # The draft stays out of the chat, or the model apologises for something nobody saw.
+                        # Keep this short: a long instruction here sends the model into a minute of thinking.
+                        messages.append({"role": "user", "content": "That hasn't happened yet. Do it now with a tool."
+                                         if claimed else "Check with a tool first, then answer."})
+                        final_speak = None
+                        continue
+                    if claimed:
+                        final_speak = ("I didn't actually do that: nothing ran. Ask me again, or tell me exactly "
+                                       "what to run.")
+                if final_speak and shown < len(draft) and draft.strip() == final_speak:
+                    yield {"type": "delta", "text": draft[shown:]}
                 if final_speak and result.get("truncated"):
                     job.notices.append("(That hit my length limit and got cut off. Say \"continue\" for the rest.)")
                 break
@@ -648,6 +775,12 @@ class CortexCore:
                           "it: use that result, try something different, or give your answer now.")
                     continue
                 job.done.add(signature)
+
+                stand_in = safety.placeholder_in(action)
+                if stand_in:
+                    reply(f"NOT RUN — `{stand_in}` is a placeholder, and commands run exactly as written. Use the "
+                          "real value. If you don't have it, find it with a tool. Only ask the user as a last resort.")
+                    continue
 
                 verdict = safety.evaluate(action, tainted=job.tainted, background=job.background, grants=grants,
                                           mode=mode, mcp_readonly=self._mcp_readonly(action))
@@ -823,14 +956,19 @@ class CortexCore:
         obs, outside = self._guarded(action, job, handle)
         job.tainted = job.tainted or outside
         job.work_log.append(f"[{kind}] {obs}")
+        if str(obs).startswith(("NOT SET", "NOT DONE")):
+            job.refused = True
+        elif "list" not in ((action.get("reminder") or {}).get("op"), action.get("task_op"), action.get("workers_op")):
+            job.refused = False
         if kind in ("execute", "devops", "run_project"):
             m = re.search(r"-> exit (-?\d+)", obs)
             job.exit_code = int(m.group(1)) if m else job.exit_code
             job.fails_in_a_row = job.fails_in_a_row + 1 if job.exit_code else 0
         if kind == "remind" and (action.get("reminder") or {}).get("op", "create") == "create" \
                 and not self._reminders_running():
-            job.notices.append("Heads up: reminders are switched off in Settings → Background, so this "
-                               "one won't fire until you turn them on.")
+            note = "Heads up: reminders are switched off in Settings → Background, so this one won't fire until you turn them on."
+            if note not in job.notices:
+                job.notices.append(note)
         yield {"type": "observation", "text": obs[:400]}
         room = job.budget.obs_chars() if job.budget else 3000
         wire = obs if len(obs) <= room else f"{obs[:room // 2]}\n[…{len(obs) - room} characters cut…]\n{obs[-room // 2:]}"
@@ -1398,30 +1536,60 @@ class CortexCore:
     def _handle_reminder(self, r: dict) -> str:
         op = r.get("op", "create")
         if op == "create":
+            if not r.get("due"):
+                return f"NOT SET: this needs `due`, the local time as ISO 8601. It's {datetime.now():%Y-%m-%dT%H:%M} now."
             try:
-                self.db.create_reminder(text=r.get("text", ""),
-                                        due_at=datetime.fromisoformat(r["due"]),
-                                        repeat_rule=r.get("repeat"))
+                due = datetime.fromisoformat(r["due"])
+                due = due.astimezone().replace(tzinfo=None) if due.tzinfo else due
+                if due <= datetime.now():
+                    return (f"NOT SET: {due:%H:%M on %d %b} has already passed, it's {datetime.now():%H:%M} now. "
+                            f"Tell them, and ask what they'd like instead.")
+                self.db.create_reminder(text=r.get("text", ""), due_at=due, repeat_rule=r.get("repeat"))
                 return f"set a reminder: {r.get('text','')}"
             except Exception as e:
                 return f"couldn't set that reminder ({e})"
+        try:
+            rows = self.db.get_all_reminders(include_fired=False)
+        except Exception:
+            rows = []
+        listing = "; ".join(f"#{x['id']} {x['text']} ({x['due_at']})" for x in rows[:10]) or "none"
         if op == "list":
-            try:
-                rem = self.db.get_all_reminders(include_fired=False)
-            except Exception:
-                rem = []
-            if not rem:
-                return "no reminders set"
-            return "reminders: " + "; ".join(f"{x['text']} ({x['due_at']})" for x in rem[:10])
-        if op == "delete" and r.get("id"):
-            return "deleted reminder" if self.db.delete_reminder(r["id"]) else "no such reminder"
-        return "done"
+            return f"reminders: {listing}" if rows else "no reminders set"
+        if op not in ("delete", "edit"):
+            return f"NOT DONE: reminders have create, list, delete and edit, not `{op}`."
+        hits = self._reminders_meant(r, rows)
+        if len(hits) != 1:
+            return (f"NOT DONE: that could be any of these, so pick one by id: {listing}." if hits else
+                    f"NOT DONE: no reminder matches that. Reminders set: {listing}.")
+        if op == "delete":
+            self.db.delete_reminder(hits[0]["id"])
+            return f"deleted reminder: {hits[0]['text']}"
+        try:
+            due = datetime.fromisoformat(r["due"]) if r.get("due") else None
+        except ValueError as e:
+            return f"NOT DONE: couldn't read that time ({e})"
+        changed = self.db.update_reminder(hits[0]["id"], text=r.get("text"), due_at=due, repeat_rule=r.get("repeat"))
+        return (f"changed reminder #{hits[0]['id']}" if changed else
+                "NOT DONE: this needs the new text, `due` or `repeat`.")
+
+    @staticmethod
+    def _reminders_meant(r: dict, rows: list) -> list:
+        """The reminders a delete or edit points at: by id, then by its words, else whichever are set."""
+        wanted, words = str(r.get("id") or "").lstrip("#"), (r.get("text") or "").strip().lower()
+        hits = [x for x in rows if str(x["id"]) == wanted]
+        if not hits and words:
+            hits = [x for x in rows if words in x["text"].lower() or x["text"].lower() in words]
+            if not hits and r.get("op") == "edit" and len(rows) == 1:
+                return rows         # the words are its new wording
+        return hits or (rows if not wanted and not words else [])
 
     def _handle_workers(self, a: dict) -> str:
         """Chat control over Cortex's own background workers + the model's memory."""
         import cortex.core.workers as workers
         import cortex.core.resources as resources
         op = a.get("workers_op") or "list"
+        if op not in safety.WORKER_OPS:
+            return f"NOT DONE: there's no `{op}` here. A recurring task is removed with schedule_task."
         if op == "list":
             return workers.describe() + "\n" + resources.describe()
         if op == "unload_model":
@@ -1456,11 +1624,19 @@ class CortexCore:
                 f"[{t['id']}] {t['desc']} — {t.get('human', t['schedule'])} → {t.get('deliver','notify')}"
                 f"{'' if t.get('enabled', True) else ' (paused)'}" for t in ts)
         if op == "remove":
-            tid = action.get("task_id")
-            if not tid:
-                return "need the task id to remove (op=list to see them)"
-            tasks.remove_task(tid)
-            return f"removed task {tid}"
+            rows = tasks.list_tasks()
+            listing = "; ".join(f"[{t['id']}] {t['desc']}" for t in rows) or "none"
+            wanted, words = str(action.get("task_id") or "").strip("[]# "), (action.get("task_desc") or "").lower()
+            hits = [t for t in rows if str(t["id"]) == wanted]
+            if not hits and words:
+                hits = [t for t in rows if words in t["desc"].lower() or t["desc"].lower() in words]
+            if not hits and not wanted and not words:
+                hits = rows
+            if len(hits) != 1:
+                return (f"NOT DONE: that could be any of these, so pick one by id: {listing}." if hits else
+                        f"NOT DONE: no task matches that. Recurring tasks: {listing}.")
+            tasks.remove_task(hits[0]["id"])
+            return f"removed task: {hits[0]['desc']}"
         # add
         prompt = action.get("task_prompt")
         schedule = action.get("task_schedule")
@@ -1477,8 +1653,8 @@ class CortexCore:
 
     # ── final plain-language summary when the job ran multi-step ────────────
     def _final_summary(self, work_log: list[str]) -> str:
-        if not work_log:
-            return "All done."
+        if not work_log:        # nothing ran and the model said nothing, so nothing can be claimed
+            return "I didn't get that done: nothing ran and I got no answer from the model. Please ask me again."
         prompt = _FINAL_SYNTH.format(who=self._owner, log="\n".join(work_log)[:5000])
         try:
             raw = self.llm.complete(

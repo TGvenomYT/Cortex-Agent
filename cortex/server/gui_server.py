@@ -447,9 +447,9 @@ def devices():
                 if u and t:
                     mac["mem"] = round(u / t * 100); mac["detail"] = f"{round(u/1024,1)}/{round(t/1024,1)} GB RAM"
             elif c["key"] == "disk" and isinstance(v, dict):
-                vols = v.get("all_volumes") or []
-                if vols:
-                    mac["disk"] = str(vols[0].get("capacity", ""))
+                main = v.get("main") or next(iter(v.get("all_volumes") or []), None)
+                if main:
+                    mac["disk"] = str(main.get("use_pct", ""))
     except Exception as e:
         logger.warning(f"/devices mac: {e}")
     out.append(mac)
@@ -715,7 +715,12 @@ def history():
     except Exception as e:
         logger.warning(f"/history jobs: {e}")
         cut_off, last_id = [], 0
-    return jsonify({"messages": out, "running": bool(job and not job.done), "pending": pending,
+    try:
+        context = core().context_percent(session)
+    except Exception as e:
+        logger.warning(f"/history context: {e}")
+        context = None
+    return jsonify({"messages": out, "context": context, "running": bool(job and not job.done), "pending": pending,
                     "interrupted": cut_off, "last_id": last_id})
 
 
@@ -1389,11 +1394,12 @@ function renderChats(){const f=($('srchin')||{}).value?$('srchin').value.toLower
  allChats.filter(c=>!f||c.title.toLowerCase().includes(f)).forEach(c=>{
   const d=el('div','chat'+(c.session_id===sid?' sel':''),esc(c.title||'New chat'));
   d.onclick=()=>openChat(c.session_id);list.appendChild(d)})}
-async function openChat(s){busy=false;sid=s;localStorage.setItem('cx-sid',s);wrap.innerHTML='';renderChats();
+async function openChat(s){busy=false;sid=s;localStorage.setItem('cx-sid',s);$('ctx').textContent='';wrap.innerHTML='';renderChats();
  let d={messages:[],running:false};
  try{d=await (await fetch('/history?session='+encodeURIComponent(s))).json()}catch(_){}
  if(s!==sid)return;                       // user switched chats while this was loading
  const msgs=d.messages||[];
+ if(msgs.length&&d.context!=null)$('ctx').textContent='Context '+d.context+'% · ';
  hello.style.display=msgs.length?'none':'';
  msgs.forEach(m=>{if(m.role==='user')addUser(m.content);else addResp(m.content,m.parts)});
  $('scroll').scrollTop=$('scroll').scrollHeight;
@@ -1474,7 +1480,7 @@ function submit(text){if(busy||!text)return;busy=true;send.classList.remove('sho
  runTurn(turn,'/stream?session='+encodeURIComponent(sid)+'&q='+encodeURIComponent(text))}
 function attachRunning(){const last=wrap.lastElementChild;if(!last)return;busy=true;
  runTurn(last,'/attach?session='+encodeURIComponent(sid))}
-function runTurn(turn,url){stopShown(true);
+function runTurn(turn,url){stopShown(true);const ownChat=sid;
  const resp=el('div','resp');
  const live=el('div','rlive active');
  const det=el('details','trace');          // collapsed by default → retractable; summary = live preview
@@ -1492,7 +1498,8 @@ function runTurn(turn,url){stopShown(true);
  es.onmessage=e=>{let ev;try{ev=JSON.parse(e.data)}catch(_){return}
   const t=ev.type;
   if(t==='delta'){buf+=ev.text;if(!paintT)paintT=setTimeout(paint,80);return}
-  if(t==='context'){$('ctx').textContent='Context '+ev.percent+'% · ';return}
+  if(t==='delta_reset'){if(paintT){clearTimeout(paintT);paintT=0}buf='';ans.innerHTML='';return}
+  if(t==='context'){if(ownChat===sid)$('ctx').textContent='Context '+ev.percent+'% · ';return}
   if((t==='tool'||t==='answer')&&paintT){clearTimeout(paintT);paintT=0}
   if(t==='tool'&&buf){buf='';ans.innerHTML=''}     // that was the model talking on its way to a step
   if(t==='status'){preview(ev.text)}

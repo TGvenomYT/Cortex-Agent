@@ -25,10 +25,13 @@ import os
 import sys
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from cortex.core import safety
 from cortex.util.notify import notify
+
+_MAX_SELF_GOALS = 10
+_SELF_GOAL_DAYS = 7
 
 logger = logging.getLogger("cortex.autonomy.session")
 
@@ -140,6 +143,25 @@ class AutonomySession:
         self.registry, self.tool_names = _load_agentkit()
 
     # ── public entry ──────────────────────────────────────────────────────
+    def _own_goals(self) -> list:
+        return [g for g in self.db.get_active_goals(limit=1000) if g.get("source") == "self"]
+
+    def _drop_stale_goals(self) -> None:
+        """Goals it wrote for itself stop mattering after a while, and left alone they pile up
+        and become what it spends every run on. They're marked abandoned, not deleted."""
+        cutoff = datetime.now() - timedelta(days=_SELF_GOAL_DAYS)
+        for goal in self._own_goals():
+            created = goal.get("created_at")
+            created = datetime.fromisoformat(created) if isinstance(created, str) else created
+            if created and created < cutoff:
+                self.db.update_goal(goal["id"], status="abandoned")
+
+    def _add_goal(self, description: str):
+        """Returns the new goal's id, or None if it already has plenty to do."""
+        if len(self._own_goals()) >= _MAX_SELF_GOALS:
+            return None
+        return self.db.create_goal(description=description, source="self")
+
     def run(self) -> dict:
         """Run one autonomous session (possibly several steps). Returns a summary dict."""
         try:
@@ -150,6 +172,7 @@ class AutonomySession:
         if recent >= self.max_actions_per_hour:
             logger.info(f"rate-limited ({recent}/{self.max_actions_per_hour}/hr) — skipping")
             return {"status": "rate_limited"}
+        self._drop_stale_goals()
 
         observations: list[str] = []
         transcript: list[dict] = []
@@ -307,7 +330,9 @@ class AutonomySession:
             g = action.get("goal") or {}
             op = g.get("op")
             if op == "create":
-                gid = self.db.create_goal(description=g.get("description", ""), source="self")
+                gid = self._add_goal(g.get("description", ""))
+                if gid is None:
+                    return (f"not added: you already have {_MAX_SELF_GOALS} open goals, finish those first", 0)
                 return (f"tracked new goal #{gid}: {g.get('description','')}", 0)
             if op == "complete":
                 self.db.update_goal(g["id"], status="completed", result=g.get("result"))
@@ -347,7 +372,7 @@ class AutonomySession:
         for desc in (parsed.get("followups") or []):
             if isinstance(desc, str) and desc.strip():
                 try:
-                    self.db.create_goal(description=desc.strip(), source="self")
+                    self._add_goal(desc.strip())
                 except Exception:
                     pass
         return parsed

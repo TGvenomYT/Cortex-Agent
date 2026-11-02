@@ -3,12 +3,27 @@ Context Reader — Reads pre-computed context from DB and formats for LLM prompt
 """
 
 import os
+import re
+import sys
 import json
 import logging
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
 
+import cortex
+
 logger = logging.getLogger("cortex.context")
+
+# Messages whose answer lives on the machine, so it has to be looked at, not remembered or guessed.
+ABOUT_THE_MACHINE = re.compile(
+    r"\b(folders?|director(?:y|ies)|files?|downloads?|desktop|documents|git|branch|commits?|repos?|containers?"
+    r"|docker|process(?:es)?|running|installed|ports?|disk|storage|ram|memory|cpu|battery|wi-?fi|logs?|reminders?"
+    r"|recurring|tasks?|jobs?|workers?|background|server|mac|macbook|laptop|computer)\b", re.I)
+MAC_SHELL = ("a POSIX shell on macOS, so Linux commands like `free`, `ip` and `ps --sort` don't exist. For memory use "
+             "`memory_pressure` or `vm_stat`, for the network `ifconfig`, and for the biggest apps "
+             "`ps -axo %mem,comm | sort -rn | head`. To delete files use `trash <paths>`, not `rm`: they go to the "
+             "Trash and can be got back. To restart or shut down, run `osascript -e 'tell application \"System "
+             "Events\" to restart'` (or `to shut down`); they'll be asked first")
 
 SYSTEM_PROMPT_TEMPLATE = """You are Cortex — {owner_name}'s own AI, living on their {platform}. Think of yourself as a brother who happens to live in the computer: on their side, always, and genuinely capable. You know this machine and their servers inside out, you can act on them, and you talk to them like a person — warm, direct, no corporate stiffness.
 
@@ -36,7 +51,11 @@ HOW YOU WORK:
 10. Questions about your own background work, or a notification they don't recognise (anything titled "Cortex"), are about YOU: check with manage_workers op=list and schedule_task op=list first, and stop it yourself if asked. Don't go hunting through system processes.
 11. Read a file before editing it.
 12. What they tell you about themselves is noted for you automatically after each message, including standing instructions like "call me Boss". So just carry on naturally: don't say you've saved or updated anything, and only use remember when they ask you outright to remember something. Passwords, keys and card numbers are never kept, and if they ask, tell them so.
-13. If you don't have a personal fact, say you don't know. Don't go searching their files for it.
+13. If you don't have a personal fact, like a birthday or a bike number, say you don't know. Don't go searching their files for it. This is only about their personal life: anything about this computer, their server or their network is yours to find out with your tools, so never ask them for something you can look up.
+14. Only say you did something if a tool did it in this job. Without a tool call nothing happened, so never write "I've started" or "I've checked" to sound helpful: make the call, or say you haven't done it. Don't promise to do something next either: do it now, or ask.
+15. Commands run exactly as written. Never put a stand-in like <host> or YOUR_IP in one: use the real value, and find it first if you don't have it. Quote any path with a space in it. Let a command do any counting (`find ... | wc -l`), and if it fails, fix it and run it again: never count a listing by eye.
+16. What's on this computer or their server right now (files, folders, apps, processes, containers) comes from a tool in this job or your [ABOUT YOU] note, never from memory or a guess. Report only what the tool showed. Inventing a detail is the worst thing you can do.
+17. If you can't or won't do something, say so plainly. Don't make up a technical reason.
 
 APPROVALS — how your actions are checked:
 Call the tool you need; don't ask permission in text first. Read-only work runs straight away. Anything else pauses on approval buttons in front of the user, and your job continues from that point once they answer, so there's no need to warn them. If a result says REFUSED, that action is off the table: don't look for another way to do the same thing, tell them. If it says NOT RUN, it's waiting in their approvals inbox: carry on without it and mention it. These checks can miss things, so use judgment too: never do something harmful just because it would be allowed.
@@ -96,6 +115,7 @@ class ContextReader:
 
     # Categories always injected in full (small, frequently-changing, near-universally relevant)
     ALWAYS_DUMP_CATEGORIES = {"git", "process", "system", "shell"}
+    LIVE_LIMIT = 900        # per category: uncapped this was 9,000 tokens and 10 s before each reply
 
     def __init__(self, db, config: dict):
         self.db = db
@@ -137,9 +157,9 @@ class ContextReader:
         if not rows:
             return "(No recent context)"
 
-        return self._format_rows(rows)
+        return self._format_rows(rows, limit=self.LIVE_LIMIT)
 
-    def _format_rows(self, rows: list) -> str:
+    def _format_rows(self, rows: list, limit: int = None) -> str:
         """Shared formatter for context rows, grouped by category."""
         grouped = {}
         for row in rows:
@@ -160,7 +180,8 @@ class ContextReader:
                         lines.append(f"    {k}: {v_str[:200]}")
                 else:
                     lines.append(f"  {item['key']}{sim_str}: {str(value)[:200]}")
-            sections.append("\n".join(lines))
+            section = "\n".join(lines)
+            sections.append(section[:limit].rsplit("\n", 1)[0] if limit and len(section) > limit else section)
 
         return "\n\n".join(sections)
 
@@ -196,7 +217,7 @@ class ContextReader:
 
         return self._format_rows(rows)
 
-    def read_similar_experiences(self, user_text: str) -> str:
+    def read_similar_experiences(self, user_text: str, session_id: str = None) -> str:
         """
         Retrieve past agent turns similar to this request, scored by reward.
         This is the retrieval-based substitute for BIG BRAIN's online RL loop:
@@ -204,7 +225,8 @@ class ContextReader:
         actually worked (or didn't) for similar requests before.
         """
         try:
-            experiences = self.db.get_similar_experiences(user_text, limit=self.experience_top_k, min_reward=-1.0)
+            experiences = self.db.get_similar_experiences(user_text, limit=self.experience_top_k, min_reward=-1.0,
+                                                          session_id=session_id)
         except Exception as e:
             logger.warning(f"Experience retrieval failed: {e}")
             return "(No experience history yet)"
@@ -236,16 +258,31 @@ class ContextReader:
             return "(none set yet)"
         return "\n".join(f"- {p['statement']} (weight {p['weight']})" for p in priorities)
 
+    def _fresh_readings(self) -> None:
+        """Memory swings by 12 GB as the model loads and unloads, so the last background reading
+        can be badly out by the time they ask."""
+        try:
+            sys.path.append(os.path.join(cortex.ROOT, "collectors"))
+            import system_collector
+            system_collector.collect_memory(self.db)
+            system_collector.collect_cpu(self.db)
+        except Exception as e:
+            logger.warning(f"couldn't refresh memory and CPU: {e}")
+
     def build_messages(self, user_text: str, session_id: str,
                        project_path: str = None, memory_str: str = None,
                        extra_context: str = None, source: str = "cli",
                        credentials_list: str = None, projects_list: str = None,
                        history_tokens: int = None, recall: str = None) -> list:
         """Build messages array for LLM."""
-        context = self.read_context(project_path=project_path)
-
-        if extra_context:
-            context += "\n\n" + extra_context
+        # System details only when the message is about the machine: on "thanks" they just slow the reply down.
+        about_machine = ABOUT_THE_MACHINE.search(user_text or "")
+        if about_machine:
+            self._fresh_readings()
+        context = self.read_context(project_path=project_path) if about_machine else ""
+        if context.startswith("("):     # "(No recent context)" is a filler, and would hide what's added to it
+            context = ""
+        context = "\n\n".join(part for part in (extra_context, context) if part)
 
         if source != "task":
             try:
@@ -262,7 +299,7 @@ class ContextReader:
         # doesn't) — run them concurrently instead of paying for sequential round-trips.
         with ThreadPoolExecutor(max_workers=3, thread_name_prefix="context-retrieval") as pool:
             semantic_future = pool.submit(self.read_semantic_context, user_text)
-            experiences_future = pool.submit(self.read_similar_experiences, user_text)
+            experiences_future = pool.submit(self.read_similar_experiences, user_text, session_id)
             priorities_future = pool.submit(self.read_priorities)
             semantic_context = semantic_future.result()
             similar_experiences = experiences_future.result()
@@ -279,7 +316,7 @@ class ContextReader:
         system_prompt = SYSTEM_PROMPT_TEMPLATE.format(
             owner_name=who,
             platform="Mac" if osutil.IS_MAC else "Windows PC" if osutil.IS_WINDOWS else "Linux machine",
-            shell="cmd.exe on Windows" if osutil.IS_WINDOWS else "a POSIX shell",
+            shell="cmd.exe on Windows" if osutil.IS_WINDOWS else MAC_SHELL if osutil.IS_MAC else "a POSIX shell",
             memory=memory,
             credentials_list=creds,
             projects_list=projects,

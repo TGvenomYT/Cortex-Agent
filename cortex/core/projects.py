@@ -17,6 +17,15 @@ STEPS = ("dev", "start", "build", "test", "install")
 _LONG_RUNNING = ("dev", "start")
 
 
+def tracked(rows, config: dict) -> list[dict]:
+    """Projects from the database plus any listed under `projects:` in config.yaml."""
+    merged = {r["path"]: dict(r) for r in rows}
+    for p in config.get("projects") or []:
+        if p.get("path") and p["path"] not in merged:
+            merged[p["path"]] = {"name": p.get("name") or os.path.basename(p["path"].rstrip("/")), "path": p["path"]}
+    return list(merged.values())
+
+
 def _node(path: str, step: str) -> str | None:
     try:
         with open(os.path.join(path, "package.json"), encoding="utf-8") as f:

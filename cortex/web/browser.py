@@ -16,11 +16,24 @@ works even before `playwright install chromium` has run.
 from __future__ import annotations
 
 import logging
+import os
 
 logger = logging.getLogger("cortex.browser")
 
 _DEFAULT_TIMEOUT = 20_000  # ms
 _MAX_TEXT = 12_000
+_PROGRAMS = (os.environ.get("ProgramFiles") or "C:\\Program Files", os.environ.get("ProgramFiles(x86)") or "")
+_SYSTEM_BROWSERS = [
+    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
+    "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+    "/Applications/Chromium.app/Contents/MacOS/Chromium",
+    "/usr/bin/google-chrome", "/usr/bin/chromium", "/usr/bin/chromium-browser", "/usr/bin/brave-browser",
+    "/usr/bin/microsoft-edge",
+    *(os.path.join(base, app) for base in _PROGRAMS if base for app in (
+        "Google\\Chrome\\Application\\chrome.exe", "Microsoft\\Edge\\Application\\msedge.exe",
+        "BraveSoftware\\Brave-Browser\\Application\\brave.exe")),
+]
 
 
 def available() -> bool:
@@ -31,8 +44,19 @@ def available() -> bool:
         return False
 
 
+def _launch(p, headless=True):
+    """Playwright's own Chromium if it's been downloaded, otherwise a browser that's already installed."""
+    try:
+        return p.chromium.launch(headless=headless)
+    except Exception as e:
+        path = next((b for b in _SYSTEM_BROWSERS if os.path.exists(b)), None)
+        if not path or "Executable doesn't exist" not in str(e):
+            raise
+        return p.chromium.launch(headless=headless, executable_path=path)
+
+
 def _new_page(p, headless=True):
-    browser = p.chromium.launch(headless=headless)
+    browser = _launch(p, headless)
     ctx = browser.new_context(
         user_agent=("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
                     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"),

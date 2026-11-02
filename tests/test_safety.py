@@ -194,3 +194,83 @@ def test_configured_server_counts_as_known(monkeypatch):
 def test_wide_target_is_about_depth():
     assert safety._wide_target(os.path.expanduser("~/Documents"))
     assert not safety._wide_target(os.path.expanduser("~/Documents/old/build"))
+
+
+@pytest.mark.parametrize("cmd", ["ping -c 3 <IP_OF_YOUR_SERVER>", "ssh <user>@<host> uptime", "ssh me@<your-server-ip>",
+                                 "ping -c 3 <your_server_ip_placeholder>", 'ssh me@host "<cmd>"',
+                                 "ping <server ip>", "curl https://YOUR_DOMAIN/x"])
+def test_placeholders_are_caught(cmd):
+    assert safety.placeholder_in({"action": "execute", "command": cmd})
+
+
+@pytest.mark.parametrize("cmd", ["sort < in.txt > out.txt", "grep '<title>' index.html", "ping 100.100.35.38",
+                                 "echo a<b>c", "cat <<EOF", "python3 -c 'print(1<2>0)'"])
+def test_real_commands_are_not_placeholders(cmd):
+    assert not safety.placeholder_in({"action": "execute", "command": cmd})
+
+
+def test_only_shell_commands_are_checked():
+    assert not safety.placeholder_in({"action": "answer", "command": "<HOST>"})
+
+
+def test_tailscale_can_be_read_freely_but_not_changed():
+    assert safety.evaluate({"action": "execute", "command": "tailscale status"}).kind == safety.ALLOW
+    assert safety.evaluate({"action": "execute", "command": "tailscale up"}).kind == safety.ASK
+
+
+def test_a_reminder_can_be_cancelled_without_asking_unless_outside_content_is_involved():
+    action = {"action": "remind", "reminder": {"op": "delete", "id": 1}}
+    assert evaluate(action).kind == ALLOW
+    assert evaluate(action, tainted=True).kind == ASK
+
+
+def test_memory_pressure_is_read_only():
+    assert evaluate({"action": "execute", "command": "memory_pressure"}).kind == ALLOW
+
+
+TRASHABLE = ["trash ~/Downloads/*", "trash ~/Downloads", "trash ~/Downloads/old.zip", "trash a.txt b.txt"]
+NEVER_TRASH = ["trash ~", "trash ~/*", "trash /", "trash /Applications", "trash *", "trash .", "sudo trash ~/x", "trash"]
+
+
+@pytest.mark.parametrize("command", TRASHABLE)
+def test_moving_things_to_the_trash_needs_a_yes(command):
+    verdict = safety.evaluate({"action": "execute", "command": command})
+    assert verdict.kind == "ask" and "get them back" in verdict.message
+
+
+@pytest.mark.parametrize("command", NEVER_TRASH)
+def test_everything_at_once_never_goes_to_the_trash(command):
+    assert safety.evaluate({"action": "execute", "command": command}).kind == "block"
+
+
+def test_a_refused_folder_delete_points_at_the_trash_on_a_mac(monkeypatch):
+    monkeypatch.setattr(safety.sys, "platform", "darwin")
+    verdict = safety.evaluate({"action": "execute", "command": "rm -rf ~/Downloads/*"})
+    assert verdict.kind == "block" and "`trash`" in verdict.message
+
+
+@pytest.mark.parametrize("command", ["rm -rf ~/Documents", "rm -rf ~", "rm -rf /", "rm -rf ~/*", "rm -rf *"])
+def test_wide_deletes_are_still_refused(command):
+    assert safety.evaluate({"action": "execute", "command": command}).kind == "block"
+
+
+def test_what_went_to_the_trash_can_be_undone():
+    paths, complete = safety.write_targets("trash /tmp/some-file", "/tmp")
+    assert paths == ["/tmp/some-file"] and complete
+
+
+@pytest.mark.parametrize("word", ["restart", "shut down"])
+def test_restarting_the_mac_warns_and_asks(word):
+    verdict = safety.evaluate({"action": "execute", "command": f"osascript -e 'tell application \"System Events\" to {word}'"})
+    assert verdict.kind == "ask" and "unsaved" in verdict.message
+
+
+def test_restarting_can_never_be_waved_through():
+    command = "osascript -e 'tell application \"System Events\" to restart'"
+    assert safety.evaluate({"action": "execute", "command": command}, background=True).kind == "ask"
+
+
+@pytest.mark.parametrize("command", ["shutdown -r now", "sudo shutdown -h now", "reboot"])
+def test_the_blunt_shutdown_commands_stay_refused(command):
+    assert safety.evaluate({"action": "execute", "command": command}).kind == "block"
+

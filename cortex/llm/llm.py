@@ -34,11 +34,40 @@ import uuid
 import logging
 import itertools
 
+from contextvars import ContextVar
+
 import httpx
 
 from cortex.core import usage
 
 logger = logging.getLogger("cortex.llm")
+
+# Set around a call to drop it if a local model has shown nothing by then. Now and then Gemma
+# starts its hidden reasoning even with thinking off: Ollama shows none of it, it runs out of
+# tokens 45 s later, and there's no reply at all. A normal reply starts within about 12 s.
+quiet_limit: ContextVar = ContextVar("quiet_limit", default=None)
+
+
+class WentQuiet(Exception):
+    """A local model showed nothing in time, so the request was dropped."""
+
+# Gemma sometimes writes its reasoning into the reply, wrapped in its own channel markers.
+_THOUGHT = re.compile(r"(?:<\|channel>\s*)?\bthought\b.*?<channel\|>\s*", re.S)
+_THOUGHT_STARTS = ("<|channel>", "thought")
+
+
+def without_thought(text: str) -> str:
+    if "<channel|>" not in text:
+        return text
+    return _THOUGHT.sub("", text, count=1).replace("<|channel>", "").replace("<channel|>", "")
+
+
+def _ready_to_show(text: str) -> str:
+    """How much of a reply still being written is safe to put on screen."""
+    if "<channel|>" in text:
+        return without_thought(text)
+    start = text.lstrip()
+    return "" if any(start.startswith(s) or s.startswith(start) for s in _THOUGHT_STARTS) else text
 
 
 # ── provider model lists (shown in the GUI when a key is present) ─────────────
@@ -368,23 +397,33 @@ class OllamaBackend(LLMBackend):
 
     def _lines(self, payload: dict, on_open=None):
         """The stream as parsed chunks. Raises with a readable body on an HTTP error."""
-        with httpx.stream("POST", f"{self.base_url}/api/chat", json=payload, headers=self._headers(),
-                          timeout=self._httpx_timeout()) as r:
-            if on_open:
-                on_open(r.close)
-            if r.status_code >= 400:
-                r.read()
-                r.raise_for_status()
-            for line in r.iter_lines():
-                if not line:
-                    continue
-                try:
-                    chunk = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if chunk.get("error"):
-                    raise RuntimeError(chunk["error"])
-                yield chunk
+        limit = None if self.api_key else quiet_limit.get()
+        timeout = httpx.Timeout(self.timeout, connect=4.0, read=limit) if limit else self._httpx_timeout()
+        waiting = True
+        try:
+            with httpx.stream("POST", f"{self.base_url}/api/chat", json=payload, headers=self._headers(),
+                              timeout=timeout) as r:
+                waiting = False     # Ollama answers with its first output, and from here it can take its time
+                r.request.extensions["timeout"]["read"] = self.timeout
+                if on_open:
+                    on_open(r.close)
+                if r.status_code >= 400:
+                    r.read()
+                    r.raise_for_status()
+                for line in r.iter_lines():
+                    if not line:
+                        continue
+                    try:
+                        chunk = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if chunk.get("error"):
+                        raise RuntimeError(chunk["error"])
+                    yield chunk
+        except httpx.ReadTimeout:
+            if limit and waiting:
+                raise WentQuiet() from None
+            raise
 
     def _open(self, payload: dict, on_open=None):
         """Start the stream and read its first chunk, so a rejected request surfaces here
@@ -417,6 +456,9 @@ class OllamaBackend(LLMBackend):
                 content += piece
                 yield "delta", piece
         logger.info(f"Ollama [{self.model}] {int((time.time()-start)*1000)}ms ({self.label}, stream)")
+        if not content and not calls:
+            logger.warning(f"{self.model} came back empty: stopped because {reason}, "
+                           f"{output_tokens} tokens written, {len(thinking)} characters of reasoning")
         usage.record(self.provider, self.model, input_tokens, output_tokens)
         yield "done", {"content": content, "tool_calls": self._calls(calls), "thinking": thinking,
                        "truncated": reason == "length", "input_tokens": input_tokens}
@@ -648,23 +690,39 @@ class LLMRouter:
         raise first_error  # report the chosen model's error, not the last fallback's
 
     def complete(self, messages, json_mode=False, schema=None):
-        return self._first_answer(lambda b: b.complete(messages, json_mode=json_mode, schema=schema), "LLM")
+        return without_thought(
+            self._first_answer(lambda b: b.complete(messages, json_mode=json_mode, schema=schema), "LLM"))
 
     def complete_with_tools(self, messages, tools):
-        return self._first_answer(lambda b: b.complete_with_tools(messages, tools), "LLM (tools)")
+        result = self._first_answer(lambda b: b.complete_with_tools(messages, tools), "LLM (tools)")
+        return {**result, "content": without_thought(result.get("content") or "")}
 
     def stream_with_tools(self, messages, tools, on_open=None):
         first_error = last_error = None
         for backend in self._chain():
             if not self._worth_trying(backend, last_error):
                 continue
-            started = False
+            started, written, sent = False, "", 0
             try:
                 self._charge_check(backend)
                 for kind, payload in backend.stream_with_tools(messages, tools, on_open):
-                    started = started or kind == "delta"
-                    yield kind, payload
+                    if kind == "delta":
+                        written += payload
+                        ready = _ready_to_show(written)[sent:]
+                    elif kind == "done":
+                        payload = {**payload, "content": without_thought(payload.get("content") or "")}
+                        ready = payload["content"][sent:]
+                    else:
+                        yield kind, payload
+                        continue
+                    if ready:
+                        started, sent = True, sent + len(ready)
+                        yield "delta", ready
+                    if kind == "done":
+                        yield kind, payload
                 return
+            except WentQuiet:
+                raise
             except Exception as e:
                 if started:      # part of a reply is already on screen; don't splice in another model
                     raise

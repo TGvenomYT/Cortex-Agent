@@ -53,6 +53,9 @@ _SELF = re.compile(r"\b(i|i'm|i am|i've|i'd|i'll|my|mine|we|we're|our|me)\b", re
 _REQUEST = re.compile(r"^(please\s+|can you\s+|could you\s+)?(show|list|run|check|find|open|make|create|write|plot|draw|"
                       r"summari[sz]e|search|tell|give|what|how|why|who|where|when|which|is|are|do|does|did|fix|update|"
                       r"delete|remove|install|send|read|explain|help)\b", re.I)
+# Said for one chat only, so it must not turn up in the others. The model can't be relied on for this.
+_THIS_CHAT = re.compile(r"\b(?:this|the current) (?:chat|conversation|session)\b|\bjust for now\b|\bfor now only\b"
+                        r"|\bonly (?:here|for now)\b|\bhere only\b", re.I)
 _ABOUT_ME = re.compile(r"\b(about me|know about|remember about|what do you remember|who am i)\b", re.I)
 MIN_SIMILARITY = 0.45
 SAME_NOTE = 0.8
@@ -61,7 +64,7 @@ SAME_NOTE = 0.8
 def worth_learning(text: str) -> bool:
     """Could this message hold something to remember? Spares a model call for plain requests."""
     t = (text or "").strip()
-    if len(t) < 8 or t.startswith("["):
+    if len(t) < 8 or t.startswith("[") or _THIS_CHAT.search(t):
         return False
     if _RULE_WORDS.search(t):
         return True

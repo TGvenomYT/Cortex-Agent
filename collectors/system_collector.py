@@ -26,6 +26,25 @@ def _gb(n: int) -> str:
     return f"{n / 1024 ** 3:.0f}G"
 
 
+_DF_ROW = re.compile(r"(\S.*?)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\d+%)\s+(/.*)")
+_MAC_DATA = "/System/Volumes/Data"
+
+
+def parse_df(out: str) -> list:
+    """Rows of `df -P`. On a Mac your files live on the Data volume: `/` is a small sealed
+    system volume that always looks nearly empty, so the Data volume takes its place."""
+    disks = []
+    for line in out.splitlines():
+        row = _DF_ROW.fullmatch(line.strip())
+        if row:
+            disks.append(dict(zip(("filesystem", "size", "used", "available", "use_pct", "mount"), row.groups())))
+    data = next((d for d in disks if d["mount"] == _MAC_DATA), None)
+    if not data:
+        return disks
+    return [data] + [d for d in disks if d["mount"] != "/"
+                     and not d["mount"].startswith(("/System/Volumes/", "/Library/Developer/"))]
+
+
 def collect_disk(conn):
     """Disk usage for all mounted volumes."""
     if IS_WINDOWS:
@@ -35,22 +54,11 @@ def collect_disk(conn):
                 "use_pct": f"{round(u.used / u.total * 100)}%", "mount": home}
         upsert_context(conn, "system", "disk", {"main": main, "all_volumes": [main]}, expires_minutes=10)
         return
-    out, _, _ = run_cmd("df -h | grep -v tmpfs | grep -v devfs | awk 'NR>1 {print $1,$2,$3,$4,$5,$6}'")
-    disks = []
-    for line in out.splitlines():
-        parts = line.split()
-        if len(parts) >= 6:
-            disks.append({
-                "filesystem": parts[0],
-                "size": parts[1],
-                "used": parts[2],
-                "available": parts[3],
-                "use_pct": parts[4],
-                "mount": parts[5],
-            })
+    out, _, _ = run_cmd("df -Ph | grep -v tmpfs | grep -v devfs")
+    disks = parse_df(out)
 
     # Main disk summary
-    main_disk = next((d for d in disks if d["mount"] == "/"), None)
+    main_disk = next((d for d in disks if d["mount"] in ("/", _MAC_DATA)), None)
 
     upsert_context(conn, "system", "disk", {
         "main": main_disk,

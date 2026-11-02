@@ -7,6 +7,7 @@ its output goes to files, so a long command can be handed to a watcher instead o
 """
 
 import os
+import re
 import signal
 import subprocess
 import tempfile
@@ -19,6 +20,13 @@ from cortex.core.safety import redact
 logger = logging.getLogger("cortex.executor")
 
 RUNS_DIR = "~/.cortex/runs"
+_QUOTED_HOME = re.compile(r"""(?<![\w/\\])(["'])~/""")
+
+
+def _home_in_quotes(command: str) -> str:
+    """The model rightly quotes a path with a space in it, as "~/My Folder", but a shell only
+    expands ~ outside quotes, so the folder looks like it isn't there."""
+    return _QUOTED_HOME.sub(lambda m: '"$HOME/' if m[1] == '"' else "\"$HOME\"'/", command)
 
 
 def _kill_group(proc) -> None:
@@ -89,7 +97,7 @@ class CommandExecutor:
 
         wrapped = command
         if os.name != "nt":   # the exit code has to outlive us, in case this is left running
-            wrapped = f"(\n{command}\n)\necho $? > {code_path!r}"
+            wrapped = f"(\n{_home_in_quotes(command)}\n)\necho $? > {code_path!r}"
 
         def finish(exit_code, stdout, stderr, **extra):
             duration_ms = int((time.time() - start) * 1000)

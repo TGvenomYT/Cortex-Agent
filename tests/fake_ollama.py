@@ -8,6 +8,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 class FakeOllama:
     def __init__(self, port: int = 0, reply=None, models=("fake:1b",)):
         self.requests, self.tag_headers = [], []
+        self.hold = 0
         self.reply = reply or (lambda body: {"content": "hello"})
         self.models = list(models)
         self.chat_status = 200
@@ -53,6 +54,7 @@ class FakeOllama:
                 r = outer.reply(body)
                 if not body.get("stream"):
                     return self._json({"message": {"role": "assistant", **r}, "done": True})
+                time.sleep(outer.hold)
                 self.send_response(200)
                 self.send_header("Content-Type", "application/x-ndjson")
                 self.end_headers()
